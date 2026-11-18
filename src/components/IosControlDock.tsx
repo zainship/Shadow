@@ -12,6 +12,7 @@ import {
   Blocks,
   Check,
   Compass,
+  Cpu,
   Globe,
   Image,
   Layers,
@@ -69,6 +70,8 @@ interface IosControlDockProps {
   onWakeModeChange: (mode: WakeMode) => void;
   onToggleClapWake: (enabled: boolean) => void;
   onOpenSetup: () => void;
+  onOpenAiSettings?: () => void;
+  aiProviderLabel?: string;
   onLockWithFace?: () => void;
 }
 
@@ -190,6 +193,8 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
   onWakeModeChange,
   onToggleClapWake,
   onOpenSetup,
+  onOpenAiSettings,
+  aiProviderLabel,
   onLockWithFace,
 }) => {
   const mouseX = useMotionValue(Infinity);
@@ -413,6 +418,17 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
             </div>
 
             <div className="mt-3 pt-2.5 border-t border-white/10 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  onOpenAiSettings?.();
+                }}
+                className="flex-1 py-2 px-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/8 text-xs font-medium text-slate-200 inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
+              >
+                <Cpu className="w-3.5 h-3.5 text-violet-400" />
+                <span>{aiProviderLabel || 'AI Provider'}</span>
+              </button>
               <button
                 type="button"
                 onClick={() => {

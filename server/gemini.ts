@@ -1,12 +1,63 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 let cachedClient: GoogleGenAI | null = null;
 let cachedLiveClient: GoogleGenAI | null = null;
 let cachedApiKey: string | null = null;
 let cachedLiveApiKey: string | null = null;
 
-export function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+const MODEL_DEFAULTS = {
+  fastText: 'gemini-3.1-flash-lite',
+  deepText: 'gemini-4-hydrogen',
+  live: 'gemini-3.8-live',
+  tts: 'gemini-3.8-flash-lite-tts',
+  research: 'gemini-4-hydrogen',
+} as const;
+
+function envOr(name: string, fallback: string): string {
+  const raw = (process.env[name] || '').trim();
+  return raw || fallback;
+}
+
+/**
+ * Model configuration, overridable via env so local runs can trade
+ * depth for speed (the #1 latency lever for /api/assistant/command).
+ */
+export function getModelConfig() {
+  return {
+    fastText: envOr('SHADOW_FAST_MODEL', MODEL_DEFAULTS.fastText),
+    deepText: envOr('SHADOW_DEEP_MODEL', MODEL_DEFAULTS.deepText),
+    live: envOr('SHADOW_LIVE_MODEL', MODEL_DEFAULTS.live),
+    tts: envOr('SHADOW_TTS_MODEL', MODEL_DEFAULTS.tts),
+    research: envOr('SHADOW_RESEARCH_MODEL', MODEL_DEFAULTS.research),
+  };
+}
+
+/** True when deep-model-first behaviour is explicitly requested for text commands. */
+export function preferDeepCommandDefault(): boolean {
+  return ['1', 'true', 'yes'].includes((process.env.SHADOW_USE_DEEP_COMMAND || '').toLowerCase());
+}
+
+/**
+ * Thinking level for the Gemini Live voice session.
+ * MINIMAL keeps first-audio latency low; set SHADOW_LIVE_THINKING=off to skip
+ * thinkingConfig entirely (e.g. if a custom live model rejects the field).
+ */
+export function resolveLiveThinkingLevel(): ThinkingLevel | null {
+  const raw = (process.env.SHADOW_LIVE_THINKING || 'minimal').toLowerCase();
+  if (['off', 'none', 'disabled', '0'].includes(raw)) return null;
+  if (raw === 'low') return ThinkingLevel.LOW;
+  if (raw === 'medium') return ThinkingLevel.MEDIUM;
+  if (raw === 'high') return ThinkingLevel.HIGH;
+  return ThinkingLevel.MINIMAL;
+}
+
+export function resolveServerGeminiKey(): string | null {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  return apiKey || null;
+}
+
+export function getGeminiClient(apiKeyOverride?: string): GoogleGenAI {
+  const apiKey = (apiKeyOverride || resolveServerGeminiKey() || '').trim();
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
@@ -25,8 +76,8 @@ export function getGeminiClient(): GoogleGenAI {
   return cachedClient;
 }
 
-export function getGeminiLiveClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+export function getGeminiLiveClient(apiKeyOverride?: string): GoogleGenAI {
+  const apiKey = (apiKeyOverride || resolveServerGeminiKey() || '').trim();
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
   }
@@ -62,6 +113,11 @@ export function parseGeminiHttpError(
   fallback = 'Gemini request failed'
 ): { status: number; message: string } {
   const raw = err instanceof Error ? err.message : String(err || fallback);
+  // OpenRouter errors are thrown as "OpenRouter <status>: <message>"
+  const openRouterMatch = raw.match(/^OpenRouter\s+(\d{3}):\s*([\s\S]{0,280})/);
+  if (openRouterMatch) {
+    return { status: Number(openRouterMatch[1]), message: `OpenRouter: ${openRouterMatch[2]}` };
+  }
   if (raw.includes('GEMINI_API_KEY is not configured')) {
     return { status: 500, message: 'Server Gemini API key is not configured.' };
   }
@@ -104,11 +160,10 @@ export async function withGeminiRetry<T>(
       if (!isTransient || attempt === maxRetries) {
         throw err;
       }
-      const delayMs = 500 * Math.pow(3, attempt);
+      // Short snappy backoff: local voice flows should fail over fast, not hang.
+      const delayMs = 300 * Math.pow(2, attempt);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
   throw lastError;
 }
-
-

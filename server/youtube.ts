@@ -1,4 +1,5 @@
-import { getGeminiClient, withGeminiRetry } from './gemini.ts';
+import { extractOpenRouterCitations, openRouterGenerate } from './ai-provider.ts';
+import { getGeminiClient, getModelConfig, withGeminiRetry } from './gemini.ts';
 
 export interface YouTubeSearchResult {
   videoId: string;
@@ -88,7 +89,17 @@ export function extractVideoIdFromUrl(input: string): string | null {
   return null;
 }
 
-export async function searchYouTube(query: string): Promise<YouTubeSearchResult[]> {
+export interface SearchYouTubeOptions {
+  /** BYOK Gemini key override for the grounded fallback lookup. */
+  geminiKeyOverride?: string;
+  /** BYOK OpenRouter runtime for the grounded fallback lookup (web plugin). */
+  openRouter?: { apiKey: string; model: string };
+}
+
+export async function searchYouTube(
+  query: string,
+  opts?: SearchYouTubeOptions
+): Promise<YouTubeSearchResult[]> {
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];
 
@@ -168,25 +179,43 @@ export async function searchYouTube(query: string): Promise<YouTubeSearchResult[
     console.warn('Direct YouTube HTML search failed, attempting Gemini Google Search grounding:', err);
   }
 
-  // Secondary: Use Gemini 4 Hydrogen with Google Search Grounding to find a real YouTube watch URL
+  // Secondary: grounded web lookup to find a real YouTube watch URL
+  // (BYOK: OpenRouter web plugin when provided, else Gemini Google Search grounding)
   try {
-    const ai = getGeminiClient();
-    const response = await withGeminiRetry(() =>
-      ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Find the exact official YouTube video URL (youtube.com/watch?v=...) for: "${cleanQuery}". Return the full watch URL and title.`,
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      })
-    );
-    const text = response.text || '';
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+    const lookupPrompt = `Find the exact official YouTube video URL (youtube.com/watch?v=...) for: "${cleanQuery}". Return the full watch URL and title.`;
+    let text = '';
     const candidateUrls: string[] = [];
-    for (const chunk of chunks) {
-      const uri = (chunk as { web?: { uri?: string } })?.web?.uri;
-      if (uri) candidateUrls.push(uri);
+
+    if (opts?.openRouter) {
+      const turn = await openRouterGenerate({
+        apiKey: opts.openRouter.apiKey,
+        model: opts.openRouter.model,
+        contents: [{ role: 'user', parts: [{ text: lookupPrompt }] }],
+        webSearch: true,
+      });
+      text = turn.text;
+      for (const citation of extractOpenRouterCitations(turn.annotations)) {
+        candidateUrls.push(citation.url);
+      }
+    } else {
+      const ai = getGeminiClient(opts?.geminiKeyOverride);
+      const response = await withGeminiRetry(() =>
+        ai.models.generateContent({
+          model: getModelConfig().deepText,
+          contents: lookupPrompt,
+          config: {
+            tools: [{ googleSearch: {} }],
+          },
+        })
+      );
+      text = response.text || '';
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      for (const chunk of chunks) {
+        const uri = (chunk as { web?: { uri?: string } })?.web?.uri;
+        if (uri) candidateUrls.push(uri);
+      }
     }
+
     const regexMatches = text.match(/https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)[a-zA-Z0-9_-]{6,32}/g) ?? [];
     candidateUrls.push(...regexMatches);
 

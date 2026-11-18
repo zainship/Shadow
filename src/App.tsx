@@ -93,6 +93,14 @@ import {
   type DesktopRuntimeInfo,
 } from './lib/tauriBridge';
 import { buildWindowLayoutInspection } from './lib/windowLayout';
+import {
+  aiRequestHeaders,
+  aiSocketAuthMessage,
+  loadAiSettings,
+  saveAiSettings,
+  type AiSettings,
+} from './lib/aiSettings';
+import { AiSettingsModal } from './components/AiSettingsModal';
 import type {
   AssistantMemory,
   AutomationRunState,
@@ -180,6 +188,14 @@ function JarvisArcWorkspace() {
   // First-Launch Setup, Memory & Face Auth State
   const [setupConfig, setSetupConfig] = useState<SetupConfig>(() => loadLocalSetupConfig());
   const [setupOpen, setSetupOpen] = useState<boolean>(() => !loadLocalSetupConfig().setupCompleted);
+  const [aiSettings, setAiSettingsState] = useState<AiSettings>(() => loadAiSettings());
+  const [aiSettingsOpen, setAiSettingsOpen] = useState<boolean>(false);
+  const aiSettingsRef = useRef<AiSettings>(aiSettings);
+
+  useEffect(() => {
+    aiSettingsRef.current = aiSettings;
+    saveAiSettings(aiSettings);
+  }, [aiSettings]);
   const [faceAuthProfile, setFaceAuthProfile] = useState<FaceAuthProfile | null>(() =>
     loadLocalFaceAuth()
   );
@@ -1451,6 +1467,8 @@ function JarvisArcWorkspace() {
           isConnectedRef.current = true;
           setIsConnected(true);
           setIsConnecting(false);
+          // Announce BYOK provider (server falls back to its env keys when absent).
+          ws.send(JSON.stringify(aiSocketAuthMessage(aiSettingsRef.current)));
           showTransientCaption(assistantNameRef.current, 'Voice core online. Listening.', 3500);
         };
 
@@ -1758,7 +1776,7 @@ function JarvisArcWorkspace() {
       try {
         const res = await fetch('/api/assistant/command', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
             command: clean,
             voiceName,
@@ -1941,7 +1959,7 @@ function JarvisArcWorkspace() {
       try {
         const res = await fetch('/api/assistant/tts', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ text: clean, voiceName }),
         });
         const data = (await res.json()) as { audioBase64?: string; error?: string };
@@ -1973,7 +1991,7 @@ function JarvisArcWorkspace() {
       try {
         const res = await fetch('/api/research/run', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: true }),
         });
         const data = (await res.json()) as {
@@ -2032,7 +2050,7 @@ function JarvisArcWorkspace() {
       try {
         const res = await fetch('/api/visuals/generate', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
             prompt: clean,
             style: input.style,
@@ -2721,6 +2739,14 @@ function JarvisArcWorkspace() {
         onWakeModeChange={(mode) => void handleWakeModeChange(mode)}
         onToggleClapWake={(enabled) => void handleToggleClapWake(enabled)}
         onOpenSetup={() => setSetupOpen(true)}
+        onOpenAiSettings={() => setAiSettingsOpen(true)}
+        aiProviderLabel={
+          aiSettings.provider === 'gemini'
+            ? 'Gemini BYOK'
+            : aiSettings.provider === 'openrouter'
+              ? 'OpenRouter BYOK'
+              : 'AI Provider'
+        }
         onLockWithFace={() => {
           stopVoiceSession();
           setIsFaceUnlocked(false);
@@ -2783,6 +2809,14 @@ function JarvisArcWorkspace() {
             : `${config.assistantName} setup saved.`;
           showTransientCaption(config.assistantName, greeting, 4500);
         }}
+      />
+
+      {/* BYOK AI Provider Settings */}
+      <AiSettingsModal
+        open={aiSettingsOpen}
+        settings={aiSettings}
+        onSave={(next) => setAiSettingsState(next)}
+        onClose={() => setAiSettingsOpen(false)}
       />
 
       {/* Facial Recognition Lock Screen */}

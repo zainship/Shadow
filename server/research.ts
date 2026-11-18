@@ -1,6 +1,11 @@
 import { ThinkingLevel, Type } from '@google/genai';
 import { inspectWebPage } from './automation.ts';
-import { getGeminiClient, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
+import {
+  extractOpenRouterCitations,
+  openRouterGenerate,
+  type AiRuntime,
+} from './ai-provider.ts';
+import { getGeminiClient, getModelConfig, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
 
 export interface ResearchSource {
   title: string;
@@ -65,7 +70,7 @@ async function generateResilient(
       () =>
         ai.models.generateContent({
           ...params,
-          model: 'gemini-3.1-flash-lite',
+          model: getModelConfig().fastText,
           config: liteConfig,
         }),
       1
@@ -85,7 +90,7 @@ async function generateResilient(
       () =>
         ai.models.generateContent({
           ...params,
-          model: 'gemini-3.1-flash-lite',
+          model: getModelConfig().fastText,
           config: liteConfig,
         }),
       1
@@ -93,10 +98,96 @@ async function generateResilient(
   }
 }
 
+const SYNTHESIS_COMPARISON_ITEM_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    label: { type: Type.STRING },
+    detail: { type: Type.STRING },
+  },
+  required: ['label', 'detail'],
+};
+
+const SYNTHESIS_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    executiveSummary: { type: Type.STRING },
+    keyFindings: { type: Type.ARRAY, items: { type: Type.STRING } },
+    comparisonPoints: {
+      type: Type.ARRAY,
+      items: SYNTHESIS_COMPARISON_ITEM_SCHEMA,
+    },
+    followUpQuestions: { type: Type.ARRAY, items: { type: Type.STRING } },
+    spokenSummary: { type: Type.STRING },
+  },
+  required: [
+    'executiveSummary',
+    'keyFindings',
+    'comparisonPoints',
+    'followUpQuestions',
+    'spokenSummary',
+  ],
+};
+
+interface SynthesisDraft {
+  executiveSummary: string;
+  keyFindings: string[];
+  comparisonPoints: ResearchComparisonPoint[];
+  followUpQuestions: string[];
+  spokenSummary: string;
+}
+
+/** Provider-independent phase: fetch up to 3 inspectable primary pages in parallel. */
+async function verifyPrimarySources(
+  sources: ResearchSource[],
+  depth: 'quick' | 'deep'
+): Promise<{ sources: ResearchSource[]; verifiedExcerpts: string[] }> {
+  const verifiedExcerpts: string[] = [];
+  if (depth !== 'deep') return { sources, verifiedExcerpts };
+
+  const inspectTargets = sources
+    .map((s) => s.url)
+    .filter(isInspectableSource)
+    .slice(0, 3);
+  if (inspectTargets.length === 0) return { sources, verifiedExcerpts };
+
+  const inspections = await Promise.allSettled(inspectTargets.map((u) => inspectWebPage(u)));
+  for (const res of inspections) {
+    if (res.status === 'fulfilled' && res.value.statusCode >= 200 && res.value.statusCode < 400) {
+      const p = res.value;
+      if (p.excerpt) {
+        verifiedExcerpts.push(
+          `Source "${p.title}" (${p.finalUrl}):\nHeadings: ${p.headings.slice(0, 4).join(' | ')}\nExcerpt: ${p.excerpt.slice(0, 420)}`
+        );
+      }
+      const existingSrc = sources.find((s) => s.url === p.url || s.url === p.finalUrl);
+      if (existingSrc && p.title && existingSrc.title === existingSrc.domain) {
+        existingSrc.title = p.title.slice(0, 200);
+      }
+    }
+  }
+  return { sources, verifiedExcerpts };
+}
+
+function fallbackSynthesis(groundedNotes: string): SynthesisDraft {
+  const sentences = groundedNotes
+    .replace(/[*_`#]/g, '')
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 20);
+  return {
+    executiveSummary: sentences.slice(0, 3).join(' ') || groundedNotes.slice(0, 600),
+    keyFindings: sentences.slice(0, 6).map((s) => s.slice(0, 360)),
+    comparisonPoints: [],
+    followUpQuestions: [],
+    spokenSummary: sentences.slice(0, 2).join(' ').slice(0, 420),
+  };
+}
+
 export async function runJarvisResearch(input: {
   query: string;
   depth?: 'quick' | 'deep';
   urls?: string[];
+  runtime?: AiRuntime | null;
 }): Promise<ResearchReport> {
   const query = String(input.query || '').trim().slice(0, 400);
   if (!query) {
@@ -113,13 +204,12 @@ export async function runJarvisResearch(input: {
   const inlineUrls = query.match(/https?:\/\/[^\s)]+/gi) ?? [];
   const allTargetUrls = Array.from(new Set([...cleanUrls, ...inlineUrls])).slice(0, 10);
 
-  // Phase 1: Grounded Web Search + optional URL Context discovery
-  const researchTools: Array<{ googleSearch?: Record<string, never>; urlContext?: Record<string, never> }> = [
-    { googleSearch: {} },
-  ];
-  if (allTargetUrls.length > 0) {
-    researchTools.push({ urlContext: {} });
-  }
+  const useOpenRouter = input.runtime?.provider === 'openrouter' && Boolean(input.runtime.apiKey);
+
+  // Phase 1: Grounded discovery (Gemini googleSearch / OpenRouter web plugin)
+  let groundedNotes = '';
+  let webSearchQueries: string[] = [];
+  let sources: ResearchSource[] = [];
 
   const discoveryPrompt = [
     `Conduct ${depth === 'deep' ? 'thorough, multi-angle' : 'concise'} factual research on the following request:`,
@@ -130,74 +220,90 @@ export async function runJarvisResearch(input: {
     .filter(Boolean)
     .join('\n');
 
-  const discoveryResponse = await generateResilient({
-    model: 'gemini-4-hydrogen',
-    contents: discoveryPrompt,
-    config: {
-      tools: researchTools,
-      thinkingConfig: {
-        thinkingLevel: depth === 'deep' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
-      },
-    },
-  });
-
-  const groundedNotes = (discoveryResponse.text || '').trim();
-  const metadata = discoveryResponse.candidates?.[0]?.groundingMetadata;
-  const rawChunks = metadata?.groundingChunks ?? [];
-  const webSearchQueries = (metadata?.webSearchQueries ?? [])
-    .map((q) => String(q).trim().slice(0, 200))
-    .filter(Boolean)
-    .slice(0, 8);
-
-  const sourceMap = new Map<string, ResearchSource>();
-  for (const url of allTargetUrls) {
-    sourceMap.set(url, {
-      title: extractDomain(url),
-      url: url.slice(0, 1000),
-      domain: extractDomain(url),
+  if (useOpenRouter) {
+    const discovery = await openRouterGenerate({
+      apiKey: input.runtime!.apiKey,
+      model: input.runtime!.model,
+      contents: [{ role: 'user', parts: [{ text: discoveryPrompt }] }],
+      webSearch: true,
+      temperature: 0.4,
     });
-  }
-  for (const chunk of rawChunks) {
-    const web = (chunk as { web?: { uri?: string; title?: string } })?.web;
-    if (web?.uri && /^https?:\/\//i.test(web.uri)) {
-      const url = web.uri.slice(0, 1000);
-      const title = (web.title || extractDomain(url)).trim().slice(0, 200);
-      if (!sourceMap.has(url)) {
+    groundedNotes = discovery.text.trim();
+
+    const sourceMap = new Map<string, ResearchSource>();
+    for (const url of allTargetUrls) {
+      sourceMap.set(url, {
+        title: extractDomain(url),
+        url: url.slice(0, 1000),
+        domain: extractDomain(url),
+      });
+    }
+    for (const citation of extractOpenRouterCitations(discovery.annotations).slice(0, 12)) {
+      if (!sourceMap.has(citation.url)) {
+        const url = citation.url.slice(0, 1000);
         sourceMap.set(url, {
-          title: title || extractDomain(url),
+          title: citation.title || extractDomain(url),
           url,
           domain: extractDomain(url),
         });
       }
     }
-  }
-  const sources = Array.from(sourceMap.values()).slice(0, 12);
+    sources = Array.from(sourceMap.values()).slice(0, 12);
+  } else {
+    const researchTools: Array<{ googleSearch?: Record<string, never>; urlContext?: Record<string, never> }> = [
+      { googleSearch: {} },
+    ];
+    if (allTargetUrls.length > 0) {
+      researchTools.push({ urlContext: {} });
+    }
 
-  // Phase 2: Primary-source verification in deep mode (fetch up to 3 inspectable pages in parallel)
-  const verifiedExcerpts: string[] = [];
-  if (depth === 'deep') {
-    const inspectTargets = sources
-      .map((s) => s.url)
-      .filter(isInspectableSource)
-      .slice(0, 3);
-    if (inspectTargets.length > 0) {
-      const inspections = await Promise.allSettled(inspectTargets.map((u) => inspectWebPage(u)));
-      for (const res of inspections) {
-        if (res.status === 'fulfilled' && res.value.statusCode >= 200 && res.value.statusCode < 400) {
-          const p = res.value;
-          if (p.excerpt) {
-            verifiedExcerpts.push(
-              `Source "${p.title}" (${p.finalUrl}):\nHeadings: ${p.headings.slice(0, 4).join(' | ')}\nExcerpt: ${p.excerpt.slice(0, 420)}`
-            );
-          }
-          const existingSrc = sources.find((s) => s.url === p.url || s.url === p.finalUrl);
-          if (existingSrc && p.title && existingSrc.title === existingSrc.domain) {
-            existingSrc.title = p.title.slice(0, 200);
-          }
+    const discoveryResponse = await generateResilient({
+      model: getModelConfig().research,
+      contents: discoveryPrompt,
+      config: {
+        tools: researchTools,
+        thinkingConfig: {
+          thinkingLevel: depth === 'deep' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
+        },
+      },
+    });
+
+    groundedNotes = (discoveryResponse.text || '').trim();
+    const metadata = discoveryResponse.candidates?.[0]?.groundingMetadata;
+    const rawChunks = metadata?.groundingChunks ?? [];
+    webSearchQueries = (metadata?.webSearchQueries ?? [])
+      .map((q) => String(q).trim().slice(0, 200))
+      .filter(Boolean)
+      .slice(0, 8);
+
+    const sourceMap = new Map<string, ResearchSource>();
+    for (const url of allTargetUrls) {
+      sourceMap.set(url, {
+        title: extractDomain(url),
+        url: url.slice(0, 1000),
+        domain: extractDomain(url),
+      });
+    }
+    for (const chunk of rawChunks) {
+      const web = (chunk as { web?: { uri?: string; title?: string } })?.web;
+      if (web?.uri && /^https?:\/\//i.test(web.uri)) {
+        const url = web.uri.slice(0, 1000);
+        const title = (web.title || extractDomain(url)).trim().slice(0, 200);
+        if (!sourceMap.has(url)) {
+          sourceMap.set(url, {
+            title: title || extractDomain(url),
+            url,
+            domain: extractDomain(url),
+          });
         }
       }
     }
+    sources = Array.from(sourceMap.values()).slice(0, 12);
   }
+
+  // Phase 2: Primary-source verification in deep mode (shared, provider-independent)
+  const { sources: verifiedSources, verifiedExcerpts } = await verifyPrimarySources(sources, depth);
+  sources = verifiedSources;
 
   // Phase 3: Distill into clean structured intelligence brief + spoken summary
   const synthesisPrompt = [
@@ -215,65 +321,33 @@ export async function runJarvisResearch(input: {
     '- spokenSummary: 1–2 natural spoken sentences for voice readout (no markdown, no raw URLs, no bullet syntax).',
   ].join('\n');
 
-  let parsed: Partial<{
-    executiveSummary: string;
-    keyFindings: string[];
-    comparisonPoints: ResearchComparisonPoint[];
-    followUpQuestions: string[];
-    spokenSummary: string;
-  }> = {};
+  let parsed: Partial<SynthesisDraft> = {};
 
   try {
-    const synthResponse = await generateResilient({
-      model: 'gemini-4-hydrogen',
-      contents: synthesisPrompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            executiveSummary: { type: Type.STRING },
-            keyFindings: { type: Type.ARRAY, items: { type: Type.STRING } },
-            comparisonPoints: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  label: { type: Type.STRING },
-                  detail: { type: Type.STRING },
-                },
-                required: ['label', 'detail'],
-              },
-            },
-            followUpQuestions: { type: Type.ARRAY, items: { type: Type.STRING } },
-            spokenSummary: { type: Type.STRING },
-          },
-          required: [
-            'executiveSummary',
-            'keyFindings',
-            'comparisonPoints',
-            'followUpQuestions',
-            'spokenSummary',
-          ],
+    if (useOpenRouter) {
+      const synthesis = await openRouterGenerate({
+        apiKey: input.runtime!.apiKey,
+        model: input.runtime!.model,
+        contents: [{ role: 'user', parts: [{ text: synthesisPrompt }] }],
+        jsonSchema: SYNTHESIS_SCHEMA as unknown as Record<string, unknown>,
+        temperature: 0.2,
+      });
+      parsed = JSON.parse(synthesis.text || '{}') as Partial<SynthesisDraft>;
+    } else {
+      const synthResponse = await generateResilient({
+        model: getModelConfig().research,
+        contents: synthesisPrompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: SYNTHESIS_SCHEMA,
         },
-      },
-    });
-    parsed = JSON.parse(synthResponse.text || '{}') as typeof parsed;
+      });
+      parsed = JSON.parse(synthResponse.text || '{}') as Partial<SynthesisDraft>;
+    }
   } catch {
     // Graceful fallback using already-grounded search discovery notes
-    const sentences = groundedNotes
-      .replace(/[*_`#]/g, '')
-      .split(/(?<=[.!?])\s+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 20);
-    parsed = {
-      executiveSummary: sentences.slice(0, 3).join(' ') || groundedNotes.slice(0, 600),
-      keyFindings: sentences.slice(0, 6).map((s) => s.slice(0, 360)),
-      comparisonPoints: [],
-      followUpQuestions: [],
-      spokenSummary: sentences.slice(0, 2).join(' ').slice(0, 420),
-    };
+    parsed = fallbackSynthesis(groundedNotes);
   }
 
   const executiveSummary =

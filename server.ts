@@ -10,11 +10,19 @@ import { createServer as createViteServer } from 'vite';
 import {
   getGeminiClient,
   getGeminiLiveClient,
+  getModelConfig,
   isOverloadOrQuotaError,
   parseGeminiHttpError,
+  preferDeepCommandDefault,
+  resolveLiveThinkingLevel,
+  resolveServerGeminiKey,
   withGeminiRetry,
 } from './server/gemini.ts';
-import type { Content } from '@google/genai';
+import {
+  openRouterGenerate,
+  resolveAiRuntime,
+} from './server/ai-provider.ts';
+import type { Content, FunctionCall } from '@google/genai';
 import { searchYouTube } from './server/youtube.ts';
 import { runJarvisResearch } from './server/research.ts';
 import {
@@ -83,7 +91,13 @@ async function startServer() {
       if (!q) {
         return res.status(400).json({ error: 'Missing query parameter q' });
       }
-      const results = await searchYouTube(q);
+      const ytRuntime = resolveAiRuntime({ headers: req.headers });
+      const results = await searchYouTube(
+        q,
+        ytRuntime?.provider === 'openrouter'
+          ? { openRouter: { apiKey: ytRuntime.apiKey, model: ytRuntime.model } }
+          : { geminiKeyOverride: ytRuntime?.apiKey }
+      );
       return res.json({ query: q, results });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'YouTube search failed';
@@ -106,13 +120,24 @@ async function startServer() {
     }
   });
 
-  // Text-to-speech endpoint (Gemini 3.8 Flash Lite TTS -> WAV)
+  // Text-to-speech endpoint (Gemini Flash Lite TTS -> WAV)
   app.post('/api/assistant/tts', async (req, res) => {
     try {
       const text = String(req.body?.text || '').trim();
       const voiceName = String(req.body?.voiceName || 'Charon');
       if (!text) return res.status(400).json({ error: 'Missing text' });
-      const audioBase64 = await synthesizeJarvisSpeech(text, voiceName);
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      if (runtime?.provider === 'openrouter' && !resolveServerGeminiKey()) {
+        return res.status(400).json({
+          error:
+            'Speech synthesis runs on Gemini models. Add a Gemini key in AI Settings (or set GEMINI_API_KEY on the server) — OpenRouter keys cannot generate audio.',
+        });
+      }
+      const audioBase64 = await synthesizeJarvisSpeech(
+        text,
+        voiceName,
+        runtime?.provider === 'gemini' ? runtime.apiKey : undefined
+      );
       return res.json({ audioBase64, mimeType: 'audio/wav' });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'TTS failed';
@@ -135,8 +160,15 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing research query' });
       }
 
-      const report = await runJarvisResearch({ query, depth, urls });
-      const audioBase64 = speak ? await synthesizeJarvisSpeech(report.spokenSummary, voiceName) : null;
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const report = await runJarvisResearch({ query, depth, urls, runtime });
+      const audioBase64 = speak
+        ? await synthesizeJarvisSpeech(
+            report.spokenSummary,
+            voiceName,
+            runtime?.provider === 'gemini' ? runtime.apiKey : undefined
+          )
+        : null;
       return res.json({
         report,
         audioBase64,
@@ -164,13 +196,30 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing visual prompt' });
       }
 
-      const visual = await generateVisualAsset({
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+
+      // Visuals run on either provider: Gemini native schema or OpenAI-compatible
+      // json_schema (BYOK OpenRouter). Speech narration stays Gemini-only.
+      const visualOptions: Parameters<typeof generateVisualAsset>[0] = {
         prompt,
         style,
         aspectRatio,
         refineFromSvg,
-      });
-      const audioBase64 = speak ? await synthesizeJarvisSpeech(visual.summary, voiceName) : null;
+      };
+      if (runtime?.provider === 'openrouter') {
+        visualOptions.openRouter = { apiKey: runtime.apiKey, model: runtime.model };
+      } else {
+        visualOptions.apiKeyOverride = runtime?.apiKey;
+      }
+
+      const visual = await generateVisualAsset(visualOptions);
+      const audioBase64 = speak
+        ? await synthesizeJarvisSpeech(
+            visual.summary,
+            voiceName,
+            runtime?.provider === 'gemini' ? runtime.apiKey : undefined
+          )
+        : null;
       return res.json({
         ok: true,
         visual,
@@ -304,67 +353,23 @@ async function startServer() {
         plugins: activePlugins,
       };
       const systemInstruction = buildShadowSystemInstruction(normalizedContext);
-      const ai = getGeminiClient();
-      const runCommandTurn = async (contents: Content[]) => {
-        if (Date.now() < preferLiteUntil) {
-          return await withGeminiRetry(
-            () =>
-              ai.models.generateContent({
-                model: 'gemini-3.1-flash-lite',
-                contents,
-                config: {
-                  systemInstruction,
-                  tools: [{ functionDeclarations: combinedDeclarations }],
-                },
-              }),
-            1
-          );
-        }
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
 
-        try {
-          return await withGeminiRetry(
-            () =>
-              ai.models.generateContent({
-                model: 'gemini-4-hydrogen',
-                contents,
-                config: {
-                  systemInstruction,
-                  tools: [{ functionDeclarations: combinedDeclarations }],
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                },
-              }),
-            0
-          );
-        } catch (err) {
-          if (!isOverloadOrQuotaError(err)) throw err;
-          preferLiteUntil = Date.now() + 60_000;
-          return await withGeminiRetry(
-            () =>
-              ai.models.generateContent({
-                model: 'gemini-3.1-flash-lite',
-                contents,
-                config: {
-                  systemInstruction,
-                  tools: [{ functionDeclarations: combinedDeclarations }],
-                },
-              }),
-            1
-          );
-        }
-      };
-
-      const firstResponse = await runCommandTurn([{ role: 'user', parts: [{ text: command }] }]);
-
-      const functionCalls = firstResponse.functionCalls ?? [];
-      const actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
-      let spokenText = (firstResponse.text || '').trim();
-
-      if (functionCalls.length > 0) {
+      // Shared tool executor — identical semantics for both provider paths.
+      const executeToolCalls = async (
+        calls: FunctionCall[]
+      ): Promise<{
+        actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }>;
+        toolResponseParts: Array<{
+          functionResponse: { id?: string; name: string; response: Record<string, unknown> };
+        }>;
+      }> => {
+        const actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
         const toolResponseParts: Array<{
           functionResponse: { id?: string; name: string; response: Record<string, unknown> };
         }> = [];
 
-        for (const call of functionCalls) {
+        for (const call of calls) {
           const args = (call.args ?? {}) as Record<string, unknown>;
           let result: Record<string, unknown> = { ok: true };
 
@@ -377,7 +382,12 @@ async function startServer() {
           } else if (call.name === 'play_youtube_media') {
             const query = String(args.query || command);
             const mediaType = args.mediaType === 'song' ? 'song' : 'video';
-            const results = await searchYouTube(query);
+            const results = await searchYouTube(
+              query,
+              runtime?.provider === 'openrouter'
+                ? { openRouter: { apiKey: runtime.apiKey, model: runtime.model } }
+                : { geminiKeyOverride: runtime?.apiKey }
+            );
             if (results.length > 0) {
               result = { ok: true, mediaType, selected: results[0], alternatives: results.slice(1, 4) };
             } else {
@@ -430,6 +440,7 @@ async function startServer() {
               query: String(args.query || command),
               depth: args.depth === 'quick' ? 'quick' : 'deep',
               urls: Array.isArray(args.urls) ? args.urls.map((u) => String(u)) : [],
+              runtime,
             });
             result = { ok: true, report };
           } else if (call.name === 'generate_visual') {
@@ -437,6 +448,7 @@ async function startServer() {
               prompt: String(args.prompt || command),
               style: normalizeVisualStyle(args.style),
               aspectRatio: normalizeAspectRatio(args.aspectRatio),
+              apiKeyOverride: runtime?.provider === 'gemini' ? runtime.apiKey : undefined,
             });
             result = { ok: true, visual };
           } else if (
@@ -490,12 +502,125 @@ async function startServer() {
           });
         }
 
+        return { actions, toolResponseParts };
+      };
+
+      if (runtime?.provider === 'openrouter') {
+        // BYOK OpenRouter path (OpenAI-compatible tool calling)
+        const orContents: Content[] = [{ role: 'user', parts: [{ text: command }] }];
+        const firstTurn = await openRouterGenerate({
+          apiKey: runtime.apiKey,
+          model: runtime.model,
+          systemInstruction,
+          contents: orContents,
+          tools: combinedDeclarations,
+        });
+        let spokenText = firstTurn.text;
+        let actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+
+        if (firstTurn.functionCalls.length > 0) {
+          const executed = await executeToolCalls(firstTurn.functionCalls);
+          actions = executed.actions;
+          if (firstTurn.modelContent) {
+            const followUp = await openRouterGenerate({
+              apiKey: runtime.apiKey,
+              model: runtime.model,
+              systemInstruction,
+              contents: [...orContents, firstTurn.modelContent, { role: 'user', parts: executed.toolResponseParts }],
+              tools: combinedDeclarations,
+            });
+            spokenText = followUp.text || spokenText || 'Command executed.';
+          }
+        }
+
+        if (!spokenText) {
+          spokenText = 'Ready.';
+        }
+
+        // Voice readout still rides on Gemini TTS (server key) when available.
+        const audioBase64 = speak ? await synthesizeJarvisSpeech(spokenText, voiceName) : null;
+        return res.json({
+          spokenText,
+          actions,
+          audioBase64,
+          audioMimeType: audioBase64 ? 'audio/wav' : null,
+          provider: 'openrouter',
+        });
+      }
+
+      // Gemini path (server key or BYOK Gemini key)
+      const ai = getGeminiClient(runtime?.apiKey);
+      const models = getModelConfig();
+      const deepFirst = preferDeepCommandDefault() || req.body?.preferDeep === true;
+
+      const runDeepTurn = (contents: Content[], retries = 0) =>
+        withGeminiRetry(
+          () =>
+            ai.models.generateContent({
+              model: models.deepText,
+              contents,
+              config: {
+                systemInstruction,
+                tools: [{ functionDeclarations: combinedDeclarations }],
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            }),
+          retries
+        );
+
+      const runFastTurn = (contents: Content[], retries = 1) =>
+        withGeminiRetry(
+          () =>
+            ai.models.generateContent({
+              model: models.fastText,
+              contents,
+              config: {
+                systemInstruction,
+                tools: [{ functionDeclarations: combinedDeclarations }],
+              },
+            }),
+          retries
+        );
+
+      // Fast-first by default: quick commands no longer wait on the deep model's
+      // thinking phase. Deep model is opt-in (SHADOW_USE_DEEP_COMMAND=1 / preferDeep).
+      const runCommandTurn = async (contents: Content[]) => {
+        if (deepFirst) {
+          if (Date.now() < preferLiteUntil) {
+            return runFastTurn(contents);
+          }
+          try {
+            return await runDeepTurn(contents);
+          } catch (err) {
+            if (!isOverloadOrQuotaError(err)) throw err;
+            preferLiteUntil = Date.now() + 60_000;
+            return runFastTurn(contents);
+          }
+        }
+        try {
+          return await runFastTurn(contents);
+        } catch (err) {
+          if (!isOverloadOrQuotaError(err)) throw err;
+          // Fast model temporarily unavailable — one deep attempt before failing.
+          return runDeepTurn(contents);
+        }
+      };
+
+      const firstResponse = await runCommandTurn([{ role: 'user', parts: [{ text: command }] }]);
+
+      const functionCalls = firstResponse.functionCalls ?? [];
+      let spokenText = (firstResponse.text || '').trim();
+      let actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+
+      if (functionCalls.length > 0) {
+        const executed = await executeToolCalls(functionCalls);
+        actions = executed.actions;
         const previousContent = firstResponse.candidates?.[0]?.content;
         if (previousContent) {
           const followUp = await runCommandTurn([
             { role: 'user', parts: [{ text: command }] },
             previousContent,
-            { role: 'user', parts: toolResponseParts },
+            { role: 'user', parts: executed.toolResponseParts },
           ]);
           spokenText = (followUp.text || spokenText || 'Command executed.').trim();
         }
@@ -505,12 +630,15 @@ async function startServer() {
         spokenText = 'Ready.';
       }
 
-      const audioBase64 = speak ? await synthesizeJarvisSpeech(spokenText, voiceName) : null;
+      const audioBase64 = speak
+        ? await synthesizeJarvisSpeech(spokenText, voiceName, runtime?.apiKey)
+        : null;
       return res.json({
         spokenText,
         actions,
         audioBase64,
         audioMimeType: audioBase64 ? 'audio/wav' : null,
+        provider: 'gemini',
       });
     } catch (err) {
       console.error('Assistant command error:', err);
@@ -586,8 +714,62 @@ async function startServer() {
       });
     };
 
+    // BYOK auth handshake: the client announces provider/key as its first WS
+    // message ({type:'ai_auth'}). Legacy clients fall back to server env keys
+    // after a short grace period. Messages received early are queued & flushed.
+    let processMessage: ((raw: string) => void) | null = null;
+    const preAuthQueue: string[] = [];
+    let authTimer: ReturnType<typeof setTimeout> | null = null;
+    let authResolved = false;
+
+    clientWs.on('message', (raw) => {
+      const text = raw.toString();
+      if (!authResolved) {
+        try {
+          const authMsg = JSON.parse(text) as {
+            type?: string;
+            provider?: string;
+            apiKey?: string;
+            model?: string;
+          };
+          if (authMsg?.type === 'ai_auth') {
+            authResolved = true;
+            if (authTimer) {
+              clearTimeout(authTimer);
+              authTimer = null;
+            }
+            void startLiveSession(authMsg);
+            return;
+          }
+        } catch {
+          // Not JSON (legacy client) — queue it; server env keys will be used.
+        }
+        preAuthQueue.push(text);
+        return;
+      }
+      if (processMessage) processMessage(text);
+      else preAuthQueue.push(text);
+    });
+
+    authTimer = setTimeout(() => {
+      authResolved = true;
+      void startLiveSession(null);
+    }, 2500);
+
+    const startLiveSession = async (
+      auth: { provider?: string; apiKey?: string; model?: string } | null
+    ): Promise<void> => {
     try {
-      const ai = getGeminiLiveClient();
+      if ((auth?.provider || '').toLowerCase() === 'openrouter') {
+        safeSend({
+          type: 'error',
+          message:
+            "OpenRouter keys can't drive the Live voice engine (that protocol is Gemini-only). Switch AI provider to Gemini in AI Settings for voice sessions — OpenRouter still powers text commands and research.",
+        });
+        clientWs.close();
+        return;
+      }
+      const ai = getGeminiLiveClient((auth?.apiKey || '').trim() || undefined);
       const activePlugins = normalizePluginDescriptors(sessionContext?.plugins, 30).filter(
         (p) => p.enabled
       );
@@ -596,9 +778,10 @@ async function startServer() {
         ...jarvisToolDeclarations,
         ...buildPluginToolDeclarations(activePlugins),
       ];
+      const liveThinking = resolveLiveThinkingLevel();
 
       session = await ai.live.connect({
-        model: 'gemini-3.8-live',
+        model: getModelConfig().live,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -608,6 +791,8 @@ async function startServer() {
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
+          // MINIMAL thinking keeps first-audio latency low on the voice path.
+          ...(liveThinking ? { thinkingConfig: { thinkingLevel: liveThinking } } : {}),
           tools: [{ functionDeclarations: liveToolDeclarations }],
           systemInstruction: buildShadowSystemInstruction({
             ...(sessionContext ?? {}),
@@ -668,7 +853,9 @@ async function startServer() {
                   } else if (call.name === 'play_youtube_media') {
                     const query = String(args.query || '');
                     const mediaType = args.mediaType === 'song' ? 'song' : 'video';
-                    const results = await searchYouTube(query);
+                    const results = await searchYouTube(query, {
+                      geminiKeyOverride: (auth?.apiKey || '').trim() || undefined,
+                    });
                     if (results.length > 0) {
                       result = {
                         ok: true,
@@ -837,10 +1024,10 @@ async function startServer() {
       return;
     }
 
-    clientWs.on('message', (raw) => {
+    const handleLiveClientMessage = (raw: string) => {
       if (!session || isClosed) return;
       try {
-        const msg = JSON.parse(raw.toString()) as {
+        const msg = JSON.parse(raw) as {
           type?: string;
           data?: string;
           text?: string;
@@ -864,7 +1051,13 @@ async function startServer() {
       } catch (err) {
         console.warn('Invalid WS message from client:', err);
       }
-    });
+    };
+
+    processMessage = handleLiveClientMessage;
+    for (const queued of preAuthQueue.splice(0)) {
+      handleLiveClientMessage(queued);
+    }
+    };
 
     clientWs.on('close', () => {
       isClosed = true;

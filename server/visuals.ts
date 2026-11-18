@@ -1,5 +1,6 @@
 import { ThinkingLevel, Type } from '@google/genai';
-import { getGeminiClient, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
+import { openRouterGenerate } from './ai-provider.ts';
+import { getGeminiClient, getModelConfig, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
 
 export type VisualStyle = 'auto' | 'diagram' | 'chart' | 'illustration' | 'wireframe';
 export type VisualAspectRatio = '16:9' | '1:1' | '4:3' | '3:4';
@@ -89,6 +90,9 @@ export async function generateVisualAsset(input: {
   style?: VisualStyle;
   aspectRatio?: VisualAspectRatio;
   refineFromSvg?: string;
+  apiKeyOverride?: string;
+  /** BYOK OpenRouter runtime — visuals also run on OpenAI-compatible models. */
+  openRouter?: { apiKey: string; model: string };
 }): Promise<GeneratedVisualPayload> {
   const prompt = String(input.prompt || '').trim();
   if (!prompt) {
@@ -97,7 +101,6 @@ export async function generateVisualAsset(input: {
   const style = normalizeVisualStyle(input.style);
   const aspectRatio = normalizeAspectRatio(input.aspectRatio);
   const { width, height } = ASPECT_DIMENSIONS[aspectRatio];
-  const ai = getGeminiClient();
 
   const systemInstruction = `You are a master visual designer, technical illustrator, and data visualization architect creating bespoke, high-craft SVG visuals.
 
@@ -145,46 +148,66 @@ Strict requirements for svgMarkup:
     required: ['title', 'kind', 'summary', 'palette', 'svgMarkup'],
   };
 
-  let response;
-  try {
-    response = await withGeminiRetry(
-      () =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: userParts,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        }),
-      1
-    );
-  } catch (err) {
-    if (!isOverloadOrQuotaError(err)) throw err;
-    response = await withGeminiRetry(
-      () =>
-        ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: userParts,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema,
-          },
-        }),
-      1
-    );
-  }
-
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+  let parsed: {
     title?: string;
     kind?: string;
     summary?: string;
     palette?: string[];
     svgMarkup?: string;
   };
+
+  if (input.openRouter) {
+    // BYOK OpenRouter path: same schema contract via OpenAI json_schema response format.
+    const turn = await openRouterGenerate({
+      apiKey: input.openRouter.apiKey,
+      model: input.openRouter.model,
+      systemInstruction,
+      contents: [{ role: 'user', parts: [{ text: userParts }] }],
+      jsonSchema: responseSchema as unknown as Record<string, unknown>,
+      temperature: 0.6,
+    });
+    try {
+      const cleaned = turn.text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+      parsed = JSON.parse(cleaned || '{}') as typeof parsed;
+    } catch {
+      throw new Error('OpenRouter model returned malformed visual JSON. Try a different model.');
+    }
+  } else {
+    const ai = getGeminiClient(input.apiKeyOverride);
+    let response;
+    try {
+      response = await withGeminiRetry(
+        () =>
+          ai.models.generateContent({
+            model: getModelConfig().deepText,
+            contents: userParts,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          }),
+        1
+      );
+    } catch (err) {
+      if (!isOverloadOrQuotaError(err)) throw err;
+      response = await withGeminiRetry(
+        () =>
+          ai.models.generateContent({
+            model: getModelConfig().fastText,
+            contents: userParts,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema,
+            },
+          }),
+        1
+      );
+    }
+    parsed = JSON.parse((response.text ?? '{}').trim()) as typeof parsed;
+  }
 
   const sanitizedSvg = sanitizeSvgMarkup(parsed.svgMarkup || '', width, height);
   const rawKind = String(parsed.kind || style).toLowerCase();

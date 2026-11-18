@@ -1,5 +1,5 @@
 import { FunctionDeclaration, Type } from '@google/genai';
-import { getGeminiClient, withGeminiRetry } from './gemini.ts';
+import { getGeminiClient, getModelConfig, withGeminiRetry } from './gemini.ts';
 import type { PluginRuntimeDescriptor } from './plugins.ts';
 
 export interface AutomationStep {
@@ -684,14 +684,15 @@ export const JARVIS_SYSTEM_INSTRUCTION = buildShadowSystemInstruction();
 
 export async function synthesizeJarvisSpeech(
   text: string,
-  voiceName = 'Charon'
+  voiceName = 'Charon',
+  apiKeyOverride?: string
 ): Promise<string | null> {
   if (!text.trim()) return null;
   try {
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(apiKeyOverride);
     const response = await withGeminiRetry(() =>
       ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
+        model: getModelConfig().tts,
         contents: [
           {
             role: 'user',
