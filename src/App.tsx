@@ -95,6 +95,7 @@ import {
   type DesktopRuntimeInfo,
 } from './lib/tauriBridge';
 import { buildWindowLayoutInspection } from './lib/windowLayout';
+import { API_ORIGIN, API_WS_HOST } from './lib/apiBase';
 import {
   aiRequestHeaders,
   aiSocketAuthMessage,
@@ -1489,7 +1490,7 @@ function JarvisArcWorkspace() {
 
         let ctxQuery = '';
         try {
-          const ctxRes = await fetch('/api/assistant/context', {
+          const ctxRes = await fetch(`${API_ORIGIN}/api/assistant/context`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(buildSessionContextPayload()),
@@ -1501,7 +1502,7 @@ function JarvisArcWorkspace() {
         }
 
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${window.location.host}/ws/live?voice=${voiceName}${ctxQuery}`);
+        const ws = new WebSocket(`${proto}//${API_WS_HOST || window.location.host}/ws/live?voice=${voiceName}${ctxQuery}`);
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -1815,7 +1816,7 @@ function JarvisArcWorkspace() {
       beginCommandCue('command', `Processing: ${clean.slice(0, 44)}`);
 
       try {
-        const res = await fetch('/api/assistant/command', {
+        const res = await fetch(`${API_ORIGIN}/api/assistant/command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
@@ -1879,7 +1880,7 @@ function JarvisArcWorkspace() {
       setActiveDrawer('youtube');
       beginCommandCue('youtube', `YouTube: ${query.slice(0, 44)}`);
       try {
-        const res = await fetch(`/api/youtube/search?q=${encodeURIComponent(query)}`);
+        const res = await fetch(`${API_ORIGIN}/api/youtube/search?q=${encodeURIComponent(query)}`);
         const data = (await res.json()) as { results?: YouTubeTrack[] };
         const first = data.results?.[0];
         if (!first) {
@@ -1911,7 +1912,7 @@ function JarvisArcWorkspace() {
       setActiveDrawer('automation');
       beginCommandCue('automation', `Inspecting: ${url.slice(0, 44)}`);
       try {
-        const res = await fetch('/api/automation/inspect', {
+        const res = await fetch(`${API_ORIGIN}/api/automation/inspect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
@@ -1998,7 +1999,7 @@ function JarvisArcWorkspace() {
       if (!clean) return;
       showTransientCaption(assistantNameRef.current, clean, 7000);
       try {
-        const res = await fetch('/api/assistant/tts', {
+        const res = await fetch(`${API_ORIGIN}/api/assistant/tts`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ text: clean, voiceName }),
@@ -2018,8 +2019,8 @@ function JarvisArcWorkspace() {
   const refreshBriefs = useCallback(async () => {
     try {
       const [todayRes, historyRes] = await Promise.all([
-        fetch('/api/brief/today'),
-        fetch('/api/brief/history?limit=20'),
+        fetch(`${API_ORIGIN}/api/brief/today`),
+        fetch(`${API_ORIGIN}/api/brief/history?limit=20`),
       ]);
       if (todayRes.ok) {
         const data = (await todayRes.json()) as {
@@ -2062,7 +2063,7 @@ function JarvisArcWorkspace() {
     setVoiceError(null);
     beginCommandCue('research', 'Compiling morning brief');
     try {
-      const res = await fetch('/api/brief/run', {
+      const res = await fetch(`${API_ORIGIN}/api/brief/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
         body: JSON.stringify({ voiceName }),
@@ -2094,7 +2095,7 @@ function JarvisArcWorkspace() {
 
   const handleSaveBriefConfig = useCallback(async (next: MorningBriefConfig) => {
     try {
-      const res = await fetch('/api/brief/config', {
+      const res = await fetch(`${API_ORIGIN}/api/brief/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(next),
@@ -2122,7 +2123,7 @@ function JarvisArcWorkspace() {
       beginCommandCue('research', `Researching: ${clean.slice(0, 44)}`);
 
       try {
-        const res = await fetch('/api/research/run', {
+        const res = await fetch(`${API_ORIGIN}/api/research/run`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: true }),
@@ -2181,7 +2182,7 @@ function JarvisArcWorkspace() {
       beginCommandCue('visuals', `Creating visual: ${clean.slice(0, 40)}`);
 
       try {
-        const res = await fetch('/api/visuals/generate', {
+        const res = await fetch(`${API_ORIGIN}/api/visuals/generate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
@@ -2274,7 +2275,7 @@ function JarvisArcWorkspace() {
     ): Promise<PluginExecutionResult> => {
       const started = Date.now();
       beginCommandCue('plugin', `Plugin: ${plugin.name}`);
-      const res = await fetch('/api/plugins/execute', {
+      const res = await fetch(`${API_ORIGIN}/api/plugins/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plugin, args }),
@@ -2736,7 +2737,7 @@ function JarvisArcWorkspace() {
                   onRequireAuth={() => void handleSignIn()}
                   onRunWorkflow={async (wf) => {
                     if (user) void incrementWorkflowRunCount(wf.id, wf.runCount);
-                    const inspectionRes = await fetch('/api/automation/inspect', {
+                    const inspectionRes = await fetch(`${API_ORIGIN}/api/automation/inspect`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ url: wf.targetUrl }),

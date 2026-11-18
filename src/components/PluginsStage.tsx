@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
+import { API_ORIGIN } from '../lib/apiBase';
 import {
   Check,
   Code2,
@@ -118,7 +119,7 @@ export const PluginsStage: React.FC<PluginsStageProps> = ({
   useEffect(() => {
     let active = true;
     setCatalogLoading(true);
-    fetch('/api/plugins/catalog')
+    fetch(`${API_ORIGIN}/api/plugins/catalog`)
       .then((r) => r.json())
       .then((d: { ok?: boolean; catalog?: Array<Omit<ShadowPlugin, 'id' | 'runCount'>> }) => {
         if (active && Array.isArray(d.catalog)) {
@@ -351,7 +352,7 @@ export const PluginsStage: React.FC<PluginsStageProps> = ({
     setImportBusy(true);
     setImportStatus(null);
     try {
-      const res = await fetch('/api/plugins/fetch-manifest', {
+      const res = await fetch(`${API_ORIGIN}/api/plugins/fetch-manifest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: manifestUrl.trim() }),

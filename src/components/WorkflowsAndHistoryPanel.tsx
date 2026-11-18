@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
+import { API_ORIGIN } from '../lib/apiBase';
 import {
   Check,
   CheckCircle2,
@@ -483,7 +484,7 @@ export const TauriDesktopView: React.FC<TauriDesktopViewProps> = ({
   };
 
   React.useEffect(() => {
-    void fetch('/api/desktop/scripts')
+    void fetch(`${API_ORIGIN}/api/desktop/scripts`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data: { ok?: boolean; files?: Record<string, string> } | null) => {
         if (data?.ok && data.files) setScriptsBundle(data.files);
