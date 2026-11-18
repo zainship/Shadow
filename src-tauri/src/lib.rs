@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +72,131 @@ fn resolve_agent_script_path() -> Option<PathBuf> {
         PathBuf::from("../scripts/shadow-laptop-agent.mjs"),
     ];
     candidates.into_iter().find(|p| p.exists())
+}
+
+const SERVER_PORT: u16 = 3000;
+
+fn server_port_reachable(timeout: Duration) -> bool {
+    let addr: SocketAddr = format!("127.0.0.1:{}", SERVER_PORT)
+        .parse()
+        .expect("static server address must parse");
+    TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+/// Poll 127.0.0.1:SERVER_PORT until it accepts connections or the server
+/// process dies, whichever comes first.
+fn wait_for_server(deadline: Duration, mut child: Option<&mut std::process::Child>) -> bool {
+    let start = Instant::now();
+    loop {
+        if server_port_reachable(Duration::from_millis(300)) {
+            return true;
+        }
+        let exited = match child.as_deref_mut() {
+            Some(c) => c
+                .try_wait()
+                .map(|status| status.is_some())
+                .unwrap_or(false),
+            None => false,
+        };
+        if exited {
+            return false;
+        }
+        if start.elapsed() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    server_port_reachable(Duration::from_millis(300))
+}
+
+/// Locate the Shadow repository checkout that powers this desktop shell.
+/// Order: explicit SHADOW_PROJECT_ROOT override, the working directory,
+/// directories above the executable (repo / src-tauri / target/release),
+/// then ~/Shadow.
+fn find_project_root() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("SHADOW_PROJECT_ROOT") {
+        if !root.trim().is_empty() {
+            candidates.push(PathBuf::from(root.trim()));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..4 {
+            match dir {
+                Some(d) => {
+                    candidates.push(d.clone());
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+                None => break,
+            }
+        }
+    }
+    candidates.push(dirs_home().join("Shadow"));
+    candidates.into_iter().find(|d| {
+        d.join("server.ts").is_file() && d.join("package.json").is_file()
+    })
+}
+
+fn spawn_server_process(root: &Path, use_tsx: bool) -> Option<std::process::Child> {
+    let data_dir = root.join("data");
+    fs::create_dir_all(&data_dir).ok()?;
+    let out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("server.log"))
+        .ok()?;
+    let err = out.try_clone().ok()?;
+
+    let mut cmd = Command::new("node");
+    if use_tsx {
+        // Older Node (< 23.6) cannot run TypeScript directly; the repo's
+        // devDependency tsx can, without needing npx/network.
+        cmd.arg(root.join("node_modules").join("tsx").join("dist").join("cli.mjs"));
+    }
+    cmd.arg("server.ts");
+    cmd.current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn().ok()
+}
+
+/// The packaged app serves the UI itself, but the API/voice server is the
+/// Node process in the Shadow checkout. Make the app self-sufficient: if
+/// nothing is listening on 127.0.0.1:3000, start it before the window opens.
+/// The spawned server is left running when the app closes so the Morning
+/// Brief scheduler keeps ticking; logs land in <repo>/data/server.log.
+fn ensure_local_server() {
+    if server_port_reachable(Duration::from_millis(600)) {
+        return;
+    }
+    let Some(root) = find_project_root() else {
+        return;
+    };
+
+    // Node >= 23.6 strips TypeScript natively (same as `npm start`).
+    if let Some(mut child) = spawn_server_process(&root, false) {
+        if wait_for_server(Duration::from_secs(8), Some(&mut child)) {
+            return;
+        }
+        let _ = child.kill();
+        // Older Node: fall back to the bundled tsx runner.
+        if let Some(mut tsx_child) = spawn_server_process(&root, true) {
+            let _ = wait_for_server(Duration::from_secs(15), Some(&mut tsx_child));
+        }
+    }
 }
 
 #[tauri::command]
@@ -604,6 +732,7 @@ fn launch_background_agent() -> Result<serde_json::Value, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ensure_local_server();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_runtime_environment,

@@ -98,11 +98,26 @@ export const FaceAuthGateModal: React.FC<FaceAuthGateModalProps> = ({
     } catch (err) {
       setScanning(false);
       setCameraActive(false);
-      setCameraError(
-        err instanceof Error
-          ? err.message
-          : 'Camera unavailable. Use your backup PIN to unlock.'
-      );
+      const name = err instanceof DOMException ? err.name : '';
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        setCameraError(
+          'Camera permission was denied. Press "Verify Face to Unlock" again and choose Allow in the permission prompt. If no prompt appears, allow camera access for desktop apps in Windows Settings → Privacy & security → Camera (macOS: System Settings → Privacy & Security → Camera). You can always unlock with your backup PIN.'
+        );
+      } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+        setCameraError(
+          'No usable camera was found. Connect or enable a webcam, or unlock with your backup PIN.'
+        );
+      } else if (name === 'NotReadableError') {
+        setCameraError(
+          'The camera is busy in another app. Close it and retry, or unlock with your backup PIN.'
+        );
+      } else {
+        setCameraError(
+          err instanceof Error
+            ? `${err.message} — you can unlock with your backup PIN instead.`
+            : 'Camera unavailable. Use your backup PIN to unlock.'
+        );
+      }
     }
   };
 
@@ -168,6 +183,9 @@ export const FaceAuthGateModal: React.FC<FaceAuthGateModalProps> = ({
             <div className="text-center p-6 space-y-2">
               <ShieldCheck className="w-8 h-8 text-slate-500 mx-auto" />
               <p className="text-xs text-slate-400">Ready for facial verification</p>
+              <p className="text-[11px] text-slate-500">
+                Your first verification will ask for camera permission.
+              </p>
             </div>
           )}
           {similarityPct !== null && (
