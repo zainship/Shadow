@@ -315,3 +315,40 @@ export interface GeneratedVisual {
   createdAt: number;
 }
 
+export interface BriefSourceRef {
+  title: string;
+  url: string;
+}
+
+export interface MorningBriefSection {
+  title: string;
+  bullets: string[];
+  sources: BriefSourceRef[];
+}
+
+export interface MorningBrief {
+  id: string;
+  /** Local date key (YYYY-MM-DD) the brief was generated for. */
+  date: string;
+  generatedAt: number;
+  headline: string;
+  sections: MorningBriefSection[];
+  action: string;
+  spokenSummary: string;
+  audioBase64?: string | null;
+  topics: string[];
+  provider: string;
+}
+
+export interface MorningBriefConfig {
+  enabled: boolean;
+  /** 24h local time, 'HH:MM'. */
+  time: string;
+  topics: string[];
+  voiceName: VoiceName;
+  speakOnUnlock: boolean;
+  /** Server-managed run bookkeeping. */
+  lastRunDate?: string;
+  lastAttemptAt?: number;
+}
+

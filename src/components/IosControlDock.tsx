@@ -25,12 +25,14 @@ import {
   Settings2,
   SlidersHorizontal,
   Square,
+  Sunrise,
   Volume2,
   VolumeX,
 } from 'lucide-react';
 import type { VoiceName, WakeMode } from '../types/assistant';
 
 export type DockDrawerTab =
+  | 'brief'
   | 'research'
   | 'visuals'
   | 'automation'
@@ -55,6 +57,7 @@ interface IosControlDockProps {
   isAssistantSpeaking: boolean;
   isResearching: boolean;
   isGeneratingVisual?: boolean;
+  briefPending?: boolean;
   isAutomating: boolean;
   hasActiveVisual?: boolean;
   hasActiveTrack: boolean;
@@ -178,6 +181,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
   isAssistantSpeaking,
   isResearching,
   isGeneratingVisual = false,
+  briefPending = false,
   isAutomating,
   hasActiveVisual = false,
   hasActiveTrack,
@@ -235,6 +239,16 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
     running: boolean;
     accentClass: string;
   }> = [
+    {
+      id: 'brief',
+      label: 'Brief',
+      icon: <Sunrise className="w-5 h-5" />,
+      running: Boolean(briefPending),
+      accentClass:
+        activeDrawer === 'brief'
+          ? 'bg-gradient-to-b from-orange-400 to-rose-500 text-white shadow-[0_8px_20px_rgba(251,113,133,0.45),inset_0_1px_0_rgba(255,255,255,0.35)]'
+          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-orange-300 border border-white/10 hover:border-orange-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
+    },
     {
       id: 'research',
       label: 'Research',

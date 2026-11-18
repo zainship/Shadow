@@ -26,6 +26,14 @@ import type { Content, FunctionCall } from '@google/genai';
 import { searchYouTube } from './server/youtube.ts';
 import { runJarvisResearch } from './server/research.ts';
 import {
+  getBriefHistory,
+  getTodayBrief,
+  loadBriefConfig,
+  runMorningBrief,
+  saveBriefConfig,
+  startBriefScheduler,
+} from './server/brief.ts';
+import {
   generateVisualAsset,
   normalizeAspectRatio,
   normalizeVisualStyle,
@@ -177,6 +185,44 @@ async function startServer() {
     } catch (err) {
       console.error('Research error:', err);
       const { status, message } = parseGeminiHttpError(err, 'Research failed');
+      return res.status(status).json({ error: message });
+    }
+  });
+
+  // Morning Brief endpoints
+  app.get('/api/brief/config', (_req, res) => {
+    res.json({ config: loadBriefConfig() });
+  });
+
+  app.post('/api/brief/config', (req, res) => {
+    try {
+      const config = saveBriefConfig(req.body ?? {});
+      return res.json({ config });
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid brief config' });
+    }
+  });
+
+  app.get('/api/brief/today', (_req, res) => {
+    res.json({ brief: getTodayBrief(), config: loadBriefConfig() });
+  });
+
+  app.get('/api/brief/history', (req, res) => {
+    const limit = Number(req.query.limit || 20);
+    res.json({ briefs: getBriefHistory(limit) });
+  });
+
+  app.post('/api/brief/run', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const brief = await runMorningBrief({
+        runtime,
+        voiceName: String(req.body?.voiceName || '').trim() || undefined,
+      });
+      return res.json({ brief });
+    } catch (err) {
+      console.error('Morning brief error:', err);
+      const { status, message } = parseGeminiHttpError(err, 'Morning Brief failed');
       return res.status(status).json({ error: message });
     }
   });
@@ -1075,6 +1121,8 @@ async function startServer() {
       }
     });
   });
+
+  startBriefScheduler();
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Shadow Desktop server listening on http://localhost:${PORT}`);

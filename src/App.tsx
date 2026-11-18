@@ -11,6 +11,7 @@ import {
   LogOut,
   Monitor,
   Play,
+  Sunrise,
 } from 'lucide-react';
 import {
   ArcReactorScene,
@@ -24,6 +25,7 @@ import { FaceAuthGateModal } from './components/FaceAuthGateModal';
 import { FirstLaunchSetupModal, type SeedMemoryDraft } from './components/FirstLaunchSetupModal';
 import { IosControlDock } from './components/IosControlDock';
 import { MacWindowFrame } from './components/MacWindowShell';
+import { MorningBriefStage } from './components/MorningBriefStage';
 import { PluginsStage, type PluginActivityLog } from './components/PluginsStage';
 import { ResearchStage } from './components/ResearchStage';
 import { VisualsStage } from './components/VisualsStage';
@@ -123,11 +125,14 @@ import type {
   VisualStyle,
   VoiceName,
   WakeMode,
+  MorningBrief,
+  MorningBriefConfig,
   WindowLayoutMode,
   YouTubeTrack,
 } from './types/assistant';
 
 type DrawerTab =
+  | 'brief'
   | 'research'
   | 'automation'
   | 'youtube'
@@ -139,6 +144,37 @@ type DrawerTab =
 
 const VOICES: VoiceName[] = ['Charon', 'Fenrir', 'Zephyr', 'Kore', 'Puck'];
 const VISUALS_STORAGE_KEY = 'shadow_visuals_v1';
+const BRIEF_SEEN_STORAGE_KEY = 'shadow_brief_seen_v1';
+
+function todayKey(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+    now.getDate()
+  ).padStart(2, '0')}`;
+}
+
+function loadBriefSeenDate(): string {
+  try {
+    return window.localStorage.getItem(BRIEF_SEEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function saveBriefSeenDate(date: string): void {
+  try {
+    window.localStorage.setItem(BRIEF_SEEN_STORAGE_KEY, date);
+  } catch {
+    // ignore persistence failures
+  }
+}
+
+const DEFAULT_BRIEF_CONFIG: MorningBriefConfig = {
+  enabled: false,
+  time: '08:00',
+  topics: ['top technology & AI news'],
+  voiceName: 'Charon',
+  speakOnUnlock: true,
+};
 
 function loadLocalVisuals(): GeneratedVisual[] {
   try {
@@ -238,6 +274,11 @@ function JarvisArcWorkspace() {
   const [currentVisual, setCurrentVisual] = useState<GeneratedVisual | null>(
     () => loadLocalVisuals()[0] ?? null
   );
+  const [briefToday, setBriefToday] = useState<MorningBrief | null>(null);
+  const [briefConfig, setBriefConfig] = useState<MorningBriefConfig>(() => ({ ...DEFAULT_BRIEF_CONFIG }));
+  const [briefHistory, setBriefHistory] = useState<MorningBrief[]>([]);
+  const [isBriefRunning, setIsBriefRunning] = useState(false);
+  const [briefSeenDate, setBriefSeenDate] = useState<string>(() => loadBriefSeenDate());
   const [currentTrack, setCurrentTrack] = useState<YouTubeTrack | null>(null);
   const [localQueue, setLocalQueue] = useState<YouTubeTrack[]>([]);
   const [pendingPlayerAction, setPendingPlayerAction] = useState<{
@@ -1974,6 +2015,98 @@ function JarvisArcWorkspace() {
     [voiceName, showTransientCaption]
   );
 
+  const refreshBriefs = useCallback(async () => {
+    try {
+      const [todayRes, historyRes] = await Promise.all([
+        fetch('/api/brief/today'),
+        fetch('/api/brief/history?limit=20'),
+      ]);
+      if (todayRes.ok) {
+        const data = (await todayRes.json()) as {
+          brief?: MorningBrief | null;
+          config?: MorningBriefConfig;
+        };
+        if (data.brief !== undefined) setBriefToday(data.brief ?? null);
+        if (data.config) setBriefConfig(data.config);
+      }
+      if (historyRes.ok) {
+        const data = (await historyRes.json()) as { briefs?: MorningBrief[] };
+        if (Array.isArray(data.briefs)) setBriefHistory(data.briefs);
+      }
+    } catch {
+      // briefs are optional; ignore fetch failures silently
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshBriefs();
+    const timer = window.setInterval(() => void refreshBriefs(), 120_000);
+    return () => window.clearInterval(timer);
+  }, [refreshBriefs]);
+
+  const markBriefSeen = useCallback((date: string) => {
+    setBriefSeenDate(date);
+    saveBriefSeenDate(date);
+  }, []);
+
+  // Opening the Brief stage acknowledges today's brief.
+  useEffect(() => {
+    if (activeDrawer === 'brief' && briefToday && briefSeenDate !== briefToday.date) {
+      markBriefSeen(briefToday.date);
+    }
+  }, [activeDrawer, briefToday, briefSeenDate, markBriefSeen]);
+
+  const handleRunBrief = useCallback(async () => {
+    if (isBriefRunning) return;
+    setIsBriefRunning(true);
+    setVoiceError(null);
+    beginCommandCue('research', 'Compiling morning brief');
+    try {
+      const res = await fetch('/api/brief/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
+        body: JSON.stringify({ voiceName }),
+      });
+      const data = (await res.json()) as { brief?: MorningBrief; error?: string };
+      if (!res.ok) throw new Error(data.error || 'Morning Brief failed');
+      if (data.brief) {
+        setBriefToday(data.brief);
+        markBriefSeen(data.brief.date);
+        showTransientCaption(assistantNameRef.current, data.brief.headline, 6000);
+      }
+      finishCommandCue('research', 'Morning brief ready', true);
+      void refreshBriefs();
+    } catch (err) {
+      finishCommandCue('research', 'Morning brief failed', false);
+      setVoiceError(err instanceof Error ? err.message : 'Morning Brief failed');
+    } finally {
+      setIsBriefRunning(false);
+    }
+  }, [
+    isBriefRunning,
+    voiceName,
+    beginCommandCue,
+    finishCommandCue,
+    markBriefSeen,
+    refreshBriefs,
+    showTransientCaption,
+  ]);
+
+  const handleSaveBriefConfig = useCallback(async (next: MorningBriefConfig) => {
+    try {
+      const res = await fetch('/api/brief/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(next),
+      });
+      const data = (await res.json()) as { config?: MorningBriefConfig; error?: string };
+      if (!res.ok || !data.config) throw new Error(data.error || 'Could not save brief settings');
+      setBriefConfig(data.config);
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : 'Could not save brief settings');
+    }
+  }, []);
+
   const handleRunResearch = useCallback(
     async (query: string, depth: 'quick' | 'deep', urls: string[]) => {
       if (!isToolPermitted('research_topic')) {
@@ -2262,6 +2395,10 @@ function JarvisArcWorkspace() {
                               : 'Click Core or Press Speak'
                           : 'Click Core or Press Speak';
 
+  const briefPending = Boolean(
+    briefToday && briefToday.date === todayKey() && briefSeenDate !== briefToday.date
+  );
+
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#06090F] text-[#F3F4F6] select-none">
       {/* Full-Viewport Centered 3D Arc Reactor */}
@@ -2292,6 +2429,7 @@ function JarvisArcWorkspace() {
         <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-400 pointer-events-auto">
           {(
             [
+              { id: 'brief', label: 'Brief' },
               { id: 'research', label: 'Research' },
               { id: 'automation', label: 'Automation' },
               { id: 'youtube', label: 'YouTube' },
@@ -2453,7 +2591,9 @@ function JarvisArcWorkspace() {
           >
             <MacWindowFrame
               title={
-                activeDrawer === 'research'
+                activeDrawer === 'brief'
+                  ? 'Morning Brief'
+                  : activeDrawer === 'research'
                   ? 'Research'
                   : activeDrawer === 'visuals'
                     ? 'Visuals'
@@ -2466,7 +2606,9 @@ function JarvisArcWorkspace() {
                           : 'Desktop App'
               }
               subtitle={
-                activeDrawer === 'research'
+                activeDrawer === 'brief'
+                  ? 'Your Daily Intelligence Digest'
+                  : activeDrawer === 'research'
                   ? 'Grounded Web Intelligence'
                   : activeDrawer === 'visuals'
                     ? 'Diagrams, Charts & Vector Studio'
@@ -2479,7 +2621,9 @@ function JarvisArcWorkspace() {
                           : 'Laptop Agent & Terminal'
               }
               icon={
-                activeDrawer === 'research' ? (
+                activeDrawer === 'brief' ? (
+                  <Sunrise className="w-3.5 h-3.5 text-orange-300" />
+                ) : activeDrawer === 'research' ? (
                   <Compass className="w-3.5 h-3.5 text-indigo-300" />
                 ) : activeDrawer === 'visuals' ? (
                   <ImageIcon className="w-3.5 h-3.5 text-purple-300" />
@@ -2517,6 +2661,19 @@ function JarvisArcWorkspace() {
                   }}
                   onSpeakBrief={(text) => void handleSpeakText(text)}
                   onInspectSourceUrl={(url) => void handleInspectUrl(url)}
+                />
+              )}
+
+              {activeDrawer === 'brief' && (
+                <MorningBriefStage
+                  brief={briefToday}
+                  history={briefHistory}
+                  config={briefConfig}
+                  voices={VOICES}
+                  isRunning={isBriefRunning}
+                  onRunNow={() => void handleRunBrief()}
+                  onSaveConfig={(next) => void handleSaveBriefConfig(next)}
+                  onSpeak={(text) => void handleSpeakText(text)}
                 />
               )}
 
@@ -2718,6 +2875,7 @@ function JarvisArcWorkspace() {
         isResearching={isResearching}
         isAutomating={isAutomating}
         isGeneratingVisual={isGeneratingVisual}
+        briefPending={briefPending}
         hasActiveTrack={Boolean(currentTrack)}
         hasActiveVisual={Boolean(currentVisual)}
         hasActivePlugins={plugins.some((p) => p.enabled)}
@@ -2836,6 +2994,18 @@ function JarvisArcWorkspace() {
                 : 'Identity verified.',
               4000
             );
+            // Morning Brief delivery: if a fresh brief is waiting, announce it
+            // after the welcome and play the spoken digest when configured.
+            if (briefToday && briefToday.date === todayKey() && briefSeenDate !== briefToday.date) {
+              const freshBrief = briefToday;
+              window.setTimeout(() => {
+                showTransientCaption(assistantName, freshBrief.headline, 6000);
+                if (briefConfig?.speakOnUnlock && freshBrief.audioBase64) {
+                  void playerRef.current.playWavBase64(freshBrief.audioBase64 as string);
+                }
+              }, 1200);
+              markBriefSeen(freshBrief.date);
+            }
           }}
         />
       )}
