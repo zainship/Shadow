@@ -7,3 +7,6 @@ coverage/
 .env*
 !.env.example
 data/
+
+# Rust build artifacts
+src-tauri/target/
