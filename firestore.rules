@@ -1,0 +1,463 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitive Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidPermissionsMap(perms) {
+      return perms is map
+        && perms.keys().hasAll(['files', 'apps', 'terminal', 'browser', 'research', 'youtube', 'memory', 'faceAuth'])
+        && perms.keys().hasOnly(['files', 'apps', 'terminal', 'browser', 'research', 'youtube', 'memory', 'faceAuth'])
+        && perms.files is bool
+        && perms.apps is bool
+        && perms.terminal is bool
+        && perms.browser is bool
+        && perms.research is bool
+        && perms.youtube is bool
+        && perms.memory is bool
+        && perms.faceAuth is bool;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'voiceName', 'wakeMode', 'defaultBrowser', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'voiceName', 'wakeMode', 'defaultBrowser', 'assistantName', 'userPreferredName', 'setupCompleted', 'faceAuthEnabled', 'clapWakeEnabled', 'permissions', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.voiceName in ['Charon', 'Fenrir', 'Zephyr', 'Kore', 'Puck']
+        && data.wakeMode in ['push-to-talk', 'continuous']
+        && data.defaultBrowser in ['chromium', 'system-default', 'sandbox']
+        && (!('assistantName' in data) || (data.assistantName is string && data.assistantName.size() >= 1 && data.assistantName.size() <= 60))
+        && (!('userPreferredName' in data) || (data.userPreferredName is string && data.userPreferredName.size() <= 80))
+        && (!('setupCompleted' in data) || data.setupCompleted is bool)
+        && (!('faceAuthEnabled' in data) || data.faceAuthEnabled is bool)
+        && (!('clapWakeEnabled' in data) || data.clapWakeEnabled is bool)
+        && (!('permissions' in data) || isValidPermissionsMap(data.permissions))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 320
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserFaceAuth(data, userId) {
+      return data.keys().hasAll(['uid', 'descriptor', 'sampleCount', 'threshold', 'passcodeHash', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'descriptor', 'sampleCount', 'threshold', 'passcodeHash', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.descriptor is list && data.descriptor.size() >= 16 && data.descriptor.size() <= 128 && data.descriptor[0] is number
+        && data.sampleCount is int && data.sampleCount >= 1 && data.sampleCount <= 10
+        && data.threshold is number && data.threshold >= 0.5 && data.threshold <= 0.99
+        && data.passcodeHash is string && data.passcodeHash.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkflowStep(step) {
+      return step is map
+        && step.keys().hasAll(['action', 'selector', 'value', 'description'])
+        && step.keys().hasOnly(['action', 'selector', 'value', 'description'])
+        && step.action in ['navigate', 'click', 'fill', 'select', 'submit', 'wait', 'extract', 'scroll']
+        && step.selector is string && step.selector.size() <= 240
+        && step.value is string && step.value.size() <= 500
+        && step.description is string && step.description.size() >= 1 && step.description.size() <= 240;
+    }
+
+    function isValidWorkflow(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'voiceTrigger', 'targetUrl', 'category', 'steps', 'runCount', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'voiceTrigger', 'targetUrl', 'category', 'steps', 'runCount', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.voiceTrigger is string && data.voiceTrigger.size() >= 1 && data.voiceTrigger.size() <= 200
+        && data.targetUrl is string && data.targetUrl.size() <= 1000
+        && data.category in ['navigation', 'form-fill', 'media', 'research']
+        && data.steps is list && data.steps.size() >= 1 && data.steps.size() <= 15
+        && isValidWorkflowStep(data.steps[0])
+        && data.runCount is int && data.runCount >= 0 && data.runCount <= 1000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExecution(data) {
+      return data.keys().hasAll(['ownerId', 'transcript', 'intent', 'targetUrl', 'status', 'stepsCount', 'summary', 'runtime', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'transcript', 'intent', 'targetUrl', 'status', 'stepsCount', 'summary', 'runtime', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.transcript is string && data.transcript.size() >= 1 && data.transcript.size() <= 500
+        && data.intent in ['browser_automation', 'youtube_play', 'youtube_control', 'workflow_run', 'research', 'plugin_run', 'conversation']
+        && data.targetUrl is string && data.targetUrl.size() <= 1000
+        && data.status in ['running', 'completed', 'failed']
+        && data.stepsCount is int && data.stepsCount >= 0 && data.stepsCount <= 50
+        && data.summary is string && data.summary.size() <= 1000
+        && data.runtime in ['tauri-desktop', 'web-sandbox']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMediaQueueItem(data) {
+      return data.keys().hasAll(['ownerId', 'videoId', 'title', 'channel', 'thumbnailUrl', 'mediaType', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'videoId', 'title', 'channel', 'thumbnailUrl', 'mediaType', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.videoId is string && data.videoId.size() >= 4 && data.videoId.size() <= 32 && data.videoId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+        && data.channel is string && data.channel.size() >= 1 && data.channel.size() <= 120
+        && data.thumbnailUrl is string && data.thumbnailUrl.size() <= 500
+        && data.mediaType in ['song', 'video']
+        && data.status in ['queued', 'playing', 'played']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidComparisonPoint(item) {
+      return item is map
+        && item.keys().hasAll(['label', 'detail'])
+        && item.keys().hasOnly(['label', 'detail'])
+        && item.label is string && item.label.size() >= 1 && item.label.size() <= 120
+        && item.detail is string && item.detail.size() >= 1 && item.detail.size() <= 500;
+    }
+
+    function isValidResearchSource(src) {
+      return src is map
+        && src.keys().hasAll(['title', 'url', 'domain'])
+        && src.keys().hasOnly(['title', 'url', 'domain'])
+        && src.title is string && src.title.size() >= 1 && src.title.size() <= 200
+        && src.url is string && src.url.size() >= 1 && src.url.size() <= 1000
+        && src.domain is string && src.domain.size() >= 1 && src.domain.size() <= 160;
+    }
+
+    function isValidResearchReport(data) {
+      return data.keys().hasAll(['ownerId', 'query', 'depth', 'executiveSummary', 'keyFindings', 'comparisonPoints', 'followUpQuestions', 'sources', 'groundingSearchQueries', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'query', 'depth', 'executiveSummary', 'keyFindings', 'comparisonPoints', 'followUpQuestions', 'sources', 'groundingSearchQueries', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.query is string && data.query.size() >= 1 && data.query.size() <= 400
+        && data.depth in ['quick', 'deep']
+        && data.executiveSummary is string && data.executiveSummary.size() >= 1 && data.executiveSummary.size() <= 2000
+        && data.keyFindings is list && data.keyFindings.size() <= 10
+        && (data.keyFindings.size() == 0 || (data.keyFindings[0] is string && data.keyFindings[0].size() <= 400))
+        && data.comparisonPoints is list && data.comparisonPoints.size() <= 8
+        && (data.comparisonPoints.size() == 0 || isValidComparisonPoint(data.comparisonPoints[0]))
+        && data.followUpQuestions is list && data.followUpQuestions.size() <= 6
+        && (data.followUpQuestions.size() == 0 || (data.followUpQuestions[0] is string && data.followUpQuestions[0].size() <= 240))
+        && data.sources is list && data.sources.size() <= 12
+        && (data.sources.size() == 0 || isValidResearchSource(data.sources[0]))
+        && data.groundingSearchQueries is list && data.groundingSearchQueries.size() <= 8
+        && (data.groundingSearchQueries.size() == 0 || (data.groundingSearchQueries[0] is string && data.groundingSearchQueries[0].size() <= 200))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMemory(data) {
+      return data.keys().hasAll(['ownerId', 'category', 'content', 'importance', 'source', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'category', 'content', 'importance', 'source', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.category in ['preference', 'fact', 'project', 'routine', 'person']
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 600
+        && data.importance in ['low', 'normal', 'high']
+        && data.source in ['voice', 'manual', 'setup']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPluginParameter(param) {
+      return param is map
+        && param.keys().hasAll(['name', 'type', 'description', 'required'])
+        && param.keys().hasOnly(['name', 'type', 'description', 'required'])
+        && param.name is string && param.name.size() >= 1 && param.name.size() <= 40 && param.name.matches('^[a-zA-Z_][a-zA-Z0-9_]*$')
+        && param.type in ['string', 'number', 'boolean']
+        && param.description is string && param.description.size() >= 1 && param.description.size() <= 200
+        && param.required is bool;
+    }
+
+    function isValidPluginHeader(hdr) {
+      return hdr is map
+        && hdr.keys().hasAll(['key', 'value'])
+        && hdr.keys().hasOnly(['key', 'value'])
+        && hdr.key is string && hdr.key.size() >= 1 && hdr.key.size() <= 80
+        && hdr.value is string && hdr.value.size() <= 300;
+    }
+
+    function isValidPlugin(data) {
+      return data.keys().hasAll([
+          'ownerId', 'slug', 'name', 'description', 'category', 'kind', 'toolName',
+          'enabled', 'version', 'author', 'parameters', 'endpointUrl', 'httpMethod',
+          'headers', 'bodyTemplate', 'commandTemplate', 'runCount', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'slug', 'name', 'description', 'category', 'kind', 'toolName',
+          'enabled', 'version', 'author', 'parameters', 'endpointUrl', 'httpMethod',
+          'headers', 'bodyTemplate', 'commandTemplate', 'runCount', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 64 && data.slug.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 300
+        && data.category in ['utilities', 'developer', 'knowledge', 'automation', 'webhook']
+        && data.kind in ['http_api', 'laptop_command']
+        && data.toolName is string && data.toolName.size() >= 3 && data.toolName.size() <= 56 && data.toolName.matches('^[a-z][a-z0-9_]*$')
+        && data.enabled is bool
+        && data.version is string && data.version.size() >= 1 && data.version.size() <= 20
+        && data.author is string && data.author.size() >= 1 && data.author.size() <= 80
+        && data.parameters is list && data.parameters.size() <= 8
+        && (data.parameters.size() == 0 || isValidPluginParameter(data.parameters[0]))
+        && data.endpointUrl is string && data.endpointUrl.size() <= 500
+        && data.httpMethod in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
+        && data.headers is list && data.headers.size() <= 8
+        && (data.headers.size() == 0 || isValidPluginHeader(data.headers[0]))
+        && data.bodyTemplate is string && data.bodyTemplate.size() <= 1500
+        && data.commandTemplate is string && data.commandTemplate.size() <= 500
+        && data.runCount is int && data.runCount >= 0 && data.runCount <= 1000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. User Profile
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'voiceName',
+          'wakeMode',
+          'defaultBrowser',
+          'assistantName',
+          'userPreferredName',
+          'setupCompleted',
+          'faceAuthEnabled',
+          'clapWakeEnabled',
+          'permissions',
+          'updatedAt'
+        ]);
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      // Isolated PII & Biometric subcollection (Master Gate checks parent /users/{userId})
+      match /private/{docId} {
+        allow get: if isValidId(userId)
+          && (docId == 'info' || docId == 'faceAuth')
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow list: if false;
+        allow create: if isValidId(userId)
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            (docId == 'info' && isValidUserPrivateInfo(incoming(), userId))
+            ||
+            (docId == 'faceAuth' && isValidUserFaceAuth(incoming(), userId))
+          );
+        allow update: if isValidId(userId)
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (docId == 'info'
+              && isValidUserPrivateInfo(incoming(), userId)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt']))
+            ||
+            (docId == 'faceAuth'
+              && isValidUserFaceAuth(incoming(), userId)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['descriptor', 'sampleCount', 'threshold', 'passcodeHash', 'updatedAt']))
+          );
+        allow delete: if isValidId(userId)
+          && (docId == 'info' || docId == 'faceAuth')
+          && isOwner(userId);
+      }
+    }
+
+    // 2. Saved Automation Workflows
+    match /workflows/{workflowId} {
+      allow get: if isValidId(workflowId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(workflowId)
+        && isSignedIn()
+        && isValidWorkflow(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().runCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(workflowId)
+        && isSignedIn()
+        && isValidWorkflow(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'voiceTrigger', 'targetUrl', 'category', 'steps', 'updatedAt'])
+          ||
+          (incoming().diff(existing()).affectedKeys().hasOnly(['runCount', 'updatedAt'])
+            && incoming().runCount == existing().runCount + 1)
+        );
+      allow delete: if isValidId(workflowId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 3. Command Executions Log
+    match /executions/{executionId} {
+      allow get: if isValidId(executionId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(executionId)
+        && isSignedIn()
+        && isValidExecution(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(executionId)
+        && isSignedIn()
+        && isValidExecution(incoming())
+        && existing().ownerId == request.auth.uid
+        && existing().status == 'running'
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'stepsCount', 'summary', 'targetUrl', 'updatedAt']);
+      allow delete: if isValidId(executionId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 4. YouTube Media Queue
+    match /mediaQueue/{itemId} {
+      allow get: if isValidId(itemId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(itemId)
+        && isSignedIn()
+        && isValidMediaQueueItem(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(itemId)
+        && isSignedIn()
+        && isValidMediaQueueItem(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().videoId == existing().videoId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+      allow delete: if isValidId(itemId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 5. Research Reports
+    match /researchReports/{reportId} {
+      allow get: if isValidId(reportId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(reportId)
+        && isSignedIn()
+        && isValidResearchReport(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(reportId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 6. Long-Term Assistant Memories
+    match /memories/{memoryId} {
+      allow get: if isValidId(memoryId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(memoryId)
+        && isSignedIn()
+        && isValidMemory(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(memoryId)
+        && isSignedIn()
+        && isValidMemory(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['category', 'content', 'importance', 'updatedAt']);
+      allow delete: if isValidId(memoryId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 7. Installed & Custom Plugins
+    match /plugins/{pluginId} {
+      allow get: if isValidId(pluginId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(pluginId)
+        && isSignedIn()
+        && isValidPlugin(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().runCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(pluginId)
+        && isSignedIn()
+        && isValidPlugin(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().slug == existing().slug
+        && incoming().toolName == existing().toolName
+        && incoming().kind == existing().kind
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'description',
+            'category',
+            'enabled',
+            'version',
+            'author',
+            'parameters',
+            'endpointUrl',
+            'httpMethod',
+            'headers',
+            'bodyTemplate',
+            'commandTemplate',
+            'updatedAt'
+          ])
+          ||
+          (incoming().diff(existing()).affectedKeys().hasOnly(['runCount', 'updatedAt'])
+            && incoming().runCount == existing().runCount + 1)
+        );
+      allow delete: if isValidId(pluginId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+  }
+}

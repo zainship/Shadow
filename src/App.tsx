@@ -1,0 +1,2818 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
+import {
+  Blocks,
+  Compass,
+  Globe,
+  Image as ImageIcon,
+  Layers,
+  LogIn,
+  LogOut,
+  Monitor,
+  Play,
+} from 'lucide-react';
+import {
+  ArcReactorScene,
+  type ReactorCommandCue,
+  type ReactorCommandKind,
+  type ReactorMode,
+} from './components/ArcReactorScene';
+import { BrowserAutomationStage } from './components/BrowserAutomationStage';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { FaceAuthGateModal } from './components/FaceAuthGateModal';
+import { FirstLaunchSetupModal, type SeedMemoryDraft } from './components/FirstLaunchSetupModal';
+import { IosControlDock } from './components/IosControlDock';
+import { MacWindowFrame } from './components/MacWindowShell';
+import { PluginsStage, type PluginActivityLog } from './components/PluginsStage';
+import { ResearchStage } from './components/ResearchStage';
+import { VisualsStage } from './components/VisualsStage';
+import {
+  MacrosAndHistoryView,
+  TauriDesktopView,
+} from './components/WorkflowsAndHistoryPanel';
+import { YouTubeMediaStage } from './components/YouTubeMediaStage';
+import { float32ToPcm16Base64, PcmAudioPlayer } from './lib/audioEngine';
+import {
+  DoubleClapAnalyzer,
+  playWakeChime,
+  StandbyClapListener,
+  type ClapListenerStatus,
+} from './lib/clapDetector';
+import { auth, googleProvider, testConnection } from './lib/firebase';
+import {
+  addMediaQueueItem,
+  createExecutionLog,
+  createMemory,
+  createWorkflow,
+  deleteFaceAuthProfile,
+  deleteMediaQueueItem,
+  deleteMemory,
+  deletePluginInFirestore,
+  deleteResearchReport,
+  deleteWorkflow,
+  ensureUserProfile,
+  finalizeExecutionLog,
+  getFaceAuthProfile,
+  incrementPluginRunCount,
+  incrementWorkflowRunCount,
+  installPluginInFirestore,
+  saveFaceAuthProfile,
+  saveResearchReport,
+  saveSetupConfigToFirestore,
+  subscribeExecutions,
+  subscribeMediaQueue,
+  subscribeMemories,
+  subscribePlugins,
+  subscribeResearchReports,
+  subscribeWorkflows,
+  updateMediaQueueStatus,
+  updateMemory,
+  updatePluginInFirestore,
+  updateUserPreferences,
+} from './lib/firestoreService';
+import {
+  createLocalMemoryRecord,
+  createLocalPluginRecord,
+  loadLocalFaceAuth,
+  loadLocalMemories,
+  loadLocalPlugins,
+  loadLocalSetupConfig,
+  sanitizePermissions,
+  sanitizePluginDraft,
+  saveLocalFaceAuth,
+  saveLocalMemories,
+  saveLocalPlugins,
+  saveLocalSetupConfig,
+} from './lib/setupStorage';
+import {
+  checkLaptopAgentHealth,
+  detectRuntimeEnvironment,
+  executeLaptopTool,
+  invokeDesktopBrowserAutomation,
+  type DesktopRuntimeInfo,
+} from './lib/tauriBridge';
+import { buildWindowLayoutInspection } from './lib/windowLayout';
+import type {
+  AssistantMemory,
+  AutomationRunState,
+  AutomationStep,
+  AutomationWorkflow,
+  CommandExecution,
+  FaceAuthProfile,
+  GeneratedVisual,
+  LaptopActionEvent,
+  LaptopAgentHealth,
+  MemoryCategory,
+  MemoryImportance,
+  PageInspectionResult,
+  PluginExecutionResult,
+  ResearchReport,
+  SetupConfig,
+  ShadowPlugin,
+  StepExecutionState,
+  VisualAspectRatio,
+  VisualStyle,
+  VoiceName,
+  WakeMode,
+  WindowLayoutMode,
+  YouTubeTrack,
+} from './types/assistant';
+
+type DrawerTab =
+  | 'research'
+  | 'automation'
+  | 'youtube'
+  | 'visuals'
+  | 'macros'
+  | 'plugins'
+  | 'tauri'
+  | null;
+
+const VOICES: VoiceName[] = ['Charon', 'Fenrir', 'Zephyr', 'Kore', 'Puck'];
+const VISUALS_STORAGE_KEY = 'shadow_visuals_v1';
+
+function loadLocalVisuals(): GeneratedVisual[] {
+  try {
+    const raw = window.localStorage.getItem(VISUALS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is GeneratedVisual =>
+        Boolean(item && typeof item.id === 'string' && typeof item.svgMarkup === 'string')
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalVisuals(items: GeneratedVisual[]): void {
+  try {
+    window.localStorage.setItem(VISUALS_STORAGE_KEY, JSON.stringify(items.slice(0, 20)));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function JarvisArcWorkspace() {
+  // Auth & Firebase State
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  // Runtime & Preferences
+  const [runtimeInfo, setRuntimeInfo] = useState<DesktopRuntimeInfo>({
+    isTauri: false,
+    runtime: 'web-sandbox',
+    os: 'browser',
+    arch: 'web',
+    sidecarAvailable: false,
+  });
+  const [agentHealth, setAgentHealth] = useState<LaptopAgentHealth>({
+    reachable: false,
+    authenticated: false,
+  });
+  const [laptopActions, setLaptopActions] = useState<LaptopActionEvent[]>([]);
+  const [voiceName, setVoiceName] = useState<VoiceName>('Charon');
+  const [wakeMode, setWakeMode] = useState<WakeMode>('push-to-talk');
+
+  // First-Launch Setup, Memory & Face Auth State
+  const [setupConfig, setSetupConfig] = useState<SetupConfig>(() => loadLocalSetupConfig());
+  const [setupOpen, setSetupOpen] = useState<boolean>(() => !loadLocalSetupConfig().setupCompleted);
+  const [faceAuthProfile, setFaceAuthProfile] = useState<FaceAuthProfile | null>(() =>
+    loadLocalFaceAuth()
+  );
+  const [isFaceUnlocked, setIsFaceUnlocked] = useState<boolean>(() => {
+    const cfg = loadLocalSetupConfig();
+    const face = loadLocalFaceAuth();
+    return !(cfg.setupCompleted && cfg.faceAuthEnabled && Boolean(face));
+  });
+  const [localMemories, setLocalMemories] = useState<AssistantMemory[]>(() => loadLocalMemories());
+  const [firestoreMemories, setFirestoreMemories] = useState<AssistantMemory[]>([]);
+  const [localPlugins, setLocalPlugins] = useState<ShadowPlugin[]>(() => loadLocalPlugins());
+  const [firestorePlugins, setFirestorePlugins] = useState<ShadowPlugin[]>([]);
+  const [pluginLogs, setPluginLogs] = useState<PluginActivityLog[]>([]);
+
+  // Minimal 3D HUD State
+  const [activeDrawer, setActiveDrawer] = useState<DrawerTab>(null);
+  const [windowMaximized, setWindowMaximized] = useState(false);
+  const [hudCollapsed, setHudCollapsed] = useState(false);
+  const prefersReduced = useReducedMotion();
+
+  // Voice Session State (Voice-only, no chatbox)
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
+  const [isAutomating, setIsAutomating] = useState(false);
+  const [isResearching, setIsResearching] = useState(false);
+  const [isGeneratingVisual, setIsGeneratingVisual] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [liveCaption, setLiveCaption] = useState<{ speaker: string; text: string } | null>(null);
+  const [commandCue, setCommandCue] = useState<ReactorCommandCue | null>(null);
+  const cueTimerRef = useRef<number | null>(null);
+  const cueIdRef = useRef<number>(0);
+
+  // Automation, Research, Visuals & YouTube Stage State
+  const [automationRun, setAutomationRun] = useState<AutomationRunState | null>(null);
+  const [currentResearch, setCurrentResearch] = useState<ResearchReport | null>(null);
+  const [localResearchHistory, setLocalResearchHistory] = useState<ResearchReport[]>([]);
+  const [visuals, setVisuals] = useState<GeneratedVisual[]>(() => loadLocalVisuals());
+  const [currentVisual, setCurrentVisual] = useState<GeneratedVisual | null>(
+    () => loadLocalVisuals()[0] ?? null
+  );
+  const [currentTrack, setCurrentTrack] = useState<YouTubeTrack | null>(null);
+  const [localQueue, setLocalQueue] = useState<YouTubeTrack[]>([]);
+  const [pendingPlayerAction, setPendingPlayerAction] = useState<{
+    action: string;
+    seconds?: number;
+    nonce: number;
+  } | null>(null);
+
+  // Firestore Collections
+  const [workflows, setWorkflows] = useState<AutomationWorkflow[]>([]);
+  const [executions, setExecutions] = useState<CommandExecution[]>([]);
+  const [firestoreQueue, setFirestoreQueue] = useState<YouTubeTrack[]>([]);
+  const [firestoreResearch, setFirestoreResearch] = useState<ResearchReport[]>([]);
+
+  // Audio & Socket Refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const playerRef = useRef<PcmAudioPlayer>(new PcmAudioPlayer());
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const inputCtxRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const micAnalyserRef = useRef<AnalyserNode | null>(null);
+  const inputLevelRef = useRef<number>(0);
+  const outputLevelRef = useRef<number>(0);
+  const isMicMutedRef = useRef<boolean>(false);
+  const isConnectedRef = useRef<boolean>(false);
+  const userTranscriptBufRef = useRef<string>('');
+  const jarvisTranscriptBufRef = useRef<string>('');
+  const captionTimerRef = useRef<number | null>(null);
+  const spaceHoldActiveRef = useRef<boolean>(false);
+  const sessionUnlockedOnceRef = useRef<boolean>(false);
+  const clapListenerRef = useRef<StandbyClapListener>(new StandbyClapListener());
+  const mutedClapAnalyzerRef = useRef<DoubleClapAnalyzer>(new DoubleClapAnalyzer());
+  const [clapStatus, setClapStatus] = useState<ClapListenerStatus>('idle');
+  const clapWakeEnabledRef = useRef<boolean>(setupConfig.clapWakeEnabled);
+  clapWakeEnabledRef.current = setupConfig.clapWakeEnabled;
+
+  const mediaQueue = user ? firestoreQueue : localQueue;
+  const researchHistory = user ? firestoreResearch : localResearchHistory;
+  const memories = user ? firestoreMemories : localMemories;
+  const plugins = user ? firestorePlugins : localPlugins;
+  const pluginsRef = useRef<ShadowPlugin[]>(plugins);
+  pluginsRef.current = plugins;
+  const assistantName = setupConfig.assistantName.trim() || 'Shadow';
+  const assistantNameRef = useRef<string>(assistantName);
+  assistantNameRef.current = assistantName;
+
+  useEffect(() => {
+    document.title = `${assistantName} — Voice Desktop & Browser Assistant`;
+  }, [assistantName]);
+
+  const beginCommandCue = useCallback((kind: ReactorCommandKind, label: string) => {
+    if (cueTimerRef.current) {
+      window.clearTimeout(cueTimerRef.current);
+      cueTimerRef.current = null;
+    }
+    const id = ++cueIdRef.current;
+    setCommandCue({ id, kind, label, active: true });
+    return id;
+  }, []);
+
+  const finishCommandCue = useCallback(
+    (kind: ReactorCommandKind, label: string, ok = true, holdMs = 2400) => {
+      if (cueTimerRef.current) {
+        window.clearTimeout(cueTimerRef.current);
+      }
+      const id = ++cueIdRef.current;
+      setCommandCue({
+        id,
+        kind,
+        label,
+        active: false,
+        outcome: ok ? 'ok' : 'error',
+      });
+      cueTimerRef.current = window.setTimeout(() => {
+        setCommandCue((prev) => (prev?.id === id ? null : prev));
+      }, holdMs);
+    },
+    []
+  );
+
+  const describeToolCue = useCallback(
+    (toolName: string, args: Record<string, unknown> = {}): { kind: ReactorCommandKind; label: string } => {
+      if (toolName === 'research_topic') {
+        const q = String(args.query || '').trim();
+        return {
+          kind: 'research',
+          label: q ? `Researching: ${q.slice(0, 48)}` : 'Researching live sources',
+        };
+      }
+      if (toolName === 'generate_visual') {
+        const promptText = String(args.prompt || '').trim();
+        return {
+          kind: 'visuals',
+          label: promptText
+            ? `Creating visual: ${promptText.slice(0, 44)}`
+            : 'Generating visual graphic',
+        };
+      }
+      if (toolName === 'execute_browser_automation') {
+        const stepsArr = Array.isArray(args.steps) ? (args.steps as AutomationStep[]) : [];
+        const arrangeStep = stepsArr.find((s) => s?.action === 'arrange_windows');
+        if (arrangeStep || String(args.targetUrl || '').toLowerCase().startsWith('desktop://')) {
+          const layoutLabel = arrangeStep?.selector || 'grid';
+          return {
+            kind: 'automation',
+            label: `Arranging windows (${layoutLabel})`,
+          };
+        }
+        const goal = String(args.goal || args.targetUrl || '').trim();
+        return {
+          kind: 'automation',
+          label: goal ? `Automating: ${goal.slice(0, 48)}` : 'Executing browser task',
+        };
+      }
+      if (toolName === 'play_youtube_media') {
+        const q = String(args.query || '').trim();
+        return {
+          kind: 'youtube',
+          label: q ? `YouTube: ${q.slice(0, 48)}` : 'Loading YouTube media',
+        };
+      }
+      if (toolName === 'control_youtube_player') {
+        const action = String(args.action || 'playback');
+        return {
+          kind: 'youtube',
+          label: `Player: ${action}`,
+        };
+      }
+      if (toolName === 'manage_laptop_files') {
+        const op = String(args.operation || 'file');
+        const p = String(args.path || '').trim();
+        return {
+          kind: 'laptop',
+          label: p ? `Files (${op}): ${p.slice(0, 40)}` : `Managing laptop files (${op})`,
+        };
+      }
+      if (toolName === 'control_laptop_apps') {
+        const rawAction = String(args.action || 'app');
+        if (rawAction === 'arrange_windows') {
+          const layoutLabel = String(args.layout || 'grid');
+          return {
+            kind: 'laptop',
+            label: `Tiling windows (${layoutLabel})`,
+          };
+        }
+        const action = rawAction.replace(/_/g, ' ');
+        const appName = String(args.appName || '').trim();
+        return {
+          kind: 'laptop',
+          label: appName ? `${action}: ${appName.slice(0, 40)}` : `Laptop ${action}`,
+        };
+      }
+      if (toolName === 'execute_terminal_command') {
+        const cmd = String(args.command || '').trim();
+        return {
+          kind: 'laptop',
+          label: cmd ? `Terminal: ${cmd.slice(0, 42)}` : 'Running terminal command',
+        };
+      }
+      if (toolName === 'save_memory' || toolName === 'forget_memory') {
+        return {
+          kind: 'memory',
+          label: toolName === 'save_memory' ? 'Encoding long-term memory' : 'Updating memory bank',
+        };
+      }
+      if (toolName === 'save_voice_macro') {
+        const name = String(args.name || '').trim();
+        return {
+          kind: 'memory',
+          label: name ? `Saving macro: ${name.slice(0, 40)}` : 'Saving voice macro',
+        };
+      }
+      const pluginMatch = pluginsRef.current.find((p) => p.toolName === toolName);
+      if (pluginMatch) {
+        return {
+          kind: 'plugin',
+          label: `Plugin: ${pluginMatch.name}`,
+        };
+      }
+      return {
+        kind: 'command',
+        label: `Processing ${toolName.replace(/_/g, ' ')}`,
+      };
+    },
+    []
+  );
+
+  const showTransientCaption = useCallback((speaker: string, text: string, holdMs = 6000) => {
+    const clean = text.trim();
+    if (!clean) return;
+    setLiveCaption({ speaker, text: clean });
+    if (captionTimerRef.current) window.clearTimeout(captionTimerRef.current);
+    captionTimerRef.current = window.setTimeout(() => {
+      setLiveCaption(null);
+    }, holdMs);
+  }, []);
+
+  // Startup checks (Runtime shell + Shadow Laptop Agent health)
+  useEffect(() => {
+    void testConnection();
+    void detectRuntimeEnvironment().then(setRuntimeInfo);
+    void checkLaptopAgentHealth().then(setAgentHealth);
+  }, []);
+
+  // Poll audio amplitudes for 3D Arc Reactor reactivity
+  useEffect(() => {
+    let rafId = 0;
+    const tick = () => {
+      if (micAnalyserRef.current && isConnectedRef.current && !isMicMutedRef.current) {
+        const buf = new Uint8Array(micAnalyserRef.current.frequencyBinCount);
+        micAnalyserRef.current.getByteFrequencyData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i];
+        inputLevelRef.current = sum / (buf.length * 255);
+      } else {
+        inputLevelRef.current = 0;
+      }
+      outputLevelRef.current = playerRef.current.getOutputLevel();
+      const speakingNow = playerRef.current.isPlaying();
+      setIsAssistantSpeaking((prev) => (prev !== speakingNow ? speakingNow : prev));
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+
+  // Firebase Auth + Real-Time Firestore Listeners
+  useEffect(() => {
+    let unsubWorkflows: (() => void) | null = null;
+    let unsubExecutions: (() => void) | null = null;
+    let unsubQueue: (() => void) | null = null;
+    let unsubResearch: (() => void) | null = null;
+    let unsubMemories: (() => void) | null = null;
+    let unsubPlugins: (() => void) | null = null;
+
+    const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
+      if (unsubWorkflows) unsubWorkflows();
+      if (unsubExecutions) unsubExecutions();
+      if (unsubQueue) unsubQueue();
+      if (unsubResearch) unsubResearch();
+      if (unsubMemories) unsubMemories();
+      if (unsubPlugins) unsubPlugins();
+      unsubWorkflows = null;
+      unsubExecutions = null;
+      unsubQueue = null;
+      unsubResearch = null;
+      unsubMemories = null;
+      unsubPlugins = null;
+
+      setUser(nextUser);
+      setAuthReady(true);
+
+      if (nextUser) {
+        try {
+          const profile = await ensureUserProfile(nextUser);
+          if (profile.voiceName) setVoiceName(profile.voiceName);
+          if (profile.wakeMode) setWakeMode(profile.wakeMode);
+
+          const localCfg = loadLocalSetupConfig();
+          const remoteConfigured = Boolean(profile.setupCompleted);
+          let resolvedConfig: SetupConfig;
+          if (remoteConfigured) {
+            resolvedConfig = {
+              assistantName: (profile.assistantName || 'Shadow').slice(0, 60),
+              userPreferredName: (profile.userPreferredName || '').slice(0, 80),
+              setupCompleted: true,
+              faceAuthEnabled: Boolean(profile.faceAuthEnabled),
+              clapWakeEnabled:
+                profile.clapWakeEnabled !== undefined
+                  ? Boolean(profile.clapWakeEnabled)
+                  : localCfg.clapWakeEnabled,
+              permissions: sanitizePermissions(profile.permissions),
+            };
+            saveLocalSetupConfig(resolvedConfig);
+          } else if (localCfg.setupCompleted) {
+            resolvedConfig = localCfg;
+            await saveSetupConfigToFirestore(nextUser.uid, localCfg);
+          } else {
+            resolvedConfig = {
+              assistantName: (profile.assistantName || localCfg.assistantName || 'Shadow').slice(0, 60),
+              userPreferredName: (
+                profile.userPreferredName ||
+                localCfg.userPreferredName ||
+                profile.displayName?.split(' ')[0] ||
+                ''
+              ).slice(0, 80),
+              setupCompleted: false,
+              faceAuthEnabled: Boolean(profile.faceAuthEnabled),
+              clapWakeEnabled:
+                profile.clapWakeEnabled !== undefined
+                  ? Boolean(profile.clapWakeEnabled)
+                  : localCfg.clapWakeEnabled,
+              permissions: sanitizePermissions(profile.permissions || localCfg.permissions),
+            };
+          }
+          setSetupConfig(resolvedConfig);
+          setSetupOpen(!resolvedConfig.setupCompleted);
+
+          const remoteFace = await getFaceAuthProfile(nextUser.uid).catch(() => null);
+          const localFace = loadLocalFaceAuth();
+          const resolvedFace = remoteFace || localFace;
+          if (!remoteFace && localFace) {
+            void saveFaceAuthProfile(nextUser.uid, {
+              descriptor: localFace.descriptor,
+              sampleCount: localFace.sampleCount,
+              threshold: localFace.threshold,
+              passcodeHash: localFace.passcodeHash,
+            }).catch(() => null);
+          } else if (remoteFace) {
+            saveLocalFaceAuth(remoteFace);
+          }
+          setFaceAuthProfile(resolvedFace);
+          if (
+            resolvedConfig.setupCompleted &&
+            resolvedConfig.faceAuthEnabled &&
+            resolvedFace &&
+            !sessionUnlockedOnceRef.current
+          ) {
+            setIsFaceUnlocked(false);
+          }
+
+          unsubWorkflows = subscribeWorkflows(nextUser.uid, setWorkflows);
+          unsubExecutions = subscribeExecutions(nextUser.uid, setExecutions);
+          unsubQueue = subscribeMediaQueue(nextUser.uid, (items) => {
+            setFirestoreQueue(items);
+            if (!currentTrack && items.length > 0) {
+              const playing = items.find((i) => i.status === 'playing') || items[0];
+              if (playing) setCurrentTrack(playing);
+            }
+          });
+          unsubResearch = subscribeResearchReports(nextUser.uid, (reports) => {
+            setFirestoreResearch(reports);
+            setCurrentResearch((prev) => prev || reports[0] || null);
+          });
+          unsubMemories = subscribeMemories(nextUser.uid, setFirestoreMemories);
+          unsubPlugins = subscribePlugins(nextUser.uid, setFirestorePlugins);
+        } catch (err) {
+          setAuthError(err instanceof Error ? err.message : 'Failed to load profile');
+        }
+      } else {
+        setWorkflows([]);
+        setExecutions([]);
+        setFirestoreQueue([]);
+        setFirestoreResearch([]);
+        setFirestoreMemories([]);
+        setFirestorePlugins([]);
+      }
+    });
+
+    return () => {
+      unsubAuth();
+      if (unsubWorkflows) unsubWorkflows();
+      if (unsubExecutions) unsubExecutions();
+      if (unsubQueue) unsubQueue();
+      if (unsubResearch) unsubResearch();
+      if (unsubMemories) unsubMemories();
+      if (unsubPlugins) unsubPlugins();
+    };
+  }, []);
+
+  // Permission check + Memory CRUD helpers
+  const isToolPermitted = useCallback(
+    (toolName: string): boolean => {
+      const p = setupConfig.permissions;
+      if (toolName === 'manage_laptop_files') return p.files;
+      if (toolName === 'control_laptop_apps') return p.apps;
+      if (toolName === 'execute_terminal_command') return p.terminal;
+      if (toolName === 'execute_browser_automation') return p.browser;
+      if (toolName === 'research_topic') return p.research;
+      if (toolName === 'play_youtube_media' || toolName === 'control_youtube_player') {
+        return p.youtube;
+      }
+      if (toolName === 'save_memory' || toolName === 'forget_memory') return p.memory;
+      return true;
+    },
+    [setupConfig.permissions]
+  );
+
+  const handleAddMemoryRecord = useCallback(
+    async (input: {
+      category: MemoryCategory;
+      content: string;
+      importance?: MemoryImportance;
+      source?: 'voice' | 'manual' | 'setup';
+    }) => {
+      const clean = input.content.trim().slice(0, 600);
+      if (!clean) return;
+      if (user) {
+        await createMemory(user.uid, {
+          category: input.category,
+          content: clean,
+          importance: input.importance || 'normal',
+          source: input.source || 'manual',
+        });
+      } else {
+        const record = createLocalMemoryRecord(input);
+        setLocalMemories((prev) => {
+          const next = [record, ...prev].slice(0, 200);
+          saveLocalMemories(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleToggleMemoryImportance = useCallback(
+    async (mem: AssistantMemory) => {
+      const nextImportance: MemoryImportance = mem.importance === 'high' ? 'normal' : 'high';
+      if (user) {
+        await updateMemory(mem.id, { importance: nextImportance });
+      } else {
+        setLocalMemories((prev) => {
+          const next = prev.map((m) =>
+            m.id === mem.id ? { ...m, importance: nextImportance } : m
+          );
+          saveLocalMemories(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleDeleteMemoryRecord = useCallback(
+    async (id: string) => {
+      if (user) {
+        await deleteMemory(id);
+      } else {
+        setLocalMemories((prev) => {
+          const next = prev.filter((m) => m.id !== id);
+          saveLocalMemories(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleInstallPlugin = useCallback(
+    async (draft: Partial<ShadowPlugin> & { name: string; description: string }) => {
+      if (user) {
+        await installPluginInFirestore(user.uid, draft);
+      } else {
+        const record = createLocalPluginRecord(draft);
+        setLocalPlugins((prev) => {
+          const next = [record, ...prev.filter((p) => p.toolName !== record.toolName)].slice(0, 40);
+          saveLocalPlugins(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleUpdatePlugin = useCallback(
+    async (plugin: ShadowPlugin, updates: Partial<ShadowPlugin>) => {
+      if (user) {
+        await updatePluginInFirestore(plugin, updates);
+      } else {
+        const clean = sanitizePluginDraft({
+          ...plugin,
+          ...updates,
+          slug: plugin.slug,
+          toolName: plugin.toolName,
+          kind: plugin.kind,
+        });
+        setLocalPlugins((prev) => {
+          const next = prev.map((p) =>
+            p.id === plugin.id
+              ? { ...p, ...clean, updatedAt: new Date().toISOString() }
+              : p
+          );
+          saveLocalPlugins(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleDeletePlugin = useCallback(
+    async (pluginId: string) => {
+      if (user) {
+        await deletePluginInFirestore(pluginId);
+      } else {
+        setLocalPlugins((prev) => {
+          const next = prev.filter((p) => p.id !== pluginId);
+          saveLocalPlugins(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const recordPluginExecution = useCallback(
+    async (
+      plugin: ShadowPlugin | undefined,
+      toolName: string,
+      ok: boolean,
+      summary: string,
+      opts?: { latencyMs?: number; statusCode?: number; targetUrl?: string; transcript?: string }
+    ) => {
+      setPluginLogs((prev) => [
+        {
+          id: `plog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          pluginName: plugin?.name || toolName,
+          toolName,
+          ok,
+          summary,
+          latencyMs: opts?.latencyMs,
+          statusCode: opts?.statusCode,
+          timestamp: Date.now(),
+        },
+        ...prev.slice(0, 29),
+      ]);
+
+      if (plugin) {
+        if (user) {
+          void incrementPluginRunCount(plugin.id, plugin.runCount).catch(() => null);
+        } else {
+          setLocalPlugins((prev) => {
+            const next = prev.map((p) =>
+              p.id === plugin.id ? { ...p, runCount: p.runCount + 1 } : p
+            );
+            saveLocalPlugins(next);
+            return next;
+          });
+        }
+      }
+
+      if (user) {
+        try {
+          const exId = await createExecutionLog(user.uid, {
+            transcript: opts?.transcript || `Plugin: ${plugin?.name || toolName}`,
+            intent: 'plugin_run',
+            targetUrl: opts?.targetUrl || plugin?.endpointUrl || '',
+            stepsCount: 1,
+            summary: summary.slice(0, 900),
+            runtime: runtimeInfo.runtime,
+          });
+          await finalizeExecutionLog(exId, {
+            status: ok ? 'completed' : 'failed',
+            stepsCount: 1,
+            summary: summary.slice(0, 900),
+            targetUrl: opts?.targetUrl || plugin?.endpointUrl || '',
+          });
+        } catch {
+          // ignore logging failure
+        }
+      }
+    },
+    [user, runtimeInfo.runtime]
+  );
+
+  const buildSessionContextPayload = useCallback(() => {
+    const sortedMemories = [...memories]
+      .sort((a, b) => {
+        const score = (imp: MemoryImportance) => (imp === 'high' ? 2 : imp === 'normal' ? 1 : 0);
+        return score(b.importance) - score(a.importance);
+      })
+      .slice(0, 40)
+      .map((m) => ({
+        category: m.category,
+        content: m.content,
+        importance: m.importance,
+      }));
+    const activePlugins = plugins
+      .filter((p) => p.enabled)
+      .slice(0, 30)
+      .map((p) => ({
+        id: p.id,
+        slug: p.slug,
+        name: p.name,
+        description: p.description,
+        category: p.category,
+        kind: p.kind,
+        toolName: p.toolName,
+        enabled: p.enabled,
+        version: p.version,
+        author: p.author,
+        parameters: p.parameters,
+        endpointUrl: p.endpointUrl,
+        httpMethod: p.httpMethod,
+        headers: p.headers,
+        bodyTemplate: p.bodyTemplate,
+        commandTemplate: p.commandTemplate,
+      }));
+    return {
+      assistantName,
+      userPreferredName: setupConfig.userPreferredName,
+      permissions: setupConfig.permissions,
+      memories: sortedMemories,
+      plugins: activePlugins,
+    };
+  }, [memories, plugins, assistantName, setupConfig]);
+
+  // Keyboard shortcut: 'H' toggles Cinema / Zen HUD collapse
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (['input', 'textarea', 'select'].includes(target.tagName.toLowerCase()) ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === 'h' || e.key === 'H') {
+        setHudCollapsed((prev) => !prev);
+      } else if (e.key === 'Escape' && activeDrawer) {
+        setActiveDrawer(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeDrawer]);
+
+  const runAutomationSequence = useCallback(
+    async (
+      goal: string,
+      targetUrl: string,
+      rawSteps: AutomationStep[],
+      inspection: PageInspectionResult | null,
+      transcript: string,
+      options?: { skipClientInvocation?: boolean; gap?: number }
+    ) => {
+      setIsAutomating(true);
+      setActiveDrawer('automation');
+
+      const baseSteps: AutomationStep[] =
+        rawSteps.length > 0
+          ? rawSteps
+          : [
+              {
+                action: 'navigate',
+                selector: 'body',
+                value: targetUrl,
+                description: `Open ${targetUrl}`,
+              },
+            ];
+      const steps: StepExecutionState[] = baseSteps.map((s) => ({
+        ...s,
+        status: 'pending',
+      }));
+
+      const runId = `run-${Date.now()}`;
+      setAutomationRun({
+        id: runId,
+        goal,
+        targetUrl,
+        status: 'running',
+        steps,
+        inspection,
+        startedAt: Date.now(),
+      });
+
+      let execId: string | null = null;
+      if (user) {
+        try {
+          execId = await createExecutionLog(user.uid, {
+            transcript: transcript || goal,
+            intent: 'browser_automation',
+            targetUrl,
+            stepsCount: steps.length,
+            summary: goal,
+            runtime: runtimeInfo.runtime,
+          });
+        } catch {
+          // continue cleanly
+        }
+      }
+
+      const isDesktopLayout =
+        targetUrl.toLowerCase().startsWith('desktop://') ||
+        baseSteps.some((s) => s.action === 'arrange_windows');
+      const canReachLaptop =
+        runtimeInfo.isTauri || (agentHealth.reachable && agentHealth.authenticated);
+
+      let tauriOk = true;
+      if (!options?.skipClientInvocation && canReachLaptop && (runtimeInfo.isTauri || isDesktopLayout)) {
+        try {
+          const tauriRes = await invokeDesktopBrowserAutomation({
+            goal,
+            targetUrl,
+            steps: baseSteps,
+            gap: options?.gap,
+          });
+          tauriOk = tauriRes.executedInDesktop;
+          if (isDesktopLayout) {
+            setLaptopActions((prev) => [
+              {
+                id: `lap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                tool: 'execute_browser_automation',
+                summary: goal,
+                ok: tauriRes.executedInDesktop,
+                output: tauriRes.stdout || tauriRes.stderr || goal,
+                timestamp: Date.now(),
+                runtime: runtimeInfo.isTauri ? 'tauri-native' : 'laptop-agent',
+              },
+              ...prev.slice(0, 24),
+            ]);
+          }
+        } catch {
+          tauriOk = false;
+        }
+      }
+
+      for (let i = 0; i < steps.length; i++) {
+        setAutomationRun((prev) => {
+          if (!prev || prev.id !== runId) return prev;
+          return {
+            ...prev,
+            steps: prev.steps.map((st, idx) =>
+              idx === i ? { ...st, status: 'running' as const } : st
+            ),
+          };
+        });
+
+        await new Promise((r) => setTimeout(r, 360));
+
+        const step = steps[i];
+        setAutomationRun((prev) => {
+          if (!prev || prev.id !== runId) return prev;
+          const updatedSteps = prev.steps.map((st, idx) =>
+            idx === i ? { ...st, status: 'completed' as const } : st
+          );
+
+          let updatedInspection = prev.inspection;
+          if (updatedInspection && step.action === 'fill' && step.value) {
+            const selLower = step.selector.toLowerCase();
+            const descLower = step.description.toLowerCase();
+            let matched = false;
+            const newFields = updatedInspection.fields.map((f) => {
+              const fieldMatches =
+                (f.selector && f.selector.toLowerCase() === selLower) ||
+                (f.name && selLower.includes(f.name.toLowerCase())) ||
+                (f.id && selLower.includes(f.id.toLowerCase())) ||
+                (f.label && descLower.includes(f.label.toLowerCase()));
+              if (fieldMatches && !matched) {
+                matched = true;
+                return { ...f, filledValue: step.value };
+              }
+              return f;
+            });
+            updatedInspection = { ...updatedInspection, fields: newFields };
+          }
+
+          return {
+            ...prev,
+            steps: updatedSteps,
+            inspection: updatedInspection,
+          };
+        });
+      }
+
+      const finalStatus = tauriOk ? 'completed' : 'failed';
+      setAutomationRun((prev) =>
+        prev && prev.id === runId ? { ...prev, status: finalStatus } : prev
+      );
+      setIsAutomating(false);
+
+      if (execId && user) {
+        try {
+          await finalizeExecutionLog(execId, {
+            status: finalStatus,
+            stepsCount: steps.length,
+            summary: `${goal} (${steps.length} steps)`,
+            targetUrl: inspection?.finalUrl || targetUrl,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [user, runtimeInfo, agentHealth.reachable, agentHealth.authenticated]
+  );
+
+  const handleToolAction = useCallback(
+    async (
+      name: string,
+      args: Record<string, unknown>,
+      result: Record<string, unknown>,
+      transcript = ''
+    ) => {
+      if (name === 'execute_browser_automation') {
+        const goal = String(args.goal || 'Browser Automation');
+        const targetUrl = String(result.targetUrl || args.targetUrl || 'https://news.ycombinator.com');
+        const steps = (Array.isArray(result.steps) ? result.steps : args.steps || []) as AutomationStep[];
+        const inspection = (result.inspection as PageInspectionResult | null) ?? null;
+        await runAutomationSequence(goal, targetUrl, steps, inspection, transcript || goal, {
+          skipClientInvocation: Boolean(result.clientExecuted),
+        });
+      } else if (name === 'play_youtube_media') {
+        const selected = result.selected as YouTubeTrack | undefined;
+        if (selected?.videoId) {
+          const track: YouTubeTrack = {
+            videoId: selected.videoId,
+            title: selected.title,
+            channel: selected.channel,
+            duration: selected.duration,
+            thumbnailUrl: selected.thumbnailUrl,
+            mediaType: args.mediaType === 'song' ? 'song' : 'video',
+            status: 'playing',
+            url: selected.url,
+          };
+          setCurrentTrack(track);
+          setActiveDrawer('youtube');
+
+          if (user) {
+            try {
+              await addMediaQueueItem(user.uid, track);
+              const exId = await createExecutionLog(user.uid, {
+                transcript: transcript || `Play ${selected.title} on YouTube`,
+                intent: 'youtube_play',
+                targetUrl: `https://www.youtube.com/watch?v=${selected.videoId}`,
+                stepsCount: 1,
+                summary: `Playing "${selected.title}" by ${selected.channel}`,
+                runtime: runtimeInfo.runtime,
+              });
+              await finalizeExecutionLog(exId, {
+                status: 'completed',
+                stepsCount: 1,
+                summary: `Playing "${selected.title}"`,
+                targetUrl: `https://www.youtube.com/watch?v=${selected.videoId}`,
+              });
+            } catch {
+              // continue smoothly
+            }
+          } else {
+            setLocalQueue((prev) => [track, ...prev.filter((p) => p.videoId !== track.videoId)]);
+          }
+        }
+      } else if (name === 'control_youtube_player') {
+        const action = String(args.action || 'play');
+        const seconds = typeof args.seconds === 'number' ? args.seconds : undefined;
+        setPendingPlayerAction({ action, seconds, nonce: Date.now() });
+      } else if (name === 'save_voice_macro' && user) {
+        const steps = (Array.isArray(args.steps) ? args.steps : []) as AutomationStep[];
+        await createWorkflow(user.uid, {
+          name: String(args.name || 'Saved Macro'),
+          voiceTrigger: String(args.voiceTrigger || args.name || 'Run macro'),
+          targetUrl: String(args.targetUrl || 'https://news.ycombinator.com'),
+          category: (['navigation', 'form-fill', 'media', 'research'].includes(String(args.category))
+            ? args.category
+            : 'navigation') as AutomationWorkflow['category'],
+          steps,
+        });
+      } else if (name === 'save_memory') {
+        if (!isToolPermitted('save_memory')) {
+          setVoiceError('Memory permission is disabled in Setup.');
+          return;
+        }
+        const content = String(args.content || '').trim();
+        if (content) {
+          const validCats: MemoryCategory[] = ['preference', 'fact', 'project', 'routine', 'person'];
+          const rawCat = String(args.category || 'fact') as MemoryCategory;
+          const category = validCats.includes(rawCat) ? rawCat : 'fact';
+          const rawImp = String(args.importance || 'normal') as MemoryImportance;
+          const importance: MemoryImportance = ['low', 'normal', 'high'].includes(rawImp)
+            ? rawImp
+            : 'normal';
+          await handleAddMemoryRecord({
+            category,
+            content,
+            importance,
+            source: 'voice',
+          });
+        }
+      } else if (name === 'forget_memory') {
+        if (!isToolPermitted('forget_memory')) {
+          setVoiceError('Memory permission is disabled in Setup.');
+          return;
+        }
+        const q = String(args.query || '').trim().toLowerCase();
+        if (q) {
+          const matches = memories.filter((m) => m.content.toLowerCase().includes(q));
+          for (const m of matches.slice(0, 5)) {
+            await handleDeleteMemoryRecord(m.id);
+          }
+        }
+      } else if (name === 'research_topic') {
+        if (!isToolPermitted('research_topic')) {
+          setIsResearching(false);
+          setVoiceError('Deep Research permission is disabled in Setup.');
+          return;
+        }
+        setIsResearching(false);
+        const report = result.report as ResearchReport | undefined;
+        if (report?.query) {
+          setCurrentResearch(report);
+          setActiveDrawer('research');
+          if (user) {
+            try {
+              const savedId = await saveResearchReport(user.uid, report);
+              setCurrentResearch((prev) => (prev?.id === report.id ? { ...report, id: savedId } : prev));
+              const exId = await createExecutionLog(user.uid, {
+                transcript: transcript || report.query,
+                intent: 'research',
+                targetUrl: report.sources?.[0]?.url || '',
+                stepsCount: Math.max(1, report.sources.length),
+                summary: report.executiveSummary.slice(0, 900),
+                runtime: runtimeInfo.runtime,
+              });
+              await finalizeExecutionLog(exId, {
+                status: 'completed',
+                stepsCount: Math.max(1, report.sources.length),
+                summary: `${report.query} (${report.sources.length} sources)`,
+                targetUrl: report.sources?.[0]?.url || '',
+              });
+            } catch {
+              // continue smoothly
+            }
+          } else {
+            setLocalResearchHistory((prev) => [report, ...prev.filter((r) => r.id !== report.id)].slice(0, 20));
+          }
+        }
+      } else if (name === 'generate_visual') {
+        setIsGeneratingVisual(false);
+        const visual = result.visual as GeneratedVisual | undefined;
+        if (visual?.svgMarkup) {
+          setCurrentVisual(visual);
+          setVisuals((prev) => {
+            const next = [visual, ...prev.filter((item) => item.id !== visual.id)].slice(0, 20);
+            saveLocalVisuals(next);
+            return next;
+          });
+          setActiveDrawer('visuals');
+          if (user) {
+            try {
+              const exId = await createExecutionLog(user.uid, {
+                transcript: transcript || visual.prompt,
+                intent: 'visual_generate',
+                targetUrl: '',
+                stepsCount: 1,
+                summary: `${visual.title} (${visual.kind}, ${visual.aspectRatio})`,
+                runtime: runtimeInfo.runtime,
+              });
+              await finalizeExecutionLog(exId, {
+                status: 'completed',
+                stepsCount: 1,
+                summary: visual.summary || visual.title,
+                targetUrl: '',
+              });
+            } catch {
+              // continue smoothly
+            }
+          }
+        } else if (result.error) {
+          setVoiceError(String(result.error));
+        }
+      } else if (
+        name === 'manage_laptop_files' ||
+        name === 'control_laptop_apps' ||
+        name === 'execute_terminal_command'
+      ) {
+        if (!isToolPermitted(name)) {
+          setVoiceError(`Permission for ${name} is disabled in Laptop Setup.`);
+          return;
+        }
+        const finalResult = result.requiresClientExecution
+          ? (await executeLaptopTool(name, args)).result
+          : result;
+        const ok = Boolean(finalResult.ok);
+        const summary =
+          name === 'manage_laptop_files'
+            ? `${String(args.operation || 'file')} ${String(args.path || '')}`.trim()
+            : name === 'control_laptop_apps'
+              ? `${String(args.action || 'app')} ${String(args.appName || '')}`.trim()
+              : `${Boolean(args.background) ? '[BG] ' : ''}${String(args.command || '')}`;
+        const rawOut =
+          typeof finalResult.stdout === 'string' && finalResult.stdout
+            ? finalResult.stdout
+            : typeof finalResult.content === 'string'
+              ? finalResult.content.slice(0, 600)
+              : typeof finalResult.error === 'string'
+                ? finalResult.error
+                : JSON.stringify(finalResult).slice(0, 600);
+        setLaptopActions((prev) => [
+          {
+            id: `lap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            tool: name,
+            summary,
+            ok,
+            output: rawOut,
+            timestamp: Date.now(),
+            runtime: runtimeInfo.isTauri ? 'tauri-native' : 'laptop-agent',
+          },
+          ...prev.slice(0, 24),
+        ]);
+        if (!ok) {
+          setActiveDrawer('tauri');
+        }
+      } else {
+        const matchedPlugin = pluginsRef.current.find((p) => p.toolName === name);
+        if (matchedPlugin) {
+          let finalOk = Boolean(result.ok);
+          let finalSummary =
+            typeof result.summary === 'string' && result.summary
+              ? result.summary
+              : finalOk
+                ? `${matchedPlugin.name} executed.`
+                : String(result.error || 'Plugin failed.');
+
+          if (result.requiresClientExecution && typeof result.renderedCommand === 'string') {
+            if (!isToolPermitted('execute_terminal_command')) {
+              finalOk = false;
+              finalSummary = 'Terminal permission is disabled in Laptop Setup.';
+            } else {
+              const { result: laptopExec, runtime } = await executeLaptopTool(
+                'execute_terminal_command',
+                {
+                  command: result.renderedCommand,
+                  background: false,
+                }
+              );
+              finalOk = Boolean(laptopExec.ok);
+              finalSummary = finalOk
+                ? `${matchedPlugin.name} ran on laptop.`
+                : String(laptopExec.error || 'Laptop command failed.');
+              const rawOut =
+                typeof laptopExec.stdout === 'string' && laptopExec.stdout
+                  ? laptopExec.stdout
+                  : typeof laptopExec.error === 'string'
+                    ? laptopExec.error
+                    : finalSummary;
+              setLaptopActions((prev) => [
+                {
+                  id: `lap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  tool: name,
+                  summary: `${matchedPlugin.name}: ${result.renderedCommand}`,
+                  ok: finalOk,
+                  output: rawOut,
+                  timestamp: Date.now(),
+                  runtime,
+                },
+                ...prev.slice(0, 24),
+              ]);
+            }
+          }
+
+          await recordPluginExecution(matchedPlugin, name, finalOk, finalSummary, {
+            latencyMs: typeof result.latencyMs === 'number' ? result.latencyMs : undefined,
+            statusCode: typeof result.statusCode === 'number' ? result.statusCode : undefined,
+            targetUrl: matchedPlugin.endpointUrl,
+            transcript: transcript || `Voice call ${matchedPlugin.name}`,
+          });
+        }
+      }
+    },
+    [
+      user,
+      runtimeInfo.runtime,
+      runtimeInfo.isTauri,
+      runAutomationSequence,
+      isToolPermitted,
+      handleAddMemoryRecord,
+      handleDeleteMemoryRecord,
+      memories,
+      recordPluginExecution,
+    ]
+  );
+
+  const runDirectLaptopTool = useCallback(
+    async (toolName: string, args: Record<string, unknown>) => {
+      const cueInfo = describeToolCue(toolName, args);
+      if (!isToolPermitted(toolName)) {
+        const deniedResult = {
+          ok: false,
+          permissionDenied: true,
+          error: `Permission for ${toolName} is disabled in Laptop Setup.`,
+        };
+        finishCommandCue(cueInfo.kind, `${cueInfo.label} (Denied)`, false);
+        setVoiceError(deniedResult.error);
+        return deniedResult;
+      }
+      beginCommandCue(cueInfo.kind, cueInfo.label);
+      const { result, runtime } = await executeLaptopTool(toolName, args);
+      const ok = Boolean(result.ok);
+      finishCommandCue(cueInfo.kind, ok ? cueInfo.label : `${cueInfo.label} failed`, ok);
+      const summary =
+        toolName === 'manage_laptop_files'
+          ? `${String(args.operation || 'file')} ${String(args.path || '')}`.trim()
+          : toolName === 'control_laptop_apps'
+            ? args.action === 'arrange_windows'
+              ? `arrange_windows (${String(args.layout || 'grid')})`
+              : `${String(args.action || 'app')} ${String(args.appName || '')}`.trim()
+            : toolName === 'execute_browser_automation'
+              ? String(args.goal || args.targetUrl || 'Browser Automation').trim()
+              : `${Boolean(args.background) ? '[BG] ' : ''}${String(args.command || '')}`;
+      const output =
+        typeof result.stdout === 'string' && result.stdout
+          ? result.stdout
+          : typeof result.content === 'string'
+            ? result.content.slice(0, 800)
+            : typeof result.error === 'string'
+              ? result.error
+              : JSON.stringify(result, null, 2).slice(0, 800);
+
+      setLaptopActions((prev) => [
+        {
+          id: `lap-${Date.now()}`,
+          tool: toolName,
+          summary,
+          ok,
+          output,
+          timestamp: Date.now(),
+          runtime,
+        },
+        ...prev.slice(0, 24),
+      ]);
+
+      if (user) {
+        try {
+          const exId = await createExecutionLog(user.uid, {
+            transcript: summary,
+            intent: 'workflow_run',
+            targetUrl: '',
+            stepsCount: 1,
+            summary: output.slice(0, 900) || summary,
+            runtime: runtimeInfo.runtime,
+          });
+          await finalizeExecutionLog(exId, {
+            status: ok ? 'completed' : 'failed',
+            stepsCount: 1,
+            summary: `${summary} · ${ok ? 'OK' : 'Failed'}`,
+            targetUrl: '',
+          });
+        } catch {
+          // continue smoothly
+        }
+      }
+      return result;
+    },
+    [user, runtimeInfo.runtime, isToolPermitted, describeToolCue, beginCommandCue, finishCommandCue]
+  );
+
+  const stopVoiceSession = useCallback(() => {
+    isConnectedRef.current = false;
+    setIsConnected(false);
+    setIsConnecting(false);
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current.onaudioprocess = null;
+      processorRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (inputCtxRef.current && inputCtxRef.current.state !== 'closed') {
+      void inputCtxRef.current.close();
+      inputCtxRef.current = null;
+    }
+    micAnalyserRef.current = null;
+
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+    }
+    playerRef.current.clear();
+  }, []);
+
+  const startVoiceSession = useCallback(
+    async (startMuted = false) => {
+      if (isConnectedRef.current || isConnecting) return;
+      setVoiceError(null);
+      setIsConnecting(true);
+
+      // Release standby clap listener stream before opening live session mic
+      clapListenerRef.current.stop();
+      setClapStatus('idle');
+      mutedClapAnalyzerRef.current.reset();
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+        micStreamRef.current = stream;
+
+        const inputCtx = new AudioContext({ sampleRate: 16000 });
+        inputCtxRef.current = inputCtx;
+        const source = inputCtx.createMediaStreamSource(stream);
+        const analyser = inputCtx.createAnalyser();
+        analyser.fftSize = 128;
+        micAnalyserRef.current = analyser;
+
+        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        source.connect(analyser);
+        analyser.connect(processor);
+        processor.connect(inputCtx.destination);
+
+        isMicMutedRef.current = startMuted;
+        setIsMicMuted(startMuted);
+
+        let ctxQuery = '';
+        try {
+          const ctxRes = await fetch('/api/assistant/context', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(buildSessionContextPayload()),
+          });
+          const ctxData = (await ctxRes.json()) as { ctxId?: string };
+          if (ctxData?.ctxId) ctxQuery = `&ctx=${encodeURIComponent(ctxData.ctxId)}`;
+        } catch {
+          // continue cleanly without ctx
+        }
+
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${window.location.host}/ws/live?voice=${voiceName}${ctxQuery}`);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          isConnectedRef.current = true;
+          setIsConnected(true);
+          setIsConnecting(false);
+          showTransientCaption(assistantNameRef.current, 'Voice core online. Listening.', 3500);
+        };
+
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data) as {
+            type: string;
+            data?: string;
+            text?: string;
+            callId?: string;
+            name?: string;
+            args?: Record<string, unknown>;
+            result?: Record<string, unknown>;
+            message?: string;
+          };
+
+          if (msg.type === 'audio' && msg.data) {
+            playerRef.current.enqueuePcmChunk(msg.data);
+          } else if (msg.type === 'interrupted') {
+            playerRef.current.clear();
+            if (jarvisTranscriptBufRef.current) {
+              showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 4500);
+              jarvisTranscriptBufRef.current = '';
+            }
+          } else if (msg.type === 'input_transcript' && msg.text) {
+            userTranscriptBufRef.current += msg.text;
+            showTransientCaption('You', userTranscriptBufRef.current, 5000);
+          } else if (msg.type === 'output_transcript' && msg.text) {
+            userTranscriptBufRef.current = '';
+            jarvisTranscriptBufRef.current += msg.text;
+            showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 7000);
+          } else if (msg.type === 'turn_complete') {
+            userTranscriptBufRef.current = '';
+            if (jarvisTranscriptBufRef.current) {
+              showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 6000);
+              jarvisTranscriptBufRef.current = '';
+            }
+          } else if (msg.type === 'tool_started' && msg.name) {
+            const cueInfo = describeToolCue(msg.name, msg.args || {});
+            beginCommandCue(cueInfo.kind, cueInfo.label);
+            if (msg.name === 'research_topic') {
+              setIsResearching(true);
+              setActiveDrawer('research');
+              showTransientCaption(
+                assistantNameRef.current,
+                `Researching ${String(msg.args?.query || 'live sources')}...`,
+                5000
+              );
+            } else if (msg.name === 'generate_visual') {
+              setIsGeneratingVisual(true);
+              setActiveDrawer('visuals');
+              showTransientCaption(
+                assistantNameRef.current,
+                `Generating visual: ${String(msg.args?.prompt || 'graphic').slice(0, 48)}...`,
+                5000
+              );
+            } else if (msg.name === 'execute_browser_automation') {
+              setIsAutomating(true);
+              setActiveDrawer('automation');
+            } else if (
+              msg.name === 'manage_laptop_files' ||
+              msg.name === 'control_laptop_apps' ||
+              msg.name === 'execute_terminal_command'
+            ) {
+              setIsAutomating(true);
+            } else {
+              const pluginMatch = pluginsRef.current.find((p) => p.toolName === msg.name);
+              if (pluginMatch) {
+                showTransientCaption(
+                  assistantNameRef.current,
+                  `Running plugin: ${pluginMatch.name}...`,
+                  4000
+                );
+              }
+            }
+          } else if (msg.type === 'client_tool_request' && msg.callId && msg.name) {
+            const cueInfo = describeToolCue(msg.name, msg.args || {});
+            beginCommandCue(cueInfo.kind, cueInfo.label);
+            const toolResult = await runDirectLaptopTool(msg.name, msg.args || {});
+            setIsAutomating(false);
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  type: 'client_tool_response',
+                  callId: msg.callId,
+                  result: toolResult,
+                })
+              );
+            }
+          } else if (msg.type === 'tool_action' && msg.name) {
+            if (msg.name === 'research_topic') setIsResearching(false);
+            if (msg.name === 'generate_visual') setIsGeneratingVisual(false);
+            if (msg.name === 'execute_browser_automation') setIsAutomating(false);
+            const cueInfo = describeToolCue(msg.name, msg.args || {});
+            const actionOk = msg.result?.ok !== false;
+            finishCommandCue(cueInfo.kind, cueInfo.label, actionOk);
+            const recentTranscript = userTranscriptBufRef.current || '';
+            await handleToolAction(msg.name, msg.args || {}, msg.result || {}, recentTranscript);
+          } else if (msg.type === 'error') {
+            setIsResearching(false);
+            setIsGeneratingVisual(false);
+            setIsAutomating(false);
+            finishCommandCue('command', msg.message || 'Voice stream error', false);
+            setVoiceError(msg.message || 'Voice stream error.');
+          } else if (msg.type === 'closed') {
+            setIsResearching(false);
+            setIsGeneratingVisual(false);
+            setIsAutomating(false);
+            setCommandCue(null);
+            stopVoiceSession();
+          }
+        };
+
+        ws.onerror = () => {
+          setVoiceError('WebSocket connection error. Verify server availability.');
+          stopVoiceSession();
+        };
+
+        ws.onclose = () => {
+          if (isConnectedRef.current) {
+            stopVoiceSession();
+          }
+        };
+
+        processor.onaudioprocess = (e) => {
+          if (!isConnectedRef.current) return;
+          const samples = e.inputBuffer.getChannelData(0);
+          if (isMicMutedRef.current) {
+            if (
+              clapWakeEnabledRef.current &&
+              mutedClapAnalyzerRef.current.processSamples(samples, 16000)
+            ) {
+              playWakeChime();
+              isMicMutedRef.current = false;
+              setIsMicMuted(false);
+              showTransientCaption(
+                assistantNameRef.current,
+                'Double-clap detected. Mic live.',
+                3500
+              );
+            }
+            return;
+          }
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+          const base64 = float32ToPcm16Base64(samples);
+          wsRef.current.send(JSON.stringify({ type: 'audio', data: base64 }));
+        };
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Microphone permission is required for voice control.';
+        setVoiceError(msg);
+        stopVoiceSession();
+      }
+    },
+    [
+      voiceName,
+      isConnecting,
+      showTransientCaption,
+      handleToolAction,
+      runDirectLaptopTool,
+      stopVoiceSession,
+      buildSessionContextPayload,
+      describeToolCue,
+      beginCommandCue,
+      finishCommandCue,
+    ]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (cueTimerRef.current) window.clearTimeout(cueTimerRef.current);
+      if (captionTimerRef.current) window.clearTimeout(captionTimerRef.current);
+      clapListenerRef.current.stop();
+      stopVoiceSession();
+      playerRef.current.dispose();
+    };
+  }, [stopVoiceSession]);
+
+  // Background Double-Clap Wake Listener (active in standby when unlocked & not in setup)
+  useEffect(() => {
+    const faceLocked = Boolean(faceAuthProfile && setupConfig.faceAuthEnabled && !isFaceUnlocked);
+    const shouldArm =
+      setupConfig.clapWakeEnabled &&
+      !isConnected &&
+      !isConnecting &&
+      !setupOpen &&
+      !faceLocked;
+
+    if (!shouldArm) {
+      clapListenerRef.current.stop();
+      setClapStatus('idle');
+      return;
+    }
+
+    let cancelled = false;
+    let gestureCleanup: (() => void) | null = null;
+
+    const triggerWake = () => {
+      if (cancelled || isConnectedRef.current) return;
+      clapListenerRef.current.stop();
+      setClapStatus('idle');
+      playWakeChime();
+      showTransientCaption(
+        assistantNameRef.current,
+        'Double-clap detected. Listening.',
+        3500
+      );
+      void startVoiceSession(false);
+    };
+
+    const arm = async () => {
+      const status = await clapListenerRef.current.start(triggerWake);
+      if (cancelled) {
+        clapListenerRef.current.stop();
+        return;
+      }
+      setClapStatus(status);
+
+      if (status === 'needs-gesture' || status === 'denied') {
+        const onFirstGesture = () => {
+          if (gestureCleanup) {
+            gestureCleanup();
+            gestureCleanup = null;
+          }
+          if (!cancelled) {
+            void arm();
+          }
+        };
+        window.addEventListener('pointerdown', onFirstGesture, { once: true });
+        window.addEventListener('keydown', onFirstGesture, { once: true });
+        gestureCleanup = () => {
+          window.removeEventListener('pointerdown', onFirstGesture);
+          window.removeEventListener('keydown', onFirstGesture);
+        };
+      }
+    };
+
+    void arm();
+
+    return () => {
+      cancelled = true;
+      if (gestureCleanup) gestureCleanup();
+      clapListenerRef.current.stop();
+    };
+  }, [
+    setupConfig.clapWakeEnabled,
+    setupConfig.faceAuthEnabled,
+    faceAuthProfile,
+    isFaceUnlocked,
+    isConnected,
+    isConnecting,
+    setupOpen,
+    startVoiceSession,
+    showTransientCaption,
+  ]);
+
+  // Hold Spacebar shortcut for Push-to-Talk
+  useEffect(() => {
+    const isInputTarget = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || e.repeat || isInputTarget(e.target)) return;
+      if (wakeMode !== 'push-to-talk') return;
+      e.preventDefault();
+      spaceHoldActiveRef.current = true;
+      if (!isConnectedRef.current) {
+        void startVoiceSession(false);
+      } else {
+        isMicMutedRef.current = false;
+        setIsMicMuted(false);
+      }
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || !spaceHoldActiveRef.current) return;
+      spaceHoldActiveRef.current = false;
+      if (wakeMode === 'push-to-talk' && isConnectedRef.current) {
+        isMicMutedRef.current = true;
+        setIsMicMuted(true);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [wakeMode, startVoiceSession]);
+
+  // Triggered by stage demo buttons or macro replay (speaks back via TTS, no chatbox)
+  const runSpokenAction = useCallback(
+    async (commandText: string) => {
+      const clean = commandText.trim();
+      if (!clean) return;
+      setVoiceError(null);
+      showTransientCaption('You', clean, 4000);
+      beginCommandCue('command', `Processing: ${clean.slice(0, 44)}`);
+
+      try {
+        const res = await fetch('/api/assistant/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            command: clean,
+            voiceName,
+            speak: true,
+            context: buildSessionContextPayload(),
+          }),
+        });
+        const data = (await res.json()) as {
+          spokenText?: string;
+          actions?: Array<{
+            name: string;
+            args: Record<string, unknown>;
+            result: Record<string, unknown>;
+          }>;
+          audioBase64?: string | null;
+          error?: string;
+        };
+
+        if (!res.ok) throw new Error(data.error || 'Command failed');
+
+        if (data.actions && data.actions.length > 0) {
+          for (const act of data.actions) {
+            const cueInfo = describeToolCue(act.name, act.args);
+            beginCommandCue(cueInfo.kind, cueInfo.label);
+            await handleToolAction(act.name, act.args, act.result, clean);
+            finishCommandCue(cueInfo.kind, cueInfo.label, act.result?.ok !== false);
+          }
+        } else {
+          finishCommandCue('command', 'Command completed', true);
+        }
+        if (data.spokenText) {
+          showTransientCaption(assistantNameRef.current, data.spokenText, 6000);
+        }
+        if (data.audioBase64) {
+          await playerRef.current.playWavBase64(data.audioBase64);
+        }
+      } catch (err) {
+        finishCommandCue('command', 'Command failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Unable to execute command.');
+      }
+    },
+    [
+      voiceName,
+      showTransientCaption,
+      handleToolAction,
+      buildSessionContextPayload,
+      describeToolCue,
+      beginCommandCue,
+      finishCommandCue,
+    ]
+  );
+
+  const handleSearchAndPlayYouTube = useCallback(
+    async (query: string, mediaType: 'song' | 'video') => {
+      if (!isToolPermitted('play_youtube_media')) {
+        setVoiceError('YouTube Media permission is disabled in Laptop Setup.');
+        return;
+      }
+      setActiveDrawer('youtube');
+      beginCommandCue('youtube', `YouTube: ${query.slice(0, 44)}`);
+      try {
+        const res = await fetch(`/api/youtube/search?q=${encodeURIComponent(query)}`);
+        const data = (await res.json()) as { results?: YouTubeTrack[] };
+        const first = data.results?.[0];
+        if (!first) {
+          finishCommandCue('youtube', 'No matching tracks found', false);
+          setVoiceError(`No playable YouTube videos found for "${query}".`);
+          return;
+        }
+        await handleToolAction(
+          'play_youtube_media',
+          { query, mediaType },
+          { ok: true, mediaType, selected: first },
+          `Play ${query} on YouTube`
+        );
+        finishCommandCue('youtube', `Playing: ${first.title.slice(0, 42)}`, true);
+      } catch (err) {
+        finishCommandCue('youtube', 'YouTube search failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'YouTube search failed');
+      }
+    },
+    [handleToolAction, isToolPermitted, beginCommandCue, finishCommandCue]
+  );
+
+  const handleInspectUrl = useCallback(
+    async (url: string) => {
+      if (!isToolPermitted('execute_browser_automation')) {
+        setVoiceError('Browser Automation permission is disabled in Laptop Setup.');
+        return;
+      }
+      setActiveDrawer('automation');
+      beginCommandCue('automation', `Inspecting: ${url.slice(0, 44)}`);
+      try {
+        const res = await fetch('/api/automation/inspect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const inspection = (await res.json()) as PageInspectionResult;
+        setAutomationRun({
+          id: `inspect-${Date.now()}`,
+          goal: `Inspect ${inspection.title || url}`,
+          targetUrl: inspection.finalUrl || url,
+          status: 'completed',
+          steps: [
+            {
+              action: 'navigate',
+              selector: 'document',
+              value: inspection.finalUrl || url,
+              description: `Loaded ${inspection.title || url}`,
+              status: 'completed',
+            },
+          ],
+          inspection,
+          startedAt: Date.now(),
+        });
+        finishCommandCue('automation', `Inspected ${inspection.title || url}`, true);
+      } catch (err) {
+        finishCommandCue('automation', 'Page inspection failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Inspection failed');
+      }
+    },
+    [isToolPermitted, beginCommandCue, finishCommandCue]
+  );
+
+  const handleArrangeWindowsViaBrowserAutomation = useCallback(
+    async ({
+      layout,
+      apps,
+      gap,
+    }: {
+      layout: WindowLayoutMode;
+      apps: string[];
+      gap: number;
+    }) => {
+      if (!isToolPermitted('execute_browser_automation')) {
+        setVoiceError('Browser Automation permission is disabled in Laptop Setup.');
+        return;
+      }
+      const layoutLabel =
+        layout === 'side-by-side'
+          ? 'Side-by-Side'
+          : layout === 'focus-split'
+            ? 'Focus + Stack'
+            : 'Grid';
+      const steps: AutomationStep[] = [
+        {
+          action: 'arrange_windows',
+          selector: layout,
+          value: apps.join(', '),
+          description: `Arrange ${apps.length > 0 ? apps.join(', ') : 'open windows'} into ${layoutLabel} layout (${gap}px gap)`,
+        },
+      ];
+      const goal = `Arrange ${apps.length || 'open'} laptop windows (${layoutLabel})`;
+      const inspection = buildWindowLayoutInspection(layout, apps, steps);
+      beginCommandCue('automation', `Arranging windows (${layout})`);
+      try {
+        await runAutomationSequence(
+          goal,
+          'desktop://window-layout',
+          steps,
+          inspection,
+          `Arrange ${apps.join(', ') || 'open windows'} into ${layoutLabel} layout`,
+          { gap }
+        );
+        finishCommandCue('automation', `Arranged windows (${layoutLabel})`, true);
+      } catch (err) {
+        finishCommandCue('automation', 'Window arrangement failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Unable to arrange windows.');
+      }
+    },
+    [isToolPermitted, beginCommandCue, finishCommandCue, runAutomationSequence]
+  );
+
+  const handleSpeakText = useCallback(
+    async (text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      showTransientCaption(assistantNameRef.current, clean, 7000);
+      try {
+        const res = await fetch('/api/assistant/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: clean, voiceName }),
+        });
+        const data = (await res.json()) as { audioBase64?: string; error?: string };
+        if (!res.ok) throw new Error(data.error || 'TTS failed');
+        if (data.audioBase64) {
+          await playerRef.current.playWavBase64(data.audioBase64);
+        }
+      } catch (err) {
+        setVoiceError(err instanceof Error ? err.message : 'Unable to speak briefing');
+      }
+    },
+    [voiceName, showTransientCaption]
+  );
+
+  const handleRunResearch = useCallback(
+    async (query: string, depth: 'quick' | 'deep', urls: string[]) => {
+      if (!isToolPermitted('research_topic')) {
+        setVoiceError('Deep Research permission is disabled in Laptop Setup.');
+        return;
+      }
+      const clean = query.trim();
+      if (!clean) return;
+      setVoiceError(null);
+      setIsResearching(true);
+      setActiveDrawer('research');
+      showTransientCaption('You', `Research: ${clean}`, 4500);
+      beginCommandCue('research', `Researching: ${clean.slice(0, 44)}`);
+
+      try {
+        const res = await fetch('/api/research/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: true }),
+        });
+        const data = (await res.json()) as {
+          report?: ResearchReport;
+          audioBase64?: string | null;
+          error?: string;
+        };
+        if (!res.ok || !data.report) {
+          throw new Error(data.error || 'Research request failed');
+        }
+        await handleToolAction(
+          'research_topic',
+          { query: clean, depth, urls },
+          { ok: true, report: data.report },
+          clean
+        );
+        finishCommandCue('research', `Briefing ready (${data.report.sources.length} sources)`, true);
+        if (data.report.spokenSummary) {
+          showTransientCaption(assistantNameRef.current, data.report.spokenSummary, 7000);
+        }
+        if (data.audioBase64) {
+          await playerRef.current.playWavBase64(data.audioBase64);
+        }
+      } catch (err) {
+        finishCommandCue('research', 'Research failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Unable to complete research.');
+      } finally {
+        setIsResearching(false);
+      }
+    },
+    [
+      voiceName,
+      showTransientCaption,
+      handleToolAction,
+      isToolPermitted,
+      beginCommandCue,
+      finishCommandCue,
+    ]
+  );
+
+  const handleGenerateVisual = useCallback(
+    async (input: {
+      prompt: string;
+      style: VisualStyle;
+      aspectRatio: VisualAspectRatio;
+      refineFromSvg?: string;
+    }) => {
+      const clean = input.prompt.trim();
+      if (!clean) return;
+      setVoiceError(null);
+      setIsGeneratingVisual(true);
+      setActiveDrawer('visuals');
+      showTransientCaption('You', `Visual: ${clean}`, 4500);
+      beginCommandCue('visuals', `Creating visual: ${clean.slice(0, 40)}`);
+
+      try {
+        const res = await fetch('/api/visuals/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: clean,
+            style: input.style,
+            aspectRatio: input.aspectRatio,
+            refineFromSvg: input.refineFromSvg,
+            voiceName,
+            speak: true,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          visual?: GeneratedVisual;
+          audioBase64?: string | null;
+          error?: string;
+        };
+        if (!res.ok || !data.visual) {
+          throw new Error(data.error || 'Visual generation failed');
+        }
+        await handleToolAction(
+          'generate_visual',
+          { prompt: clean, style: input.style, aspectRatio: input.aspectRatio },
+          { ok: true, visual: data.visual },
+          clean
+        );
+        finishCommandCue('visuals', `Visual ready: ${data.visual.title.slice(0, 36)}`, true);
+        if (data.visual.summary) {
+          showTransientCaption(assistantNameRef.current, data.visual.summary, 6500);
+        }
+        if (data.audioBase64) {
+          await playerRef.current.playWavBase64(data.audioBase64);
+        }
+      } catch (err) {
+        finishCommandCue('visuals', 'Visual generation failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Unable to generate visual.');
+      } finally {
+        setIsGeneratingVisual(false);
+      }
+    },
+    [
+      voiceName,
+      showTransientCaption,
+      beginCommandCue,
+      finishCommandCue,
+      handleToolAction,
+    ]
+  );
+
+  const handleSignIn = async () => {
+    setAuthError(null);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed');
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOut(auth);
+  };
+
+  const handleVoiceChange = async (next: VoiceName) => {
+    setVoiceName(next);
+    if (user) await updateUserPreferences(user.uid, { voiceName: next });
+    if (isConnectedRef.current) stopVoiceSession();
+  };
+
+  const handleWakeModeChange = async (mode: WakeMode) => {
+    setWakeMode(mode);
+    if (user) await updateUserPreferences(user.uid, { wakeMode: mode });
+  };
+
+  const handleToggleClapWake = async (enabled: boolean) => {
+    const nextConfig: SetupConfig = {
+      ...setupConfig,
+      clapWakeEnabled: enabled,
+    };
+    setSetupConfig(nextConfig);
+    saveLocalSetupConfig(nextConfig);
+    if (user) {
+      await updateUserPreferences(user.uid, { clapWakeEnabled: enabled });
+    }
+  };
+
+  const handleTestRunPlugin = useCallback(
+    async (
+      plugin: ShadowPlugin,
+      args: Record<string, unknown>
+    ): Promise<PluginExecutionResult> => {
+      const started = Date.now();
+      beginCommandCue('plugin', `Plugin: ${plugin.name}`);
+      const res = await fetch('/api/plugins/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plugin, args }),
+      });
+      const data = (await res.json()) as PluginExecutionResult;
+      if (data.requiresClientExecution && data.renderedCommand) {
+        const laptopRes = await runDirectLaptopTool('execute_terminal_command', {
+          command: data.renderedCommand,
+          background: false,
+        });
+        const laptopObj = laptopRes as Record<string, unknown>;
+        const ok = Boolean(laptopObj.ok);
+        const execResult: PluginExecutionResult = {
+          ok,
+          pluginId: plugin.id,
+          pluginName: plugin.name,
+          toolName: plugin.toolName,
+          kind: plugin.kind,
+          latencyMs: Date.now() - started,
+          stdout:
+            typeof laptopObj.stdout === 'string' && laptopObj.stdout
+              ? laptopObj.stdout
+              : typeof laptopObj.stderr === 'string'
+                ? laptopObj.stderr
+                : undefined,
+          summary: ok
+            ? `Executed "${data.renderedCommand}" on laptop.`
+            : String(laptopObj.error || 'Laptop command failed.'),
+          error: ok ? undefined : String(laptopObj.error || 'Command failed'),
+        };
+        await recordPluginExecution(plugin, plugin.toolName, ok, execResult.summary || plugin.name, {
+          latencyMs: execResult.latencyMs,
+          transcript: `Test Run: ${plugin.name}`,
+        });
+        finishCommandCue('plugin', `Plugin: ${plugin.name}`, ok);
+        return execResult;
+      }
+
+      await recordPluginExecution(
+        plugin,
+        plugin.toolName,
+        Boolean(data.ok),
+        data.summary || (data.ok ? `${plugin.name} succeeded.` : data.error || 'Failed'),
+        {
+          latencyMs: data.latencyMs,
+          statusCode: data.statusCode,
+          targetUrl: plugin.endpointUrl,
+          transcript: `Test Run: ${plugin.name}`,
+        }
+      );
+      finishCommandCue('plugin', `Plugin: ${plugin.name}`, Boolean(data.ok));
+      return data;
+    },
+    [runDirectLaptopTool, recordPluginExecution, beginCommandCue, finishCommandCue]
+  );
+
+  // Compute 3D Arc Reactor visual mode
+  const reactorMode: ReactorMode = useMemo(() => {
+    if (commandCue?.active) {
+      if (commandCue.kind === 'research') return 'researching';
+      if (commandCue.kind === 'visuals') return 'visuals';
+      if (commandCue.kind === 'automation') return 'automating';
+      if (commandCue.kind === 'youtube') return 'media';
+      if (commandCue.kind === 'laptop') return 'laptop';
+      if (commandCue.kind === 'memory') return 'memory';
+      if (commandCue.kind === 'plugin') return 'plugin';
+    }
+    if (isResearching) return 'researching';
+    if (isGeneratingVisual) return 'visuals';
+    if (isAutomating) return 'automating';
+    if (isAssistantSpeaking) return 'speaking';
+    if (isConnecting) return 'connecting';
+    if (isConnected && !isMicMuted) return 'listening';
+    if (currentTrack && activeDrawer === 'youtube') return 'media';
+    return 'standby';
+  }, [
+    commandCue,
+    isResearching,
+    isGeneratingVisual,
+    isAutomating,
+    isAssistantSpeaking,
+    isConnecting,
+    isConnected,
+    isMicMuted,
+    currentTrack,
+    activeDrawer,
+  ]);
+
+  const statusText = commandCue
+    ? commandCue.label
+    : reactorMode === 'connecting'
+      ? 'Connecting Audio'
+      : reactorMode === 'researching'
+        ? 'Researching Live Sources'
+        : reactorMode === 'visuals'
+          ? 'Generating Visual Graphic'
+          : reactorMode === 'laptop'
+            ? 'Executing Laptop Command'
+            : reactorMode === 'memory'
+              ? 'Updating Long-Term Memory'
+              : reactorMode === 'plugin'
+                ? 'Running Plugin Connector'
+                : reactorMode === 'speaking'
+                  ? 'Speaking'
+                  : reactorMode === 'listening'
+                    ? 'Listening'
+                    : reactorMode === 'automating'
+                      ? 'Executing Browser Task'
+                      : isConnected && isMicMuted
+                        ? setupConfig.clapWakeEnabled
+                          ? 'Microphone Muted · Clap twice to unmute'
+                          : 'Microphone Muted'
+                        : setupConfig.clapWakeEnabled
+                          ? clapStatus === 'listening'
+                            ? 'Clap twice or click Core to speak'
+                            : clapStatus === 'needs-gesture'
+                              ? 'Click anywhere once to arm Double-Clap Wake'
+                              : 'Click Core or Press Speak'
+                          : 'Click Core or Press Speak';
+
+  return (
+    <div className="relative w-screen h-screen overflow-hidden bg-[#06090F] text-[#F3F4F6] select-none">
+      {/* Full-Viewport Centered 3D Arc Reactor */}
+      <div className="absolute inset-0 z-0">
+        <ArcReactorScene
+          mode={reactorMode}
+          commandCue={commandCue}
+          stageOverlayOpen={activeDrawer !== null}
+          inputLevelRef={inputLevelRef}
+          outputLevelRef={outputLevelRef}
+          onCoreClick={() => {
+            if (isConnected) stopVoiceSession();
+            else void startVoiceSession(false);
+          }}
+        />
+      </div>
+
+      {/* Minimal 3-Zone Top Bar (No backdrop-blur over WebGL) */}
+      <header className="relative z-20 px-6 py-4 flex items-center justify-between gap-8 pointer-events-none">
+        <button
+          type="button"
+          onClick={() => setActiveDrawer(null)}
+          className="pointer-events-auto font-[family-name:var(--font-display)] text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0 hover:text-sky-300 transition-colors"
+        >
+          {assistantName}
+        </button>
+
+        <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-400 pointer-events-auto">
+          {(
+            [
+              { id: 'research', label: 'Research' },
+              { id: 'automation', label: 'Automation' },
+              { id: 'youtube', label: 'YouTube' },
+              { id: 'visuals', label: 'Visuals' },
+              { id: 'macros', label: 'Memory' },
+              { id: 'plugins', label: 'Plugins' },
+              { id: 'tauri', label: 'Desktop' },
+            ] as const
+          ).map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() =>
+                setActiveDrawer((prev) => (prev === item.id ? null : item.id))
+              }
+              className={`pb-0.5 border-b transition-colors whitespace-nowrap shrink-0 ${
+                activeDrawer === item.id
+                  ? 'text-slate-100 border-sky-400'
+                  : 'text-slate-400 border-transparent hover:text-slate-200'
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="pointer-events-auto flex items-center shrink-0">
+          {!authReady ? (
+            <span className="text-xs text-slate-500 whitespace-nowrap shrink-0">Connecting</span>
+          ) : user ? (
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="px-3.5 py-1.5 rounded-lg border border-slate-800 bg-[#0B0F19]/90 text-xs font-medium text-slate-200 hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <LogOut className="w-3.5 h-3.5 text-slate-400" />
+              <span className="max-w-[130px] truncate">{user.displayName || user.email}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSignIn}
+              className="px-4 py-1.5 rounded-lg bg-sky-500 text-slate-950 text-xs font-semibold hover:bg-sky-400 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span>Sign In</span>
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* Live Spoken Caption Only (No Chatbox, No Input Form) */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-32 z-10 flex flex-col items-center px-6 text-center">
+        <AnimatePresence mode="wait">
+          {liveCaption ? (
+            <motion.div
+              key={liveCaption.text}
+              initial={{ opacity: 0, y: 12, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -8, scale: 0.98 }}
+              transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+              className="max-w-xl px-5 py-2.5 rounded-2xl bg-[#0B111E]/80 backdrop-blur-xl border border-white/12 shadow-[0_18px_48px_rgba(0,0,0,0.6),inset_0_1px_0_rgba(255,255,255,0.12)]"
+            >
+              <p className="text-[11px] font-medium text-sky-400 mb-0.5">{liveCaption.speaker}</p>
+              <p className="text-sm text-slate-100 leading-snug line-clamp-2">{liveCaption.text}</p>
+            </motion.div>
+          ) : (
+            <motion.div
+              key={statusText}
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.18 }}
+              className={`inline-flex items-center gap-2 text-xs tracking-wide ${
+                commandCue
+                  ? 'px-3.5 py-1.5 rounded-full bg-[#0B111E]/95 border border-white/12 text-slate-100 shadow-md'
+                  : 'text-slate-400'
+              }`}
+            >
+              {commandCue && (
+                <span
+                  aria-hidden="true"
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    commandCue.outcome === 'error'
+                      ? 'bg-rose-400'
+                      : commandCue.kind === 'research'
+                        ? 'bg-indigo-400'
+                        : commandCue.kind === 'visuals'
+                          ? 'bg-purple-400'
+                          : commandCue.kind === 'automation'
+                            ? 'bg-amber-400'
+                            : commandCue.kind === 'youtube'
+                              ? 'bg-rose-400'
+                              : commandCue.kind === 'laptop'
+                                ? 'bg-emerald-400'
+                                : commandCue.kind === 'memory'
+                                  ? 'bg-amber-300'
+                                  : commandCue.kind === 'plugin'
+                                    ? 'bg-teal-400'
+                                    : 'bg-sky-400'
+                  }`}
+                />
+              )}
+              <span>{statusText}</span>
+              {currentTrack && activeDrawer !== 'youtube' && (
+                <>
+                  <span aria-hidden="true"> · </span>
+                  <span className="text-sky-300">Playing: {currentTrack.title}</span>
+                </>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {(voiceError || authError) && (
+          <div className="pointer-events-auto mt-3 px-4 py-2 rounded-xl bg-red-950/90 border border-red-500/40 text-xs text-red-200 flex items-center gap-3 shadow-lg">
+            <span>{voiceError || authError}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setVoiceError(null);
+                setAuthError(null);
+              }}
+              className="text-red-300 underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* macOS Vibrancy Glass Window Stage Overlay */}
+      <AnimatePresence>
+        {activeDrawer && activeDrawer !== 'youtube' && (
+          <motion.div
+            key={activeDrawer}
+            layout
+            initial={
+              prefersReduced
+                ? { opacity: 0 }
+                : { opacity: 0, y: 68, scale: 0.86, filter: 'blur(8px)' }
+            }
+            animate={
+              prefersReduced
+                ? { opacity: 1 }
+                : { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }
+            }
+            exit={
+              prefersReduced
+                ? { opacity: 0 }
+                : { opacity: 0, y: 74, scale: 0.84, filter: 'blur(8px)' }
+            }
+            transition={{ type: 'spring', stiffness: 340, damping: 28, mass: 0.85 }}
+            className={`absolute z-30 flex flex-col origin-bottom ${
+              windowMaximized
+                ? 'inset-x-3 md:inset-x-4 top-14 bottom-26'
+                : 'inset-x-4 md:inset-x-10 top-16 bottom-28 max-w-6xl mx-auto'
+            }`}
+          >
+            <MacWindowFrame
+              title={
+                activeDrawer === 'research'
+                  ? 'Research'
+                  : activeDrawer === 'visuals'
+                    ? 'Visuals'
+                    : activeDrawer === 'automation'
+                      ? 'Browser Automation'
+                      : activeDrawer === 'macros'
+                        ? 'Memory & Macros'
+                        : activeDrawer === 'plugins'
+                          ? 'Plugins'
+                          : 'Desktop App'
+              }
+              subtitle={
+                activeDrawer === 'research'
+                  ? 'Grounded Web Intelligence'
+                  : activeDrawer === 'visuals'
+                    ? 'Diagrams, Charts & Vector Studio'
+                    : activeDrawer === 'automation'
+                      ? 'DOM Inspector & Actions'
+                      : activeDrawer === 'macros'
+                        ? `${assistantName} Long-Term Context`
+                        : activeDrawer === 'plugins'
+                          ? 'Live API & CLI Extensions'
+                          : 'Laptop Agent & Terminal'
+              }
+              icon={
+                activeDrawer === 'research' ? (
+                  <Compass className="w-3.5 h-3.5 text-indigo-300" />
+                ) : activeDrawer === 'visuals' ? (
+                  <ImageIcon className="w-3.5 h-3.5 text-purple-300" />
+                ) : activeDrawer === 'automation' ? (
+                  <Globe className="w-3.5 h-3.5 text-sky-300" />
+                ) : activeDrawer === 'macros' ? (
+                  <Layers className="w-3.5 h-3.5 text-amber-300" />
+                ) : activeDrawer === 'plugins' ? (
+                  <Blocks className="w-3.5 h-3.5 text-emerald-300" />
+                ) : (
+                  <Monitor className="w-3.5 h-3.5 text-slate-200" />
+                )
+              }
+              isMaximized={windowMaximized}
+              onClose={() => setActiveDrawer(null)}
+              onMinimize={() => setActiveDrawer(null)}
+              onToggleMaximize={() => setWindowMaximized((prev) => !prev)}
+            >
+              {activeDrawer === 'research' && (
+                <ResearchStage
+                  report={currentResearch}
+                  history={researchHistory}
+                  isResearching={isResearching}
+                  onRunResearch={(q, depth, urls) => void handleRunResearch(q, depth, urls)}
+                  onSelectReport={(rep) => setCurrentResearch(rep)}
+                  onDeleteReport={(rep) => {
+                    if (user && rep.id) {
+                      void deleteResearchReport(rep.id);
+                    } else {
+                      setLocalResearchHistory((prev) => prev.filter((r) => r.id !== rep.id));
+                    }
+                    if (currentResearch?.id === rep.id) {
+                      setCurrentResearch(null);
+                    }
+                  }}
+                  onSpeakBrief={(text) => void handleSpeakText(text)}
+                  onInspectSourceUrl={(url) => void handleInspectUrl(url)}
+                />
+              )}
+
+              {activeDrawer === 'visuals' && (
+                <VisualsStage
+                  visual={currentVisual}
+                  history={visuals}
+                  isGenerating={isGeneratingVisual}
+                  onGenerateVisual={handleGenerateVisual}
+                  onSelectVisual={(v) => setCurrentVisual(v)}
+                  onDeleteVisual={(v) => {
+                    setVisuals((prev) => {
+                      const next = prev.filter((item) => item.id !== v.id);
+                      saveLocalVisuals(next);
+                      return next;
+                    });
+                    setCurrentVisual((prev) => (prev?.id === v.id ? null : prev));
+                  }}
+                />
+              )}
+
+              {activeDrawer === 'automation' && (
+                <BrowserAutomationStage
+                  run={automationRun}
+                  runtime={runtimeInfo.runtime}
+                  onInspectUrl={(url) => void handleInspectUrl(url)}
+                  onRunQuickDemo={(cmd) => void runSpokenAction(cmd)}
+                  onSaveAsMacro={async (run) => {
+                    if (!user) {
+                      await handleSignIn();
+                      return;
+                    }
+                    await createWorkflow(user.uid, {
+                      name: run.goal.slice(0, 120),
+                      voiceTrigger: run.goal.slice(0, 180),
+                      targetUrl: run.targetUrl,
+                      category: 'form-fill',
+                      steps: run.steps.map(({ action, selector, value, description }) => ({
+                        action,
+                        selector,
+                        value,
+                        description,
+                      })),
+                    });
+                    setActiveDrawer('macros');
+                  }}
+                />
+              )}
+
+              {activeDrawer === 'macros' && (
+                <MacrosAndHistoryView
+                  workflows={workflows}
+                  executions={executions}
+                  assistantName={assistantName}
+                  memories={memories}
+                  onAddMemory={(input) => handleAddMemoryRecord({ ...input, source: 'manual' })}
+                  onToggleMemoryImportance={(mem) => handleToggleMemoryImportance(mem)}
+                  onDeleteMemory={(id) => handleDeleteMemoryRecord(id)}
+                  isAuthenticated={Boolean(user)}
+                  onRequireAuth={() => void handleSignIn()}
+                  onRunWorkflow={async (wf) => {
+                    if (user) void incrementWorkflowRunCount(wf.id, wf.runCount);
+                    const inspectionRes = await fetch('/api/automation/inspect', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ url: wf.targetUrl }),
+                    }).catch(() => null);
+                    const inspection = inspectionRes?.ok
+                      ? ((await inspectionRes.json()) as PageInspectionResult)
+                      : null;
+                    await runAutomationSequence(
+                      wf.name,
+                      wf.targetUrl,
+                      wf.steps,
+                      inspection,
+                      wf.voiceTrigger
+                    );
+                  }}
+                  onDeleteWorkflow={(id) => void deleteWorkflow(id)}
+                  onCreateWorkflow={(input) => {
+                    if (!user) return;
+                    void createWorkflow(user.uid, {
+                      ...input,
+                      steps: [
+                        {
+                          action: 'navigate',
+                          selector: 'body',
+                          value: input.targetUrl,
+                          description: `Navigate to ${input.targetUrl}`,
+                        },
+                      ],
+                    });
+                  }}
+                />
+              )}
+
+              {activeDrawer === 'plugins' && (
+                <PluginsStage
+                  plugins={plugins}
+                  assistantName={assistantName}
+                  recentLogs={pluginLogs}
+                  onInstallPlugin={handleInstallPlugin}
+                  onUpdatePlugin={handleUpdatePlugin}
+                  onDeletePlugin={handleDeletePlugin}
+                  onTestRunPlugin={handleTestRunPlugin}
+                />
+              )}
+
+              {activeDrawer === 'tauri' && (
+                <TauriDesktopView
+                  runtimeInfo={runtimeInfo}
+                  agentHealth={agentHealth}
+                  laptopActions={laptopActions}
+                  setupConfig={setupConfig}
+                  hasFaceEnrolled={Boolean(faceAuthProfile)}
+                  onOpenSetup={() => setSetupOpen(true)}
+                  onLockSession={() => {
+                    stopVoiceSession();
+                    setIsFaceUnlocked(false);
+                  }}
+                  onAgentStatusChanged={setAgentHealth}
+                  onRunLaptopTool={async (toolName, args) => {
+                    return await runDirectLaptopTool(toolName, args);
+                  }}
+                  onArrangeViaBrowserAutomation={handleArrangeWindowsViaBrowserAutomation}
+                  onRunAutomationCommand={async (cmd) => {
+                    await runSpokenAction(cmd);
+                  }}
+                />
+              )}
+            </MacWindowFrame>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Persistent YouTube Media Stage (keeps audio/video playing seamlessly when minimized to Dock) */}
+      {(currentTrack || activeDrawer === 'youtube') && (
+        <motion.div
+          layout
+          initial={false}
+          animate={
+            activeDrawer === 'youtube'
+              ? prefersReduced
+                ? { opacity: 1 }
+                : { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }
+              : prefersReduced
+                ? { opacity: 0 }
+                : { opacity: 0, y: 74, scale: 0.84, filter: 'blur(8px)' }
+          }
+          transition={{ type: 'spring', stiffness: 340, damping: 28, mass: 0.85 }}
+          aria-hidden={activeDrawer !== 'youtube'}
+          className={`absolute z-30 flex flex-col origin-bottom ${
+            windowMaximized
+              ? 'inset-x-3 md:inset-x-4 top-14 bottom-26'
+              : 'inset-x-4 md:inset-x-10 top-16 bottom-28 max-w-6xl mx-auto'
+          } ${activeDrawer === 'youtube' ? 'pointer-events-auto' : 'pointer-events-none'}`}
+        >
+          <MacWindowFrame
+            title="YouTube Player"
+            subtitle={currentTrack ? currentTrack.title : 'Audio & Video Stage'}
+            icon={<Play className="w-3 h-3 text-rose-400 fill-current ml-0.5" />}
+            isMaximized={windowMaximized}
+            onClose={() => setActiveDrawer(null)}
+            onMinimize={() => setActiveDrawer(null)}
+            onToggleMaximize={() => setWindowMaximized((prev) => !prev)}
+          >
+            <YouTubeMediaStage
+              currentTrack={currentTrack}
+              queue={mediaQueue}
+              pendingPlayerAction={pendingPlayerAction}
+              onSearchAndPlay={(q, type) => void handleSearchAndPlayYouTube(q, type)}
+              onSelectTrack={(track) => {
+                setCurrentTrack(track);
+                if (user && track.id) void updateMediaQueueStatus(track.id, 'playing');
+              }}
+              onRemoveTrack={(track) => {
+                if (user && track.id) void deleteMediaQueueItem(track.id);
+                else setLocalQueue((prev) => prev.filter((t) => t.videoId !== track.videoId));
+              }}
+            />
+          </MacWindowFrame>
+        </motion.div>
+      )}
+
+      {/* iOS-Style Floating Control Dock */}
+      <IosControlDock
+        assistantName={assistantName}
+        faceAuthLockAvailable={Boolean(faceAuthProfile && setupConfig.faceAuthEnabled)}
+        clapWakeEnabled={setupConfig.clapWakeEnabled}
+        clapArmed={clapStatus === 'listening'}
+        activeDrawer={activeDrawer}
+        onSelectDrawer={setActiveDrawer}
+        hudCollapsed={hudCollapsed}
+        onToggleCollapse={setHudCollapsed}
+        isConnected={isConnected}
+        isConnecting={isConnecting}
+        isMicMuted={isMicMuted}
+        isAssistantSpeaking={isAssistantSpeaking}
+        isResearching={isResearching}
+        isAutomating={isAutomating}
+        isGeneratingVisual={isGeneratingVisual}
+        hasActiveTrack={Boolean(currentTrack)}
+        hasActiveVisual={Boolean(currentVisual)}
+        hasActivePlugins={plugins.some((p) => p.enabled)}
+        agentConnected={(agentHealth.reachable && agentHealth.authenticated) || runtimeInfo.isTauri}
+        voiceName={voiceName}
+        wakeMode={wakeMode}
+        voices={VOICES}
+        onToggleVoiceSession={() => {
+          if (isConnected) stopVoiceSession();
+          else void startVoiceSession(false);
+        }}
+        onToggleMute={() => {
+          const next = !isMicMutedRef.current;
+          isMicMutedRef.current = next;
+          setIsMicMuted(next);
+        }}
+        onInterruptSpeech={() => playerRef.current.clear()}
+        onVoiceChange={(next) => void handleVoiceChange(next)}
+        onWakeModeChange={(mode) => void handleWakeModeChange(mode)}
+        onToggleClapWake={(enabled) => void handleToggleClapWake(enabled)}
+        onOpenSetup={() => setSetupOpen(true)}
+        onLockWithFace={() => {
+          stopVoiceSession();
+          setIsFaceUnlocked(false);
+        }}
+      />
+
+      {/* First-Launch Laptop Setup Wizard */}
+      <FirstLaunchSetupModal
+        open={setupOpen}
+        isFirstLaunch={!setupConfig.setupCompleted}
+        initialConfig={setupConfig}
+        existingFaceAuth={faceAuthProfile}
+        onClose={() => setSetupOpen(false)}
+        onComplete={async ({
+          config,
+          seedMemories,
+          faceAuthProfile: nextFace,
+          clearFaceAuth,
+        }: {
+          config: SetupConfig;
+          seedMemories: SeedMemoryDraft[];
+          faceAuthProfile?: Omit<FaceAuthProfile, 'uid' | 'createdAt' | 'updatedAt'> | null;
+          clearFaceAuth?: boolean;
+        }) => {
+          setSetupConfig(config);
+          saveLocalSetupConfig(config);
+          if (user) {
+            await saveSetupConfigToFirestore(user.uid, config);
+          }
+
+          for (const seed of seedMemories) {
+            await handleAddMemoryRecord({
+              category: seed.category,
+              content: seed.content,
+              importance: seed.importance,
+              source: 'setup',
+            });
+          }
+
+          if (clearFaceAuth) {
+            setFaceAuthProfile(null);
+            saveLocalFaceAuth(null);
+            if (user) {
+              await deleteFaceAuthProfile(user.uid).catch(() => null);
+            }
+          } else if (nextFace) {
+            setFaceAuthProfile(nextFace);
+            saveLocalFaceAuth(nextFace);
+            if (user) {
+              await saveFaceAuthProfile(user.uid, nextFace);
+            }
+          }
+
+          sessionUnlockedOnceRef.current = true;
+          setIsFaceUnlocked(true);
+          setSetupOpen(false);
+          if (isConnectedRef.current) stopVoiceSession();
+          const greeting = config.userPreferredName
+            ? `${config.assistantName} configured for ${config.userPreferredName}.`
+            : `${config.assistantName} setup saved.`;
+          showTransientCaption(config.assistantName, greeting, 4500);
+        }}
+      />
+
+      {/* Facial Recognition Lock Screen */}
+      {faceAuthProfile && !setupOpen && (
+        <FaceAuthGateModal
+          open={!isFaceUnlocked && setupConfig.faceAuthEnabled}
+          assistantName={assistantName}
+          userPreferredName={setupConfig.userPreferredName}
+          faceAuthProfile={faceAuthProfile}
+          onUnlock={() => {
+            sessionUnlockedOnceRef.current = true;
+            setIsFaceUnlocked(true);
+            showTransientCaption(
+              assistantName,
+              setupConfig.userPreferredName
+                ? `Welcome back, ${setupConfig.userPreferredName}.`
+                : 'Identity verified.',
+              4000
+            );
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <JarvisArcWorkspace />
+    </ErrorBoundary>
+  );
+}

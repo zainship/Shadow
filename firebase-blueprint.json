@@ -1,0 +1,540 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Stores user voice assistant preferences and runtime settings.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "voiceName": {
+          "type": "string",
+          "enum": ["Charon", "Fenrir", "Zephyr", "Kore", "Puck"]
+        },
+        "wakeMode": {
+          "type": "string",
+          "enum": ["push-to-talk", "continuous"]
+        },
+        "defaultBrowser": {
+          "type": "string",
+          "enum": ["chromium", "system-default", "sandbox"]
+        },
+        "assistantName": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "userPreferredName": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "setupCompleted": {
+          "type": "boolean"
+        },
+        "faceAuthEnabled": {
+          "type": "boolean"
+        },
+        "clapWakeEnabled": {
+          "type": "boolean"
+        },
+        "permissions": {
+          "type": "object",
+          "description": "Granted local laptop and feature permissions.",
+          "properties": {
+            "files": { "type": "boolean" },
+            "apps": { "type": "boolean" },
+            "terminal": { "type": "boolean" },
+            "browser": { "type": "boolean" },
+            "research": { "type": "boolean" },
+            "youtube": { "type": "boolean" },
+            "memory": { "type": "boolean" },
+            "faceAuth": { "type": "boolean" }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "voiceName", "wakeMode", "defaultBrowser", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII storage for user email and account identifiers.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 320
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "UserFaceAuth": {
+      "title": "UserFaceAuth",
+      "description": "Normalized numeric facial descriptor vector stored under private owner-only subcollection (never raw camera photos).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "descriptor": {
+          "type": "array",
+          "description": "Normalized 16..128 dimension numeric face feature vector."
+        },
+        "sampleCount": {
+          "type": "integer"
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "passcodeHash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "descriptor", "sampleCount", "threshold", "passcodeHash", "createdAt", "updatedAt"]
+    },
+    "AutomationStep": {
+      "title": "AutomationStep",
+      "description": "A single browser automation action step.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["navigate", "click", "fill", "select", "submit", "wait", "extract", "scroll"]
+        },
+        "selector": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 240
+        }
+      },
+      "required": ["action", "selector", "value", "description"]
+    },
+    "AutomationWorkflow": {
+      "title": "AutomationWorkflow",
+      "description": "Saved reusable browser automation or media voice macro.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "voiceTrigger": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "targetUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "category": {
+          "type": "string",
+          "enum": ["navigation", "form-fill", "media", "research"]
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered list of browser automation steps (1 to 15 steps)."
+        },
+        "runCount": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "name", "voiceTrigger", "targetUrl", "category", "steps", "runCount", "createdAt", "updatedAt"]
+    },
+    "CommandExecution": {
+      "title": "CommandExecution",
+      "description": "Execution log for voice commands, browser automation, and YouTube playback.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "transcript": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "intent": {
+          "type": "string",
+          "enum": ["browser_automation", "youtube_play", "youtube_control", "workflow_run", "research", "plugin_run", "conversation"]
+        },
+        "targetUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["running", "completed", "failed"]
+        },
+        "stepsCount": {
+          "type": "integer"
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["tauri-desktop", "web-sandbox"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "transcript", "intent", "targetUrl", "status", "stepsCount", "summary", "runtime", "createdAt", "updatedAt"]
+    },
+    "MediaQueueItem": {
+      "title": "MediaQueueItem",
+      "description": "YouTube video or song requested via voice command.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "videoId": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "channel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "thumbnailUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "mediaType": {
+          "type": "string",
+          "enum": ["song", "video"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "playing", "played"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "videoId", "title", "channel", "thumbnailUrl", "mediaType", "status", "createdAt", "updatedAt"]
+    },
+    "ResearchReportItem": {
+      "title": "ResearchReportItem",
+      "description": "Grounded deep research briefing with key findings, comparison points, follow-ups, and verified sources.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "query": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "depth": {
+          "type": "string",
+          "enum": ["quick", "deep"]
+        },
+        "executiveSummary": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "keyFindings": {
+          "type": "array",
+          "description": "Up to 10 concrete research findings."
+        },
+        "comparisonPoints": {
+          "type": "array",
+          "description": "Up to 8 structured comparison/metric takeaways ({label, detail})."
+        },
+        "followUpQuestions": {
+          "type": "array",
+          "description": "Up to 6 suggested follow-up research questions."
+        },
+        "sources": {
+          "type": "array",
+          "description": "Up to 12 verified web grounding sources ({title, url, domain})."
+        },
+        "groundingSearchQueries": {
+          "type": "array",
+          "description": "Up to 8 Google Search queries executed during research."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "query",
+        "depth",
+        "executiveSummary",
+        "keyFindings",
+        "comparisonPoints",
+        "followUpQuestions",
+        "sources",
+        "groundingSearchQueries",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MemoryItem": {
+      "title": "MemoryItem",
+      "description": "Persistent long-term memory facts, user preferences, routines, and project context remembered by Shadow.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["preference", "fact", "project", "routine", "person"]
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "importance": {
+          "type": "string",
+          "enum": ["low", "normal", "high"]
+        },
+        "source": {
+          "type": "string",
+          "enum": ["voice", "manual", "setup"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "category", "content", "importance", "source", "createdAt", "updatedAt"]
+    },
+    "PluginItem": {
+      "title": "PluginItem",
+      "description": "Executable voice & desktop plugin registered by the user (HTTP API/Webhook or Laptop Command).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "slug": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "category": {
+          "type": "string",
+          "enum": ["utilities", "developer", "knowledge", "automation", "webhook"]
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["http_api", "laptop_command"]
+        },
+        "toolName": {
+          "type": "string",
+          "maxLength": 56,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "parameters": {
+          "type": "array",
+          "description": "Up to 8 typed input parameters exposed to Gemini tool declarations."
+        },
+        "endpointUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "httpMethod": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        },
+        "headers": {
+          "type": "array",
+          "description": "Up to 8 HTTP header key/value pairs."
+        },
+        "bodyTemplate": {
+          "type": "string",
+          "maxLength": 1500
+        },
+        "commandTemplate": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "runCount": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "slug",
+        "name",
+        "description",
+        "category",
+        "kind",
+        "toolName",
+        "enabled",
+        "version",
+        "author",
+        "parameters",
+        "endpointUrl",
+        "httpMethod",
+        "headers",
+        "bodyTemplate",
+        "commandTemplate",
+        "runCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User preferences, identity, permissions, and assistant configuration."
+    },
+    "/users/{userId}/private/info": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated user PII document."
+    },
+    "/users/{userId}/private/faceAuth": {
+      "schema": { "$ref": "#/entities/UserFaceAuth" },
+      "description": "Isolated compact normalized facial descriptor vector for Face Auth."
+    },
+    "/workflows/{workflowId}": {
+      "schema": { "$ref": "#/entities/AutomationWorkflow" },
+      "description": "User-owned saved browser automation and voice macros."
+    },
+    "/executions/{executionId}": {
+      "schema": { "$ref": "#/entities/CommandExecution" },
+      "description": "User-owned voice command and automation execution audit logs."
+    },
+    "/mediaQueue/{itemId}": {
+      "schema": { "$ref": "#/entities/MediaQueueItem" },
+      "description": "User-owned YouTube song and video playback queue."
+    },
+    "/researchReports/{reportId}": {
+      "schema": { "$ref": "#/entities/ResearchReportItem" },
+      "description": "User-owned deep web research briefings and verified grounding sources."
+    },
+    "/memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/MemoryItem" },
+      "description": "User-owned persistent long-term memory entries."
+    },
+    "/plugins/{pluginId}": {
+      "schema": { "$ref": "#/entities/PluginItem" },
+      "description": "User-owned installed and custom voice/desktop plugins."
+    }
+  }
+}
