@@ -84,24 +84,24 @@ function parseConfigMinutes(time: string): number {
   return Number(match[1]) * 60 + Number(match[2]);
 }
 
-function sanitizeConfig(raw: unknown): MorningBriefConfig {
+function sanitizeConfig(raw: unknown, fallback: MorningBriefConfig): MorningBriefConfig {
   const r = (raw ?? {}) as Partial<MorningBriefConfig>;
   const topics = Array.isArray(r.topics)
     ? r.topics
         .map((t) => String(t).trim().slice(0, 120))
         .filter(Boolean)
         .slice(0, 4)
-    : [];
+    : fallback.topics;
   return {
     enabled: Boolean(r.enabled),
     time:
       typeof r.time === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(r.time)
         ? r.time
-        : DEFAULT_BRIEF_CONFIG.time,
-    topics: topics.length > 0 ? topics : DEFAULT_BRIEF_CONFIG.topics,
+        : fallback.time,
+    topics: topics.length > 0 ? topics : fallback.topics,
     voiceName: BRIEF_VOICES.includes(r.voiceName as (typeof BRIEF_VOICES)[number])
       ? (r.voiceName as string)
-      : DEFAULT_BRIEF_CONFIG.voiceName,
+      : fallback.voiceName,
     speakOnUnlock: r.speakOnUnlock !== false,
     lastRunDate: typeof r.lastRunDate === 'string' ? r.lastRunDate : undefined,
     lastAttemptAt: typeof r.lastAttemptAt === 'number' ? r.lastAttemptAt : undefined,
@@ -123,7 +123,7 @@ function loadStore(): BriefStore {
     const raw = fs.readFileSync(STORE_PATH, 'utf8');
     const parsed = JSON.parse(raw) as Partial<BriefStore>;
     return {
-      config: sanitizeConfig(parsed.config),
+      config: sanitizeConfig(parsed.config, DEFAULT_BRIEF_CONFIG),
       history: sanitizeHistory(parsed.history),
     };
   } catch {
@@ -144,7 +144,10 @@ export function loadBriefConfig(): MorningBriefConfig {
 
 export function saveBriefConfig(patch: unknown): MorningBriefConfig {
   const store = loadStore();
-  const merged = sanitizeConfig({ ...store.config, ...(patch as Partial<MorningBriefConfig>) });
+  const merged = sanitizeConfig(
+    { ...store.config, ...(patch as Partial<MorningBriefConfig>) },
+    store.config
+  );
   store.config = merged;
   saveStore(store);
   return merged;

@@ -5,7 +5,8 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { LiveServerMessage, Modality, ThinkingLevel } from '@google/genai';
+import { Modality, ThinkingLevel } from '@google/genai';
+import type { LiveServerMessage } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   getGeminiClient,

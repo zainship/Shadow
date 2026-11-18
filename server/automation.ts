@@ -1,4 +1,5 @@
-import { FunctionDeclaration, Type } from '@google/genai';
+import { Type } from '@google/genai';
+import type { FunctionDeclaration } from '@google/genai';
 import { getGeminiClient, getModelConfig, withGeminiRetry } from './gemini.ts';
 import type { PluginRuntimeDescriptor } from './plugins.ts';
 

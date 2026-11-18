@@ -1,4 +1,5 @@
-import { FunctionDeclaration, Type } from '@google/genai';
+import { Type } from '@google/genai';
+import type { FunctionDeclaration } from '@google/genai';
 
 export type PluginCategory = 'utilities' | 'developer' | 'knowledge' | 'automation' | 'webhook';
 export type PluginKind = 'http_api' | 'laptop_command';
