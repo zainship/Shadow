@@ -13,7 +13,8 @@
     "tauri:dev": "cargo tauri dev",
     "tauri:build": "cargo tauri build",
     "shadow:agent": "node scripts/shadow-laptop-agent.mjs",
-    "shadow:agent:bg": "node scripts/shadow-laptop-agent.mjs --daemon"
+    "shadow:agent:bg": "node scripts/shadow-laptop-agent.mjs --daemon",
+    "setup:linux": "bash scripts/setup-linux.sh"
   },
   "dependencies": {
     "@firebase/eslint-plugin-security-rules": "^0.0.2",
@@ -39,7 +40,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
