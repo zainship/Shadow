@@ -76,6 +76,8 @@ export function resolveAiRuntime(input: {
   let provider: AiProvider;
   if (hint === 'gemini' || hint === 'openrouter') {
     provider = hint;
+  } else if (byokKey.startsWith('sk-or-')) {
+    provider = 'openrouter';
   } else if (envProvider === 'openrouter' && envOpenRouterKey) {
     provider = 'openrouter';
   } else {
@@ -91,6 +93,24 @@ export function resolveAiRuntime(input: {
   const apiKey = byokKey || (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) return null;
   return { provider: 'gemini', apiKey, model: modelHint, byok: Boolean(byokKey) };
+}
+
+/**
+ * Resolve a Gemini key for speech/Live fallback even when the active text provider is OpenRouter.
+ */
+export function resolveCompanionGeminiKey(input: {
+  headers?: HeaderBag;
+  body?: { geminiKey?: unknown };
+  runtime?: AiRuntime | null;
+}): string | undefined {
+  if (input.runtime?.provider === 'gemini' && input.runtime.apiKey) {
+    return input.runtime.apiKey;
+  }
+  const companion = firstString(
+    headerValue(input.headers, 'x-shadow-gemini-key'),
+    input.body?.geminiKey
+  );
+  return companion || undefined;
 }
 
 export function describeAiRuntime(runtime: AiRuntime | null): string {

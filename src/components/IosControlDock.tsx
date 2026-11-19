@@ -334,7 +334,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 10, scale: 0.94 }}
             transition={{ type: 'spring', stiffness: 360, damping: 28 }}
-            className="mb-3 w-72 p-3.5 rounded-[22px] bg-[#0B111E]/95 backdrop-blur-xl border border-white/12 shadow-[0_24px_56px_rgba(0,0,0,0.7),inset_0_1px_0_rgba(255,255,255,0.1)] origin-bottom"
+            className="mb-3 w-72 p-3.5 rounded-[22px] bg-[#0B111E]/64 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_24px_60px_rgba(0,0,0,0.68),inset_0_1px_0_rgba(255,255,255,0.22)] origin-bottom"
           >
             {/* Wake Mode iOS Segmented Switch */}
             <div className="space-y-1.5 mb-3.5">
@@ -486,7 +486,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
             <div
               onMouseMove={(e) => mouseX.set(e.clientX)}
               onMouseLeave={() => mouseX.set(Infinity)}
-              className="px-2.5 sm:px-3.5 pt-2.5 pb-1.5 rounded-[24px] sm:rounded-[28px] bg-[#0B111E]/85 backdrop-blur-xl border border-white/12 shadow-[0_20px_50px_rgba(0,0,0,0.65),inset_0_1px_0_rgba(255,255,255,0.12)] flex items-end gap-1.5 sm:gap-2.5"
+              className="px-2.5 sm:px-3.5 pt-2.5 pb-1.5 rounded-[24px] sm:rounded-[28px] bg-[#0B111E]/58 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_22px_56px_rgba(0,0,0,0.62),inset_0_1px_0_rgba(255,255,255,0.24)] flex items-end gap-1.5 sm:gap-2.5"
             >
               {/* Primary Voice Core Squircle */}
               <DockItemButton

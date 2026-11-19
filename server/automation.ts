@@ -1,6 +1,6 @@
 import { Type } from '@google/genai';
 import type { FunctionDeclaration } from '@google/genai';
-import { getGeminiClient, getModelConfig, withGeminiRetry } from './gemini.ts';
+import { getGeminiClient, getModelConfig, resolveServerGeminiKey, withGeminiRetry } from './gemini.ts';
 import type { PluginRuntimeDescriptor } from './plugins.ts';
 
 export interface AutomationStep {
@@ -689,33 +689,37 @@ export async function synthesizeJarvisSpeech(
   apiKeyOverride?: string
 ): Promise<string | null> {
   if (!text.trim()) return null;
+  const effectiveKey = (apiKeyOverride || resolveServerGeminiKey() || '').trim();
+  if (!effectiveKey) return null;
   try {
-    const ai = getGeminiClient(apiKeyOverride);
-    const response = await withGeminiRetry(() =>
-      ai.models.generateContent({
-        model: getModelConfig().tts,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: text.slice(0, 600),
-                speechMetadata: {
-                  style: 'Calm, confident, crisp British-leaning personal AI assistant',
+    const ai = getGeminiClient(effectiveKey);
+    const response = await withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: getModelConfig().tts,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: text.slice(0, 600),
+                  speechMetadata: {
+                    style: 'Calm, confident, crisp British-leaning personal AI assistant',
+                  },
                 },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
               },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
             },
           },
-        },
-      })
+        }),
+      0
     );
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     return base64Audio || null;

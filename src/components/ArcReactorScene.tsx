@@ -41,6 +41,7 @@ interface ArcReactorSceneProps {
   mode: ReactorMode;
   commandCue?: ReactorCommandCue | null;
   stageOverlayOpen: boolean;
+  brightness?: number;
   inputLevelRef: React.MutableRefObject<number>;
   outputLevelRef: React.MutableRefObject<number>;
   onCoreClick: () => void;
@@ -90,6 +91,7 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
   mode,
   commandCue = null,
   stageOverlayOpen,
+  brightness = 1,
   inputLevelRef,
   outputLevelRef,
   onCoreClick,
@@ -98,6 +100,7 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
   const modeRef = useRef<ReactorMode>(mode);
   const cueRef = useRef<ReactorCommandCue | null>(commandCue);
   const overlayOpenRef = useRef<boolean>(stageOverlayOpen);
+  const brightnessRef = useRef<number>(THREE.MathUtils.clamp(brightness, 0.15, 2.0));
   const onCoreClickRef = useRef(onCoreClick);
   const [webglLost, setWebglLost] = useState(false);
 
@@ -112,6 +115,10 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
   useEffect(() => {
     overlayOpenRef.current = stageOverlayOpen;
   }, [stageOverlayOpen]);
+
+  useEffect(() => {
+    brightnessRef.current = THREE.MathUtils.clamp(brightness, 0.15, 2.0);
+  }, [brightness]);
 
   useEffect(() => {
     onCoreClickRef.current = onCoreClick;
@@ -178,9 +185,9 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
       composer.addPass(new RenderPass(scene, camera));
       bloomPass = new UnrealBloomPass(
         new THREE.Vector2(width, height),
-        0.55,
-        0.45,
-        0.65
+        0.36,
+        0.38,
+        0.82
       );
       composer.addPass(bloomPass);
     }
@@ -547,6 +554,7 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
     let frameId = 0;
     let disposed = false;
     let smoothedAudio = 0;
+    let smoothedBrightness = brightnessRef.current;
     let explodeFactor = 0;
     let spinSpeed = 0.28;
     let telemetryMix = 0;
@@ -603,66 +611,66 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
       let targetExplode = 0;
       let targetSpin = 0.25;
       let targetColor = _emissiveStandby;
-      let targetIntensity = 1.6;
+      let targetIntensity = 1.25;
       const isProcessingCommand = Boolean(curCue?.active);
 
       if (curMode === 'connecting') {
         targetExplode = 0.22;
         targetSpin = 1.15;
         targetColor = _emissiveListening;
-        targetIntensity = 2.4;
+        targetIntensity = 1.8;
       } else if (curMode === 'listening') {
         targetExplode = 0.14 + smoothedAudio * 0.22;
         targetSpin = 0.75 + smoothedAudio * 1.4;
         targetColor = _emissiveListening;
-        targetIntensity = 2.1 + smoothedAudio * 2.2;
+        targetIntensity = 1.65 + smoothedAudio * 1.5;
       } else if (curMode === 'speaking') {
         targetExplode = 0.26 + smoothedAudio * 0.3;
         targetSpin = 1.1 + smoothedAudio * 1.8;
         targetColor = _emissiveSpeaking;
-        targetIntensity = 2.5 + smoothedAudio * 2.8;
+        targetIntensity = 1.9 + smoothedAudio * 1.8;
       } else if (curMode === 'automating') {
         targetExplode = 0.58;
         targetSpin = 1.75;
         targetColor = _emissiveAutomating;
-        targetIntensity = 2.85;
+        targetIntensity = 2.15;
       } else if (curMode === 'researching') {
         targetExplode = 0.48;
         targetSpin = 1.45;
         targetColor = _emissiveResearching;
-        targetIntensity = 2.75;
+        targetIntensity = 2.05;
       } else if (curMode === 'media') {
         targetExplode = 0.34;
         targetSpin = 0.95;
         targetColor = _emissiveMedia;
-        targetIntensity = 2.5;
+        targetIntensity = 1.85;
       } else if (curMode === 'laptop') {
         targetExplode = 0.54;
         targetSpin = 1.9;
         targetColor = _emissiveLaptop;
-        targetIntensity = 2.85;
+        targetIntensity = 2.15;
       } else if (curMode === 'memory') {
         targetExplode = 0.3 + Math.sin(elapsed * 4.5) * 0.08;
         targetSpin = 1.25;
         targetColor = _emissiveMemory;
-        targetIntensity = 2.75;
+        targetIntensity = 2.05;
       } else if (curMode === 'plugin') {
         targetExplode = 0.44;
         targetSpin = 1.6;
         targetColor = _emissivePlugin;
-        targetIntensity = 2.7;
+        targetIntensity = 2.0;
       } else if (curMode === 'visuals') {
         targetExplode = 0.5;
         targetSpin = 1.5;
         targetColor = _emissiveVisuals;
-        targetIntensity = 2.8;
+        targetIntensity = 2.1;
       }
 
       if (curCue?.active) {
         targetColor = resolveCommandColor(curCue.kind);
         targetExplode = Math.max(targetExplode, 0.44);
         targetSpin = Math.max(targetSpin, 1.45);
-        targetIntensity = Math.max(targetIntensity, 2.75);
+        targetIntensity = Math.max(targetIntensity, 2.05);
       } else if (curCue && curCue.outcome === 'error') {
         targetColor = _emissiveError;
       }
@@ -671,6 +679,13 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
         targetExplode = Math.max(targetExplode, 0.48);
       }
 
+      smoothedBrightness = THREE.MathUtils.damp(
+        smoothedBrightness,
+        brightnessRef.current,
+        10,
+        delta
+      );
+
       explodeFactor = THREE.MathUtils.damp(explodeFactor, targetExplode, 4.5, delta);
       spinSpeed = THREE.MathUtils.damp(spinSpeed, targetSpin, 4.0, delta);
 
@@ -678,12 +693,20 @@ export const ArcReactorScene: React.FC<ArcReactorSceneProps> = ({
       plasmaMat.emissive.copy(_curColor);
       plasmaMat.emissiveIntensity = THREE.MathUtils.damp(
         plasmaMat.emissiveIntensity,
-        targetIntensity,
-        6,
+        targetIntensity * smoothedBrightness,
+        7,
         delta
       );
       coreLight.color.copy(_curColor);
-      coreLight.intensity = 2.6 + smoothedAudio * 4.5 + explodeFactor * 1.5;
+      coreLight.intensity =
+        (2.1 + smoothedAudio * 3.4 + explodeFactor * 1.2) * smoothedBrightness;
+      rimLight.intensity = 1.4 * smoothedBrightness;
+      commandTelemetryMat.emissiveIntensity = 2.3 * (0.4 + 0.6 * smoothedBrightness);
+      dustMat.opacity = 0.38 * (0.35 + 0.65 * smoothedBrightness);
+      if (bloomPass) {
+        bloomPass.strength = 0.36 * (0.3 + 0.7 * smoothedBrightness);
+      }
+      renderer.toneMappingExposure = 1.02 * (0.72 + 0.28 * smoothedBrightness);
 
       // Telemetry Orbital Arcs visibility & spin during command execution
       const showTelemetry =

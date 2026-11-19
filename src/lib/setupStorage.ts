@@ -18,8 +18,20 @@ const SETUP_STORAGE_KEY = 'shadow_setup_config_v1';
 const LOCAL_MEMORIES_KEY = 'shadow_local_memories_v1';
 const LOCAL_FACE_AUTH_KEY = 'shadow_local_face_auth_v1';
 const LOCAL_PLUGINS_KEY = 'shadow_local_plugins_v1';
+const CONFIRM_LAPTOP_ACTIONS_KEY = 'shadow_confirm_laptop_actions_v1';
 
 export const DEFAULT_PERMISSIONS: ShadowPermissions = {
+  files: false,
+  apps: false,
+  terminal: false,
+  browser: true,
+  research: true,
+  youtube: true,
+  memory: true,
+  faceAuth: false,
+};
+
+export const ALL_GRANTED_PERMISSIONS: ShadowPermissions = {
   files: true,
   apps: true,
   terminal: true,
@@ -29,6 +41,24 @@ export const DEFAULT_PERMISSIONS: ShadowPermissions = {
   memory: true,
   faceAuth: true,
 };
+
+export function loadConfirmLaptopActions(): boolean {
+  try {
+    const raw = localStorage.getItem(CONFIRM_LAPTOP_ACTIONS_KEY);
+    if (raw === null) return true;
+    return raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+export function saveConfirmLaptopActions(confirm: boolean): void {
+  try {
+    localStorage.setItem(CONFIRM_LAPTOP_ACTIONS_KEY, confirm ? 'true' : 'false');
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export const DEFAULT_SETUP_CONFIG: SetupConfig = {
   userPreferredName: '',

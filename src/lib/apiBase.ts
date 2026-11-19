@@ -25,3 +25,10 @@ export const API_ORIGIN = computeApiOrigin();
 
 // Host part for WebSocket URLs; empty means "same host as the page".
 export const API_WS_HOST = API_ORIGIN ? API_ORIGIN.replace(/^https?:\/\//, '') : '';
+
+// Full WebSocket origin ("ws://127.0.0.1:3000" in packaged Tauri, or matching page origin in browser/dev).
+export const API_WS_BASE = API_ORIGIN
+  ? API_ORIGIN.replace(/^http(s?):/, 'ws$1:')
+  : typeof window !== 'undefined'
+    ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+    : '';

@@ -79,6 +79,28 @@ export async function detectRuntimeEnvironment(): Promise<DesktopRuntimeInfo> {
   };
 }
 
+export async function ensureDesktopBackendServer(): Promise<{
+  reachable: boolean;
+  root?: string;
+  reason?: string;
+}> {
+  if (!isTauriEnvironment() || !window.__TAURI_INTERNALS__) {
+    return { reachable: false, reason: 'not-tauri' };
+  }
+  try {
+    return await window.__TAURI_INTERNALS__.invoke<{
+      reachable: boolean;
+      root?: string;
+      reason?: string;
+    }>('ensure_backend_server');
+  } catch (err) {
+    return {
+      reachable: false,
+      reason: err instanceof Error ? err.message : 'invoke-failed',
+    };
+  }
+}
+
 export async function checkLaptopAgentHealth(tokenOverride?: string): Promise<LaptopAgentHealth> {
   const token = (tokenOverride ?? getSavedAgentToken()).trim();
   try {

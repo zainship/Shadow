@@ -4,6 +4,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
   Blocks,
   Compass,
+  Cpu,
   Globe,
   Image as ImageIcon,
   Layers,
@@ -20,11 +21,16 @@ import {
   type ReactorMode,
 } from './components/ArcReactorScene';
 import { BrowserAutomationStage } from './components/BrowserAutomationStage';
+import { DynamicIsland } from './components/DynamicIsland';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FaceAuthGateModal } from './components/FaceAuthGateModal';
 import { FirstLaunchSetupModal, type SeedMemoryDraft } from './components/FirstLaunchSetupModal';
 import { IosControlDock } from './components/IosControlDock';
-import { MacWindowFrame } from './components/MacWindowShell';
+import {
+  MAC_SPRING_CONTROL,
+  MAC_SPRING_WINDOW,
+  MacWindowFrame,
+} from './components/MacWindowShell';
 import { MorningBriefStage } from './components/MorningBriefStage';
 import { PluginsStage, type PluginActivityLog } from './components/PluginsStage';
 import { ResearchStage } from './components/ResearchStage';
@@ -34,7 +40,7 @@ import {
   TauriDesktopView,
 } from './components/WorkflowsAndHistoryPanel';
 import { YouTubeMediaStage } from './components/YouTubeMediaStage';
-import { float32ToPcm16Base64, PcmAudioPlayer } from './lib/audioEngine';
+import { float32ToPcm16Base64, PcmAudioPlayer, speakWithBrowserSpeech } from './lib/audioEngine';
 import {
   DoubleClapAnalyzer,
   playWakeChime,
@@ -76,12 +82,14 @@ import {
 import {
   createLocalMemoryRecord,
   createLocalPluginRecord,
+  loadConfirmLaptopActions,
   loadLocalFaceAuth,
   loadLocalMemories,
   loadLocalPlugins,
   loadLocalSetupConfig,
   sanitizePermissions,
   sanitizePluginDraft,
+  saveConfirmLaptopActions,
   saveLocalFaceAuth,
   saveLocalMemories,
   saveLocalPlugins,
@@ -90,12 +98,14 @@ import {
 import {
   checkLaptopAgentHealth,
   detectRuntimeEnvironment,
+  ensureDesktopBackendServer,
   executeLaptopTool,
   invokeDesktopBrowserAutomation,
   type DesktopRuntimeInfo,
 } from './lib/tauriBridge';
+import { requestNativeOsPermission } from './lib/osPermissions';
 import { buildWindowLayoutInspection } from './lib/windowLayout';
-import { API_ORIGIN, API_WS_HOST } from './lib/apiBase';
+import { API_ORIGIN, API_WS_BASE } from './lib/apiBase';
 import {
   aiRequestHeaders,
   aiSocketAuthMessage,
@@ -104,6 +114,10 @@ import {
   type AiSettings,
 } from './lib/aiSettings';
 import { AiSettingsModal } from './components/AiSettingsModal';
+import {
+  LaptopPermissionModal,
+  type LaptopPermissionRequest,
+} from './components/LaptopPermissionModal';
 import type {
   AssistantMemory,
   AutomationRunState,
@@ -146,6 +160,30 @@ type DrawerTab =
 const VOICES: VoiceName[] = ['Charon', 'Fenrir', 'Zephyr', 'Kore', 'Puck'];
 const VISUALS_STORAGE_KEY = 'shadow_visuals_v1';
 const BRIEF_SEEN_STORAGE_KEY = 'shadow_brief_seen_v1';
+const REACTOR_BRIGHTNESS_STORAGE_KEY = 'shadow_reactor_brightness_v1';
+
+function loadReactorBrightness(): number {
+  try {
+    const raw = window.localStorage.getItem(REACTOR_BRIGHTNESS_STORAGE_KEY);
+    if (!raw) return 1;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return 1;
+    return Math.min(2, Math.max(0.2, parsed));
+  } catch {
+    return 1;
+  }
+}
+
+function saveReactorBrightness(value: number): void {
+  try {
+    window.localStorage.setItem(
+      REACTOR_BRIGHTNESS_STORAGE_KEY,
+      String(Math.min(2, Math.max(0.2, value)))
+    );
+  } catch {
+    // ignore storage failures
+  }
+}
 
 function todayKey(now = new Date()): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
@@ -228,11 +266,23 @@ function JarvisArcWorkspace() {
   const [aiSettings, setAiSettingsState] = useState<AiSettings>(() => loadAiSettings());
   const [aiSettingsOpen, setAiSettingsOpen] = useState<boolean>(false);
   const aiSettingsRef = useRef<AiSettings>(aiSettings);
+  const serverHasGeminiKeyRef = useRef<boolean>(false);
 
   useEffect(() => {
     aiSettingsRef.current = aiSettings;
     saveAiSettings(aiSettings);
   }, [aiSettings]);
+
+  useEffect(() => {
+    void fetch(`${API_ORIGIN}/api/ai/status`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { hasServerGeminiKey?: boolean } | null) => {
+        if (data && typeof data.hasServerGeminiKey === 'boolean') {
+          serverHasGeminiKeyRef.current = data.hasServerGeminiKey;
+        }
+      })
+      .catch(() => null);
+  }, []);
   const [faceAuthProfile, setFaceAuthProfile] = useState<FaceAuthProfile | null>(() =>
     loadLocalFaceAuth()
   );
@@ -251,7 +301,29 @@ function JarvisArcWorkspace() {
   const [activeDrawer, setActiveDrawer] = useState<DrawerTab>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [hudCollapsed, setHudCollapsed] = useState(false);
+  const [reactorBrightness, setReactorBrightness] = useState<number>(() => loadReactorBrightness());
+  const [confirmLaptopActions, setConfirmLaptopActions] = useState<boolean>(() =>
+    loadConfirmLaptopActions()
+  );
+  const confirmLaptopActionsRef = useRef<boolean>(confirmLaptopActions);
+  const sessionAllowedCategoriesRef = useRef<Set<'files' | 'apps' | 'terminal'>>(new Set());
+  const [pendingPermissionReq, setPendingPermissionReq] = useState<LaptopPermissionRequest | null>(
+    null
+  );
+  const permissionResolverRef = useRef<((decision: 'deny' | 'once' | 'always') => void) | null>(
+    null
+  );
+  const permissionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const prefersReduced = useReducedMotion();
+
+  useEffect(() => {
+    saveReactorBrightness(reactorBrightness);
+  }, [reactorBrightness]);
+
+  useEffect(() => {
+    confirmLaptopActionsRef.current = confirmLaptopActions;
+    saveConfirmLaptopActions(confirmLaptopActions);
+  }, [confirmLaptopActions]);
 
   // Voice Session State (Voice-only, no chatbox)
   const [isConnected, setIsConnected] = useState(false);
@@ -656,6 +728,100 @@ function JarvisArcWorkspace() {
       return true;
     },
     [setupConfig.permissions]
+  );
+
+  const authorizeLaptopAction = useCallback(
+    async (toolName: string, args: Record<string, unknown>): Promise<boolean> => {
+      const category: 'files' | 'apps' | 'terminal' =
+        toolName === 'manage_laptop_files'
+          ? 'files'
+          : toolName === 'control_laptop_apps'
+            ? 'apps'
+            : 'terminal';
+      const categoryGranted = isToolPermitted(toolName);
+      if (
+        categoryGranted &&
+        (!confirmLaptopActionsRef.current || sessionAllowedCategoriesRef.current.has(category))
+      ) {
+        return true;
+      }
+
+      const op = String(args.operation || args.action || '').toLowerCase();
+      const isHighRisk =
+        category === 'terminal' ||
+        (category === 'files' && ['write', 'append', 'move', 'delete'].includes(op)) ||
+        (category === 'apps' && ['quit_app', 'automate_app'].includes(op));
+
+      const title =
+        category === 'files'
+          ? `File Operation: ${String(args.operation || 'access')}`
+          : category === 'apps'
+            ? `Desktop App Action: ${String(args.action || 'control')}`
+            : Boolean(args.background)
+              ? 'Background Terminal Process'
+              : 'Terminal Shell Command';
+
+      const summary =
+        category === 'files'
+          ? String(args.path || 'Local file path')
+          : category === 'apps'
+            ? String(args.appName || args.instruction || 'Desktop workspace')
+            : String(args.cwd ? `Working directory: ${String(args.cwd)}` : 'Default user directory');
+
+      const detailText =
+        category === 'terminal'
+          ? String(args.command || '')
+          : JSON.stringify(args, null, 2);
+
+      // Serialize prompts cleanly so back-to-back tool requests never collide
+      const decisionPromise = permissionQueueRef.current.then(
+        () =>
+          new Promise<'deny' | 'once' | 'always'>((resolveQueue) => {
+            permissionResolverRef.current = (decision) => {
+              permissionResolverRef.current = null;
+              setPendingPermissionReq(null);
+              resolveQueue(decision);
+            };
+            setPendingPermissionReq({
+              id: `perm-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              toolName,
+              category,
+              title,
+              summary,
+              detailText,
+              isHighRisk,
+              wasCategoryBlocked: !categoryGranted,
+            });
+          })
+      );
+      permissionQueueRef.current = decisionPromise.then(
+        () => undefined,
+        () => undefined
+      );
+      const resultDecision = await decisionPromise;
+
+      if (resultDecision === 'always') {
+        sessionAllowedCategoriesRef.current.add(category);
+        setSetupConfig((prev) => {
+          const nextConfig: SetupConfig = {
+            ...prev,
+            permissions: {
+              ...prev.permissions,
+              [category]: true,
+            },
+          };
+          saveLocalSetupConfig(nextConfig);
+          if (user) {
+            void saveSetupConfigToFirestore(user.uid, nextConfig).catch(() => null);
+          }
+          return nextConfig;
+        });
+        return true;
+      }
+
+      return resultDecision === 'once';
+    },
+    [isToolPermitted, user]
   );
 
   const handleAddMemoryRecord = useCallback(
@@ -1237,7 +1403,13 @@ function JarvisArcWorkspace() {
         name === 'control_laptop_apps' ||
         name === 'execute_terminal_command'
       ) {
-        if (!isToolPermitted(name)) {
+        if (result.requiresClientExecution) {
+          const allowed = await authorizeLaptopAction(name, args);
+          if (!allowed) {
+            setVoiceError(`Permission denied by user for ${name}.`);
+            return;
+          }
+        } else if (!isToolPermitted(name)) {
           setVoiceError(`Permission for ${name} is disabled in Laptop Setup.`);
           return;
         }
@@ -1286,9 +1458,13 @@ function JarvisArcWorkspace() {
                 : String(result.error || 'Plugin failed.');
 
           if (result.requiresClientExecution && typeof result.renderedCommand === 'string') {
-            if (!isToolPermitted('execute_terminal_command')) {
+            const allowed = await authorizeLaptopAction('execute_terminal_command', {
+              command: result.renderedCommand,
+              background: false,
+            });
+            if (!allowed) {
               finalOk = false;
-              finalSummary = 'Terminal permission is disabled in Laptop Setup.';
+              finalSummary = 'User denied laptop terminal permission.';
             } else {
               const { result: laptopExec, runtime } = await executeLaptopTool(
                 'execute_terminal_command',
@@ -1337,6 +1513,7 @@ function JarvisArcWorkspace() {
       runtimeInfo.isTauri,
       runAutomationSequence,
       isToolPermitted,
+      authorizeLaptopAction,
       handleAddMemoryRecord,
       handleDeleteMemoryRecord,
       memories,
@@ -1347,11 +1524,18 @@ function JarvisArcWorkspace() {
   const runDirectLaptopTool = useCallback(
     async (toolName: string, args: Record<string, unknown>) => {
       const cueInfo = describeToolCue(toolName, args);
-      if (!isToolPermitted(toolName)) {
+      const isInteractiveLaptopTool =
+        toolName === 'manage_laptop_files' ||
+        toolName === 'control_laptop_apps' ||
+        toolName === 'execute_terminal_command';
+      const permitted = isInteractiveLaptopTool
+        ? await authorizeLaptopAction(toolName, args)
+        : isToolPermitted(toolName);
+      if (!permitted) {
         const deniedResult = {
           ok: false,
           permissionDenied: true,
-          error: `Permission for ${toolName} is disabled in Laptop Setup.`,
+          error: `Permission for ${toolName} was denied by user.`,
         };
         finishCommandCue(cueInfo.kind, `${cueInfo.label} (Denied)`, false);
         setVoiceError(deniedResult.error);
@@ -1415,7 +1599,15 @@ function JarvisArcWorkspace() {
       }
       return result;
     },
-    [user, runtimeInfo.runtime, isToolPermitted, describeToolCue, beginCommandCue, finishCommandCue]
+    [
+      user,
+      runtimeInfo.runtime,
+      isToolPermitted,
+      authorizeLaptopAction,
+      describeToolCue,
+      beginCommandCue,
+      finishCommandCue,
+    ]
   );
 
   const stopVoiceSession = useCallback(() => {
@@ -1461,14 +1653,25 @@ function JarvisArcWorkspace() {
       mutedClapAnalyzerRef.current.reset();
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            channelCount: 1,
-            sampleRate: 16000,
-            echoCancellation: true,
-            noiseSuppression: true,
-          },
-        });
+        const ctxPromise = fetch(`${API_ORIGIN}/api/assistant/context`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(buildSessionContextPayload()),
+        })
+          .then((r) => (r.ok ? (r.json() as Promise<{ ctxId?: string }>) : null))
+          .catch(() => null);
+
+        const [stream, ctxData] = await Promise.all([
+          navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          }),
+          ctxPromise,
+        ]);
         micStreamRef.current = stream;
 
         const inputCtx = new AudioContext({ sampleRate: 16000 });
@@ -1488,21 +1691,23 @@ function JarvisArcWorkspace() {
         isMicMutedRef.current = startMuted;
         setIsMicMuted(startMuted);
 
-        let ctxQuery = '';
-        try {
-          const ctxRes = await fetch(`${API_ORIGIN}/api/assistant/context`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildSessionContextPayload()),
-          });
-          const ctxData = (await ctxRes.json()) as { ctxId?: string };
-          if (ctxData?.ctxId) ctxQuery = `&ctx=${encodeURIComponent(ctxData.ctxId)}`;
-        } catch {
-          // continue cleanly without ctx
+        const ctxQuery = ctxData?.ctxId ? `&ctx=${encodeURIComponent(ctxData.ctxId)}` : '';
+
+        if (API_ORIGIN && !ctxData) {
+          await ensureDesktopBackendServer();
+          const healthy = await fetch(`${API_ORIGIN}/api/health`, {
+            signal: AbortSignal.timeout(2000),
+          })
+            .then((r) => r.ok)
+            .catch(() => false);
+          if (!healthy) {
+            throw new Error(
+              'Local Shadow server (127.0.0.1:3000) is not running. Run "npm start" in your Shadow folder, or check data/server.log.'
+            );
+          }
         }
 
-        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${API_WS_HOST || window.location.host}/ws/live?voice=${voiceName}${ctxQuery}`);
+        const ws = new WebSocket(`${API_WS_BASE}/ws/live?voice=${voiceName}${ctxQuery}`);
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -1624,7 +1829,11 @@ function JarvisArcWorkspace() {
         };
 
         ws.onerror = () => {
-          setVoiceError('WebSocket connection error. Verify server availability.');
+          setVoiceError(
+            API_ORIGIN
+              ? `WebSocket connection failed (${API_WS_BASE}/ws/live). Start "npm start" in your Shadow folder or check data/server.log.`
+              : 'WebSocket connection error. Verify server availability.'
+          );
           stopVoiceSession();
         };
 
@@ -1658,11 +1867,21 @@ function JarvisArcWorkspace() {
           wsRef.current.send(JSON.stringify({ type: 'audio', data: base64 }));
         };
       } catch (err) {
-        const msg =
+        const rawMsg =
           err instanceof Error
             ? err.message
             : 'Microphone permission is required for voice control.';
-        setVoiceError(msg);
+        const isMicDenied =
+          err instanceof DOMException &&
+          (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError');
+        if (isMicDenied && runtimeInfo.isTauri) {
+          void requestNativeOsPermission('microphone');
+        }
+        setVoiceError(
+          isMicDenied
+            ? 'Microphone permission denied. Allow Microphone access in your OS Privacy Settings.'
+            : rawMsg
+        );
         stopVoiceSession();
       }
     },
@@ -1677,6 +1896,7 @@ function JarvisArcWorkspace() {
       describeToolCue,
       beginCommandCue,
       finishCommandCue,
+      runtimeInfo.isTauri,
     ]
   );
 
@@ -1806,7 +2026,42 @@ function JarvisArcWorkspace() {
     };
   }, [wakeMode, startVoiceSession]);
 
-  // Triggered by stage demo buttons or macro replay (speaks back via TTS, no chatbox)
+  const handleSpeakText = useCallback(
+    async (text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      showTransientCaption(assistantNameRef.current, clean, 7000);
+      const settings = aiSettingsRef.current;
+      const canUseNeuralTts =
+        Boolean(settings.geminiKey.trim()) ||
+        (settings.provider !== 'openrouter' && serverHasGeminiKeyRef.current);
+
+      if (!canUseNeuralTts) {
+        speakWithBrowserSpeech(clean);
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_ORIGIN}/api/assistant/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(settings) },
+          body: JSON.stringify({ text: clean, voiceName }),
+        });
+        const data = (await res.json()) as { audioBase64?: string | null; error?: string };
+        if (!res.ok) throw new Error(data.error || 'TTS failed');
+        if (data.audioBase64) {
+          await playerRef.current.playWavBase64(data.audioBase64);
+        } else {
+          speakWithBrowserSpeech(clean);
+        }
+      } catch {
+        speakWithBrowserSpeech(clean);
+      }
+    },
+    [voiceName, showTransientCaption]
+  );
+
+  // Triggered by stage demo buttons or macro replay (speaks back via non-blocking TTS, no chatbox)
   const runSpokenAction = useCallback(
     async (commandText: string) => {
       const clean = commandText.trim();
@@ -1822,7 +2077,7 @@ function JarvisArcWorkspace() {
           body: JSON.stringify({
             command: clean,
             voiceName,
-            speak: true,
+            speak: false,
             context: buildSessionContextPayload(),
           }),
         });
@@ -1851,9 +2106,11 @@ function JarvisArcWorkspace() {
         }
         if (data.spokenText) {
           showTransientCaption(assistantNameRef.current, data.spokenText, 6000);
-        }
-        if (data.audioBase64) {
-          await playerRef.current.playWavBase64(data.audioBase64);
+          if (data.audioBase64) {
+            void playerRef.current.playWavBase64(data.audioBase64);
+          } else {
+            void handleSpeakText(data.spokenText);
+          }
         }
       } catch (err) {
         finishCommandCue('command', 'Command failed', false);
@@ -1864,6 +2121,7 @@ function JarvisArcWorkspace() {
       voiceName,
       showTransientCaption,
       handleToolAction,
+      handleSpeakText,
       buildSessionContextPayload,
       describeToolCue,
       beginCommandCue,
@@ -1880,7 +2138,9 @@ function JarvisArcWorkspace() {
       setActiveDrawer('youtube');
       beginCommandCue('youtube', `YouTube: ${query.slice(0, 44)}`);
       try {
-        const res = await fetch(`${API_ORIGIN}/api/youtube/search?q=${encodeURIComponent(query)}`);
+        const res = await fetch(`${API_ORIGIN}/api/youtube/search?q=${encodeURIComponent(query)}`, {
+          headers: aiRequestHeaders(aiSettingsRef.current),
+        });
         const data = (await res.json()) as { results?: YouTubeTrack[] };
         const first = data.results?.[0];
         if (!first) {
@@ -1993,28 +2253,6 @@ function JarvisArcWorkspace() {
     [isToolPermitted, beginCommandCue, finishCommandCue, runAutomationSequence]
   );
 
-  const handleSpeakText = useCallback(
-    async (text: string) => {
-      const clean = text.trim();
-      if (!clean) return;
-      showTransientCaption(assistantNameRef.current, clean, 7000);
-      try {
-        const res = await fetch(`${API_ORIGIN}/api/assistant/tts`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
-          body: JSON.stringify({ text: clean, voiceName }),
-        });
-        const data = (await res.json()) as { audioBase64?: string; error?: string };
-        if (!res.ok) throw new Error(data.error || 'TTS failed');
-        if (data.audioBase64) {
-          await playerRef.current.playWavBase64(data.audioBase64);
-        }
-      } catch (err) {
-        setVoiceError(err instanceof Error ? err.message : 'Unable to speak briefing');
-      }
-    },
-    [voiceName, showTransientCaption]
-  );
 
   const refreshBriefs = useCallback(async () => {
     try {
@@ -2126,7 +2364,7 @@ function JarvisArcWorkspace() {
         const res = await fetch(`${API_ORIGIN}/api/research/run`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
-          body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: true }),
+          body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: false }),
         });
         const data = (await res.json()) as {
           report?: ResearchReport;
@@ -2145,9 +2383,11 @@ function JarvisArcWorkspace() {
         finishCommandCue('research', `Briefing ready (${data.report.sources.length} sources)`, true);
         if (data.report.spokenSummary) {
           showTransientCaption(assistantNameRef.current, data.report.spokenSummary, 7000);
-        }
-        if (data.audioBase64) {
-          await playerRef.current.playWavBase64(data.audioBase64);
+          if (data.audioBase64) {
+            void playerRef.current.playWavBase64(data.audioBase64);
+          } else {
+            void handleSpeakText(data.report.spokenSummary);
+          }
         }
       } catch (err) {
         finishCommandCue('research', 'Research failed', false);
@@ -2160,6 +2400,7 @@ function JarvisArcWorkspace() {
       voiceName,
       showTransientCaption,
       handleToolAction,
+      handleSpeakText,
       isToolPermitted,
       beginCommandCue,
       finishCommandCue,
@@ -2191,7 +2432,7 @@ function JarvisArcWorkspace() {
             aspectRatio: input.aspectRatio,
             refineFromSvg: input.refineFromSvg,
             voiceName,
-            speak: true,
+            speak: false,
           }),
         });
         const data = (await res.json()) as {
@@ -2212,9 +2453,11 @@ function JarvisArcWorkspace() {
         finishCommandCue('visuals', `Visual ready: ${data.visual.title.slice(0, 36)}`, true);
         if (data.visual.summary) {
           showTransientCaption(assistantNameRef.current, data.visual.summary, 6500);
-        }
-        if (data.audioBase64) {
-          await playerRef.current.playWavBase64(data.audioBase64);
+          if (data.audioBase64) {
+            void playerRef.current.playWavBase64(data.audioBase64);
+          } else {
+            void handleSpeakText(data.visual.summary);
+          }
         }
       } catch (err) {
         finishCommandCue('visuals', 'Visual generation failed', false);
@@ -2229,6 +2472,7 @@ function JarvisArcWorkspace() {
       beginCommandCue,
       finishCommandCue,
       handleToolAction,
+      handleSpeakText,
     ]
   );
 
@@ -2408,6 +2652,7 @@ function JarvisArcWorkspace() {
           mode={reactorMode}
           commandCue={commandCue}
           stageOverlayOpen={activeDrawer !== null}
+          brightness={reactorBrightness}
           inputLevelRef={inputLevelRef}
           outputLevelRef={outputLevelRef}
           onCoreClick={() => {
@@ -2417,70 +2662,133 @@ function JarvisArcWorkspace() {
         />
       </div>
 
-      {/* Minimal 3-Zone Top Bar (No backdrop-blur over WebGL) */}
-      <header className="relative z-20 px-6 py-4 flex items-center justify-between gap-8 pointer-events-none">
-        <button
+      {/* Minimal Top Bar Corners (Top Center Reserved for Mac Dynamic Island) */}
+      <header className="relative z-20 px-4 sm:px-6 pt-14 pb-2 sm:py-4 flex items-center justify-between gap-8 pointer-events-none">
+        <motion.button
           type="button"
+          whileHover={prefersReduced ? undefined : { scale: 1.03 }}
+          whileTap={prefersReduced ? undefined : { scale: 0.96 }}
+          transition={MAC_SPRING_CONTROL}
           onClick={() => setActiveDrawer(null)}
-          className="pointer-events-auto font-[family-name:var(--font-display)] text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0 hover:text-sky-300 transition-colors"
+          className="pointer-events-auto font-[family-name:var(--font-display)] text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0 hover:text-sky-300 transition-colors cursor-pointer"
         >
           {assistantName}
-        </button>
+        </motion.button>
 
-        <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-400 pointer-events-auto">
-          {(
-            [
-              { id: 'brief', label: 'Brief' },
-              { id: 'research', label: 'Research' },
-              { id: 'automation', label: 'Automation' },
-              { id: 'youtube', label: 'YouTube' },
-              { id: 'visuals', label: 'Visuals' },
-              { id: 'macros', label: 'Memory' },
-              { id: 'plugins', label: 'Plugins' },
-              { id: 'tauri', label: 'Desktop' },
-            ] as const
-          ).map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() =>
-                setActiveDrawer((prev) => (prev === item.id ? null : item.id))
-              }
-              className={`pb-0.5 border-b transition-colors whitespace-nowrap shrink-0 ${
-                activeDrawer === item.id
-                  ? 'text-slate-100 border-sky-400'
-                  : 'text-slate-400 border-transparent hover:text-slate-200'
-              }`}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
+        <div className="pointer-events-auto flex items-center gap-2 shrink-0">
+          <motion.button
+            type="button"
+            whileHover={prefersReduced ? undefined : { scale: 1.03 }}
+            whileTap={prefersReduced ? undefined : { scale: 0.96 }}
+            transition={MAC_SPRING_CONTROL}
+            onClick={() => setAiSettingsOpen(true)}
+            title="Configure OpenRouter or Gemini API Key"
+            className="px-3 py-1.5 rounded-lg border border-white/16 bg-white/[0.06] backdrop-blur-2xl backdrop-saturate-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.16)] text-xs font-medium text-slate-200 hover:bg-white/[0.12] hover:border-sky-400/45 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Cpu className="w-3.5 h-3.5 text-sky-400" />
+            <span>
+              {aiSettings.provider === 'openrouter'
+                ? 'OpenRouter'
+                : aiSettings.provider === 'gemini'
+                  ? 'Gemini'
+                  : 'AI Keys'}
+            </span>
+          </motion.button>
 
-        <div className="pointer-events-auto flex items-center shrink-0">
           {!authReady ? (
             <span className="text-xs text-slate-500 whitespace-nowrap shrink-0">Connecting</span>
           ) : user ? (
-            <button
+            <motion.button
               type="button"
+              whileHover={prefersReduced ? undefined : { scale: 1.03 }}
+              whileTap={prefersReduced ? undefined : { scale: 0.96 }}
+              transition={MAC_SPRING_CONTROL}
               onClick={handleSignOut}
-              className="px-3.5 py-1.5 rounded-lg border border-slate-800 bg-[#0B0F19]/90 text-xs font-medium text-slate-200 hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              className="px-3.5 py-1.5 rounded-lg border border-white/16 bg-white/[0.06] backdrop-blur-2xl backdrop-saturate-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.16)] text-xs font-medium text-slate-200 hover:bg-white/[0.12] transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
               <LogOut className="w-3.5 h-3.5 text-slate-400" />
               <span className="max-w-[130px] truncate">{user.displayName || user.email}</span>
-            </button>
+            </motion.button>
           ) : (
-            <button
+            <motion.button
               type="button"
+              whileHover={prefersReduced ? undefined : { scale: 1.03 }}
+              whileTap={prefersReduced ? undefined : { scale: 0.96 }}
+              transition={MAC_SPRING_CONTROL}
               onClick={handleSignIn}
-              className="px-4 py-1.5 rounded-lg bg-sky-500 text-slate-950 text-xs font-semibold hover:bg-sky-400 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              className="px-4 py-1.5 rounded-lg bg-gradient-to-b from-sky-400 to-sky-500 text-slate-950 text-xs font-semibold shadow-[0_6px_18px_rgba(56,189,248,0.35),inset_0_1px_0_rgba(255,255,255,0.45)] hover:brightness-110 transition-all inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
               <LogIn className="w-3.5 h-3.5" />
               <span>Sign In</span>
-            </button>
+            </motion.button>
           )}
         </div>
       </header>
+
+      {/* Mac-Style Dynamic Island (Top Center Live Activity & Control Notch) */}
+      <DynamicIsland
+        assistantName={assistantName}
+        mode={reactorMode}
+        commandCue={commandCue}
+        statusText={statusText}
+        isConnected={isConnected}
+        isConnecting={isConnecting}
+        isMicMuted={isMicMuted}
+        isAssistantSpeaking={isAssistantSpeaking}
+        isResearching={isResearching}
+        isGeneratingVisual={isGeneratingVisual}
+        isAutomating={isAutomating}
+        briefPending={briefPending}
+        currentTrack={currentTrack}
+        activeDrawer={activeDrawer}
+        aiProviderLabel={
+          aiSettings.provider === 'openrouter'
+            ? 'OpenRouter BYOK'
+            : aiSettings.provider === 'gemini'
+              ? 'Gemini BYOK'
+              : 'Server Default'
+        }
+        hasActivePlugins={plugins.some((p) => p.enabled)}
+        agentConnected={(agentHealth.reachable && agentHealth.authenticated) || runtimeInfo.isTauri}
+        faceAuthLockAvailable={Boolean(faceAuthProfile && setupConfig.faceAuthEnabled)}
+        mediaQueue={mediaQueue}
+        currentResearch={currentResearch}
+        currentVisual={currentVisual}
+        voiceName={voiceName}
+        voices={VOICES}
+        reactorBrightness={reactorBrightness}
+        errorMessage={voiceError || authError}
+        inputLevelRef={inputLevelRef}
+        outputLevelRef={outputLevelRef}
+        onToggleVoiceSession={() => {
+          if (isConnected) stopVoiceSession();
+          else void startVoiceSession(false);
+        }}
+        onToggleMute={() => {
+          const next = !isMicMutedRef.current;
+          isMicMutedRef.current = next;
+          setIsMicMuted(next);
+        }}
+        onInterruptSpeech={() => playerRef.current.clear()}
+        onVoiceChange={(next) => void handleVoiceChange(next)}
+        onChangeReactorBrightness={setReactorBrightness}
+        onSelectDrawer={setActiveDrawer}
+        onSelectTrack={(track) => {
+          setCurrentTrack(track);
+          if (user && track.id) void updateMediaQueueStatus(track.id, 'playing');
+        }}
+        onRunCommand={(cmd) => void runSpokenAction(cmd)}
+        onOpenAiSettings={() => setAiSettingsOpen(true)}
+        onOpenSetup={() => setSetupOpen(true)}
+        onLockWithFace={() => {
+          stopVoiceSession();
+          setIsFaceUnlocked(false);
+        }}
+        onDismissError={() => {
+          setVoiceError(null);
+          setAuthError(null);
+        }}
+      />
 
       {/* Live Spoken Caption Only (No Chatbox, No Input Form) */}
       <div className="pointer-events-none absolute inset-x-0 bottom-32 z-10 flex flex-col items-center px-6 text-center">
@@ -2488,11 +2796,11 @@ function JarvisArcWorkspace() {
           {liveCaption ? (
             <motion.div
               key={liveCaption.text}
-              initial={{ opacity: 0, y: 12, scale: 0.96 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -8, scale: 0.98 }}
-              transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-              className="max-w-xl px-5 py-2.5 rounded-2xl bg-[#0B111E]/80 backdrop-blur-xl border border-white/12 shadow-[0_18px_48px_rgba(0,0,0,0.6),inset_0_1px_0_rgba(255,255,255,0.12)]"
+              initial={prefersReduced ? { opacity: 0 } : { opacity: 0, y: 14, scale: 0.94, filter: 'blur(6px)' }}
+              animate={prefersReduced ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+              exit={prefersReduced ? { opacity: 0 } : { opacity: 0, y: -8, scale: 0.96, filter: 'blur(4px)' }}
+              transition={MAC_SPRING_WINDOW}
+              className="max-w-xl px-5 py-2.5 rounded-2xl bg-[#0B1222]/58 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_20px_54px_rgba(0,0,0,0.62),inset_0_1px_0_rgba(255,255,255,0.22)]"
             >
               <p className="text-[11px] font-medium text-sky-400 mb-0.5">{liveCaption.speaker}</p>
               <p className="text-sm text-slate-100 leading-snug line-clamp-2">{liveCaption.text}</p>
@@ -2504,36 +2812,8 @@ function JarvisArcWorkspace() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -4 }}
               transition={{ duration: 0.18 }}
-              className={`inline-flex items-center gap-2 text-xs tracking-wide ${
-                commandCue
-                  ? 'px-3.5 py-1.5 rounded-full bg-[#0B111E]/95 border border-white/12 text-slate-100 shadow-md'
-                  : 'text-slate-400'
-              }`}
+              className="inline-flex items-center gap-2 text-xs tracking-wide text-slate-400"
             >
-              {commandCue && (
-                <span
-                  aria-hidden="true"
-                  className={`w-2 h-2 rounded-full shrink-0 ${
-                    commandCue.outcome === 'error'
-                      ? 'bg-rose-400'
-                      : commandCue.kind === 'research'
-                        ? 'bg-indigo-400'
-                        : commandCue.kind === 'visuals'
-                          ? 'bg-purple-400'
-                          : commandCue.kind === 'automation'
-                            ? 'bg-amber-400'
-                            : commandCue.kind === 'youtube'
-                              ? 'bg-rose-400'
-                              : commandCue.kind === 'laptop'
-                                ? 'bg-emerald-400'
-                                : commandCue.kind === 'memory'
-                                  ? 'bg-amber-300'
-                                  : commandCue.kind === 'plugin'
-                                    ? 'bg-teal-400'
-                                    : 'bg-sky-400'
-                  }`}
-                />
-              )}
               <span>{statusText}</span>
               {currentTrack && activeDrawer !== 'youtube' && (
                 <>
@@ -2546,7 +2826,12 @@ function JarvisArcWorkspace() {
         </AnimatePresence>
 
         {(voiceError || authError) && (
-          <div className="pointer-events-auto mt-3 px-4 py-2 rounded-xl bg-red-950/90 border border-red-500/40 text-xs text-red-200 flex items-center gap-3 shadow-lg">
+          <motion.div
+            initial={prefersReduced ? { opacity: 0 } : { opacity: 0, y: 8, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={MAC_SPRING_CONTROL}
+            className="pointer-events-auto mt-3 px-4 py-2 rounded-xl bg-rose-950/70 backdrop-blur-2xl border border-rose-400/35 text-xs text-rose-100 flex items-center gap-3 shadow-xl"
+          >
             <span>{voiceError || authError}</span>
             <button
               type="button"
@@ -2554,11 +2839,11 @@ function JarvisArcWorkspace() {
                 setVoiceError(null);
                 setAuthError(null);
               }}
-              className="text-red-300 underline"
+              className="text-rose-300 underline cursor-pointer"
             >
               Dismiss
             </button>
-          </div>
+          </motion.div>
         )}
       </div>
 
@@ -2583,10 +2868,10 @@ function JarvisArcWorkspace() {
                 ? { opacity: 0 }
                 : { opacity: 0, y: 74, scale: 0.84, filter: 'blur(8px)' }
             }
-            transition={{ type: 'spring', stiffness: 340, damping: 28, mass: 0.85 }}
+            transition={prefersReduced ? { duration: 0.01 } : MAC_SPRING_WINDOW}
             className={`absolute z-30 flex flex-col origin-bottom ${
               windowMaximized
-                ? 'inset-x-3 md:inset-x-4 top-14 bottom-26'
+                ? 'inset-x-3 md:inset-x-4 top-16 bottom-26'
                 : 'inset-x-4 md:inset-x-10 top-16 bottom-28 max-w-6xl mx-auto'
             }`}
           >
@@ -2824,11 +3109,11 @@ function JarvisArcWorkspace() {
                 ? { opacity: 0 }
                 : { opacity: 0, y: 74, scale: 0.84, filter: 'blur(8px)' }
           }
-          transition={{ type: 'spring', stiffness: 340, damping: 28, mass: 0.85 }}
+          transition={prefersReduced ? { duration: 0.01 } : MAC_SPRING_WINDOW}
           aria-hidden={activeDrawer !== 'youtube'}
           className={`absolute z-30 flex flex-col origin-bottom ${
             windowMaximized
-              ? 'inset-x-3 md:inset-x-4 top-14 bottom-26'
+              ? 'inset-x-3 md:inset-x-4 top-16 bottom-26'
               : 'inset-x-4 md:inset-x-10 top-16 bottom-28 max-w-6xl mx-auto'
           } ${activeDrawer === 'youtube' ? 'pointer-events-auto' : 'pointer-events-none'}`}
         >
@@ -2917,19 +3202,27 @@ function JarvisArcWorkspace() {
         open={setupOpen}
         isFirstLaunch={!setupConfig.setupCompleted}
         initialConfig={setupConfig}
+        initialAiSettings={aiSettings}
         existingFaceAuth={faceAuthProfile}
+        onSaveAiSettings={(nextAi) => setAiSettingsState(nextAi)}
+        onConfirmPolicyChange={(confirm) => setConfirmLaptopActions(confirm)}
         onClose={() => setSetupOpen(false)}
         onComplete={async ({
           config,
+          aiSettings: nextAi,
           seedMemories,
           faceAuthProfile: nextFace,
           clearFaceAuth,
         }: {
           config: SetupConfig;
+          aiSettings?: AiSettings;
           seedMemories: SeedMemoryDraft[];
           faceAuthProfile?: Omit<FaceAuthProfile, 'uid' | 'createdAt' | 'updatedAt'> | null;
           clearFaceAuth?: boolean;
         }) => {
+          if (nextAi) {
+            setAiSettingsState(nextAi);
+          }
           setSetupConfig(config);
           saveLocalSetupConfig(config);
           if (user) {
@@ -2968,6 +3261,22 @@ function JarvisArcWorkspace() {
             : `${config.assistantName} setup saved.`;
           showTransientCaption(config.assistantName, greeting, 4500);
         }}
+      />
+
+      {/* Runtime Laptop Permission Confirmation Dialog */}
+      <LaptopPermissionModal
+        request={pendingPermissionReq}
+        assistantName={assistantName}
+        runtimeLabel={
+          runtimeInfo.isTauri
+            ? `Native Desktop (${runtimeInfo.os})`
+            : agentHealth.reachable && agentHealth.authenticated
+              ? 'Local Laptop Agent'
+              : 'Desktop Bridge'
+        }
+        onDeny={() => permissionResolverRef.current?.('deny')}
+        onAllowOnce={() => permissionResolverRef.current?.('once')}
+        onAlwaysAllowCategory={() => permissionResolverRef.current?.('always')}
       />
 
       {/* BYOK AI Provider Settings */}

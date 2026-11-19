@@ -2,28 +2,48 @@ import React from 'react';
 import { motion, useReducedMotion } from 'motion/react';
 import { Maximize2, Minimize2, Minus, X } from 'lucide-react';
 
+export const MAC_SPRING_WINDOW = {
+  type: 'spring' as const,
+  stiffness: 350,
+  damping: 29,
+  mass: 0.85,
+};
+
+export const MAC_SPRING_SHEET = {
+  type: 'spring' as const,
+  stiffness: 380,
+  damping: 31,
+  mass: 0.82,
+};
+
+export const MAC_SPRING_CONTROL = {
+  type: 'spring' as const,
+  stiffness: 460,
+  damping: 34,
+};
+
 export const MAC_GLASS_TOOLBAR =
-  'px-5 py-3 border-b border-white/10 bg-white/[0.03] backdrop-blur-md flex flex-wrap items-center gap-3 shrink-0';
+  'px-5 py-3 border-b border-white/12 bg-white/[0.04] backdrop-blur-xl backdrop-saturate-150 flex flex-wrap items-center gap-3 shrink-0';
 
 export const MAC_GLASS_INPUT_WRAP =
-  'flex items-center gap-2 px-3 py-1.5 rounded-[10px] bg-black/35 border border-white/10 focus-within:border-sky-400/60 focus-within:bg-black/45 focus-within:ring-2 focus-within:ring-sky-400/15 transition-all';
+  'flex items-center gap-2 px-3 py-1.5 rounded-[10px] bg-black/30 backdrop-blur-md border border-white/12 focus-within:border-sky-400/60 focus-within:bg-black/45 focus-within:ring-2 focus-within:ring-sky-400/15 transition-all';
 
 export const MAC_GLASS_FIELD =
-  'w-full px-3 py-1.5 rounded-[10px] bg-black/35 border border-white/10 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-400/60 focus:bg-black/45 focus:ring-2 focus:ring-sky-400/15 transition-all';
+  'w-full px-3 py-1.5 rounded-[10px] bg-black/30 backdrop-blur-md border border-white/12 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-400/60 focus:bg-black/45 focus:ring-2 focus:ring-sky-400/15 transition-all';
 
 export const MAC_GLASS_BTN_PRIMARY =
-  'px-3.5 py-1.5 rounded-[10px] bg-gradient-to-b from-sky-400 to-sky-500 text-slate-950 text-xs font-semibold shadow-[0_4px_14px_rgba(56,189,248,0.32),inset_0_1px_0_rgba(255,255,255,0.45)] hover:brightness-110 active:scale-[0.97] disabled:opacity-40 transition-all inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer';
+  'px-3.5 py-1.5 rounded-[10px] bg-gradient-to-b from-sky-400 to-sky-500 text-slate-950 text-xs font-semibold shadow-[0_4px_14px_rgba(56,189,248,0.32),inset_0_1px_0_rgba(255,255,255,0.45)] hover:brightness-110 active:scale-[0.96] disabled:opacity-40 transition-all duration-150 inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer';
 
 export const MAC_GLASS_BTN_SECONDARY =
-  'px-3 py-1.5 rounded-[10px] border border-white/12 bg-white/[0.06] hover:bg-white/[0.11] hover:border-white/20 text-xs font-medium text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] active:scale-[0.97] disabled:opacity-40 transition-all inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer';
+  'px-3 py-1.5 rounded-[10px] border border-white/14 bg-white/[0.07] hover:bg-white/[0.13] hover:border-white/24 text-xs font-medium text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] active:scale-[0.96] disabled:opacity-40 transition-all duration-150 inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer';
 
-export const MAC_GLASS_SIDEBAR = 'bg-white/[0.02] backdrop-blur-md';
+export const MAC_GLASS_SIDEBAR = 'bg-white/[0.025] backdrop-blur-xl';
 
 export const MAC_GLASS_CARD =
-  'rounded-xl bg-white/[0.035] border border-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.07)]';
+  'rounded-xl bg-white/[0.045] border border-white/12 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]';
 
 export const MAC_GLASS_SUBSURFACE =
-  'rounded-xl bg-black/30 border border-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]';
+  'rounded-xl bg-black/28 border border-white/12 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]';
 
 interface MacWindowFrameProps {
   title: string;
@@ -49,45 +69,57 @@ export const MacWindowFrame: React.FC<MacWindowFrameProps> = ({
   children,
 }) => {
   return (
-    <div className="flex flex-col h-full rounded-[20px] bg-[#0B111E]/76 backdrop-blur-2xl border border-white/14 shadow-[0_32px_90px_rgba(0,0,0,0.75),inset_0_1px_0_rgba(255,255,255,0.16)] overflow-hidden">
+    <div className="relative flex flex-col h-full rounded-[22px] bg-[#0B111E]/64 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_32px_90px_rgba(0,0,0,0.72),inset_0_1px_0_rgba(255,255,255,0.22)] overflow-hidden">
+      {/* Subtle Top Specular Glass Rim */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-8 top-0 h-px bg-gradient-to-r from-transparent via-white/35 to-transparent"
+      />
+
       {/* Authentic macOS Vibrancy Title Bar */}
-      <div className="h-11 px-4 border-b border-white/10 bg-white/[0.04] backdrop-blur-xl flex items-center justify-between gap-4 shrink-0 select-none">
+      <div className="h-11 px-4 border-b border-white/12 bg-white/[0.05] backdrop-blur-2xl flex items-center justify-between gap-4 shrink-0 select-none">
         {/* Left: Interactive macOS Traffic Lights */}
         <div className="group/lights flex items-center gap-2 shrink-0">
-          <button
+          <motion.button
             type="button"
+            whileHover={{ scale: 1.12 }}
+            whileTap={{ scale: 0.88 }}
             onClick={onClose}
             aria-label={`Close ${title}`}
             title="Close (Esc)"
-            className="w-3.5 h-3.5 rounded-full bg-[#FF5F57] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.3)] flex items-center justify-center text-black/75 hover:brightness-110 active:scale-90 transition-all cursor-pointer"
+            className="w-3.5 h-3.5 rounded-full bg-[#FF5F57] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] flex items-center justify-center text-black/75 hover:brightness-110 transition-colors cursor-pointer"
           >
             <X className="w-2.5 h-2.5 opacity-0 group-hover/lights:opacity-100 transition-opacity stroke-[2.5]" />
-          </button>
+          </motion.button>
 
-          <button
+          <motion.button
             type="button"
+            whileHover={{ scale: 1.12 }}
+            whileTap={{ scale: 0.88 }}
             onClick={onMinimize || onClose}
             aria-label={`Minimize ${title}`}
             title="Minimize to Dock"
-            className="w-3.5 h-3.5 rounded-full bg-[#FEBC2E] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] flex items-center justify-center text-black/75 hover:brightness-110 active:scale-90 transition-all cursor-pointer"
+            className="w-3.5 h-3.5 rounded-full bg-[#FEBC2E] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.38)] flex items-center justify-center text-black/75 hover:brightness-110 transition-colors cursor-pointer"
           >
             <Minus className="w-2.5 h-2.5 opacity-0 group-hover/lights:opacity-100 transition-opacity stroke-[2.5]" />
-          </button>
+          </motion.button>
 
-          <button
+          <motion.button
             type="button"
+            whileHover={{ scale: 1.12 }}
+            whileTap={{ scale: 0.88 }}
             onClick={onToggleMaximize}
             disabled={!onToggleMaximize}
             aria-label={isMaximized ? `Restore ${title} size` : `Expand ${title}`}
             title={isMaximized ? 'Restore Window' : 'Expand Window'}
-            className="w-3.5 h-3.5 rounded-full bg-[#28C840] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.3)] flex items-center justify-center text-black/75 hover:brightness-110 active:scale-90 disabled:opacity-50 transition-all cursor-pointer"
+            className="w-3.5 h-3.5 rounded-full bg-[#28C840] border border-black/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] flex items-center justify-center text-black/75 hover:brightness-110 disabled:opacity-50 transition-colors cursor-pointer"
           >
             {isMaximized ? (
               <Minimize2 className="w-2 h-2 opacity-0 group-hover/lights:opacity-100 transition-opacity stroke-[2.5]" />
             ) : (
               <Maximize2 className="w-2 h-2 opacity-0 group-hover/lights:opacity-100 transition-opacity stroke-[2.5]" />
             )}
-          </button>
+          </motion.button>
         </div>
 
         {/* Center: App Window Title & Icon */}
@@ -96,7 +128,7 @@ export const MacWindowFrame: React.FC<MacWindowFrameProps> = ({
           className="flex items-center justify-center gap-2 min-w-0 flex-1"
         >
           {icon && (
-            <span className="w-5 h-5 rounded-md bg-white/[0.08] border border-white/12 flex items-center justify-center shrink-0">
+            <span className="w-5 h-5 rounded-md bg-white/[0.1] border border-white/15 flex items-center justify-center shrink-0">
               {icon}
             </span>
           )}

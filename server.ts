@@ -20,8 +20,10 @@ import {
   withGeminiRetry,
 } from './server/gemini.ts';
 import {
+  DEFAULT_OPENROUTER_MODEL,
   openRouterGenerate,
   resolveAiRuntime,
+  resolveCompanionGeminiKey,
 } from './server/ai-provider.ts';
 import type { Content, FunctionCall } from '@google/genai';
 import { searchYouTube } from './server/youtube.ts';
@@ -78,7 +80,7 @@ async function startServer() {
       res.setHeader('Vary', 'Origin');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Accept, x-shadow-provider, x-shadow-key, x-shadow-model'
+        'Content-Type, Accept, x-shadow-provider, x-shadow-key, x-shadow-model, x-shadow-gemini-key'
       );
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       if (req.method === 'OPTIONS') {
@@ -92,6 +94,57 @@ async function startServer() {
   // Health endpoint
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'shadow-desktop-server' });
+  });
+
+  // Server AI configuration status (booleans only, never returns secret values)
+  app.get('/api/ai/status', (_req, res) => {
+    res.json({
+      hasServerGeminiKey: Boolean(resolveServerGeminiKey()),
+      hasServerOpenRouterKey: Boolean((process.env.OPENROUTER_API_KEY || '').trim()),
+      defaultOpenRouterModel:
+        (process.env.OPENROUTER_MODEL || '').trim() || DEFAULT_OPENROUTER_MODEL,
+    });
+  });
+
+  // Verify a GUI-supplied OpenRouter or Gemini key live
+  app.post('/api/ai/test', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      if (!runtime) {
+        return res.status(400).json({
+          ok: false,
+          error: 'No API key provided. Enter an OpenRouter or Gemini key in Settings/Setup.',
+        });
+      }
+      if (runtime.provider === 'openrouter') {
+        const turn = await openRouterGenerate({
+          apiKey: runtime.apiKey,
+          model: runtime.model,
+          contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+          maxTokens: 12,
+        });
+        return res.json({
+          ok: true,
+          provider: 'openrouter',
+          model: runtime.model,
+          reply: turn.text.slice(0, 60) || 'OK',
+        });
+      }
+      const ai = getGeminiClient(runtime.apiKey);
+      const response = await ai.models.generateContent({
+        model: getModelConfig().fastText,
+        contents: 'Reply with OK.',
+      });
+      return res.json({
+        ok: true,
+        provider: 'gemini',
+        model: getModelConfig().fastText,
+        reply: (response.text || 'OK').trim().slice(0, 60),
+      });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'API key verification failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
   });
 
   // Downloadable / copyable standalone Shadow Laptop Agent & background service installers
@@ -160,18 +213,15 @@ async function startServer() {
       const voiceName = String(req.body?.voiceName || 'Charon');
       if (!text) return res.status(400).json({ error: 'Missing text' });
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
-      if (runtime?.provider === 'openrouter' && !resolveServerGeminiKey()) {
-        return res.status(400).json({
-          error:
-            'Speech synthesis runs on Gemini models. Add a Gemini key in AI Settings (or set GEMINI_API_KEY on the server) — OpenRouter keys cannot generate audio.',
-        });
+      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
+      if (!geminiTtsKey && !resolveServerGeminiKey()) {
+        return res.json({ audioBase64: null, mimeType: null, fallback: 'browser-speech' });
       }
-      const audioBase64 = await synthesizeJarvisSpeech(
-        text,
-        voiceName,
-        runtime?.provider === 'gemini' ? runtime.apiKey : undefined
-      );
-      return res.json({ audioBase64, mimeType: 'audio/wav' });
+      const audioBase64 = await synthesizeJarvisSpeech(text, voiceName, geminiTtsKey);
+      return res.json({
+        audioBase64,
+        mimeType: audioBase64 ? 'audio/wav' : null,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'TTS failed';
       return res.status(500).json({ error: msg });
@@ -187,20 +237,17 @@ async function startServer() {
         ? req.body.urls.map((u: unknown) => String(u || '').trim()).filter(Boolean)
         : [];
       const voiceName = String(req.body?.voiceName || 'Charon');
-      const speak = req.body?.speak !== false;
+      const speak = req.body?.speak === true;
 
       if (!query) {
         return res.status(400).json({ error: 'Missing research query' });
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
       const report = await runJarvisResearch({ query, depth, urls, runtime });
       const audioBase64 = speak
-        ? await synthesizeJarvisSpeech(
-            report.spokenSummary,
-            voiceName,
-            runtime?.provider === 'gemini' ? runtime.apiKey : undefined
-          )
+        ? await synthesizeJarvisSpeech(report.spokenSummary, voiceName, geminiTtsKey)
         : null;
       return res.json({
         report,
@@ -268,6 +315,7 @@ async function startServer() {
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
 
       // Visuals run on either provider: Gemini native schema or OpenAI-compatible
       // json_schema (BYOK OpenRouter). Speech narration stays Gemini-only.
@@ -285,11 +333,7 @@ async function startServer() {
 
       const visual = await generateVisualAsset(visualOptions);
       const audioBase64 = speak
-        ? await synthesizeJarvisSpeech(
-            visual.summary,
-            voiceName,
-            runtime?.provider === 'gemini' ? runtime.apiKey : undefined
-          )
+        ? await synthesizeJarvisSpeech(visual.summary, voiceName, geminiTtsKey)
         : null;
       return res.json({
         ok: true,
@@ -515,12 +559,17 @@ async function startServer() {
             });
             result = { ok: true, report };
           } else if (call.name === 'generate_visual') {
-            const visual = await generateVisualAsset({
+            const visualOpts: Parameters<typeof generateVisualAsset>[0] = {
               prompt: String(args.prompt || command),
               style: normalizeVisualStyle(args.style),
               aspectRatio: normalizeAspectRatio(args.aspectRatio),
-              apiKeyOverride: runtime?.provider === 'gemini' ? runtime.apiKey : undefined,
-            });
+            };
+            if (runtime?.provider === 'openrouter') {
+              visualOpts.openRouter = { apiKey: runtime.apiKey, model: runtime.model };
+            } else {
+              visualOpts.apiKeyOverride = runtime?.apiKey;
+            }
+            const visual = await generateVisualAsset(visualOpts);
             result = { ok: true, visual };
           } else if (
             call.name === 'manage_laptop_files' ||
@@ -608,8 +657,14 @@ async function startServer() {
           spokenText = 'Ready.';
         }
 
-        // Voice readout still rides on Gemini TTS (server key) when available.
-        const audioBase64 = speak ? await synthesizeJarvisSpeech(spokenText, voiceName) : null;
+        const companionGeminiKey = resolveCompanionGeminiKey({
+          headers: req.headers,
+          body: req.body,
+          runtime,
+        });
+        const audioBase64 = speak
+          ? await synthesizeJarvisSpeech(spokenText, voiceName, companionGeminiKey)
+          : null;
         return res.json({
           spokenText,
           actions,
@@ -639,7 +694,7 @@ async function startServer() {
           retries
         );
 
-      const runFastTurn = (contents: Content[], retries = 1) =>
+      const runFastTurn = (contents: Content[], retries = 0) =>
         withGeminiRetry(
           () =>
             ai.models.generateContent({
@@ -825,22 +880,25 @@ async function startServer() {
     authTimer = setTimeout(() => {
       authResolved = true;
       void startLiveSession(null);
-    }, 2500);
+    }, 600);
 
     const startLiveSession = async (
-      auth: { provider?: string; apiKey?: string; model?: string } | null
+      auth: { provider?: string; apiKey?: string; model?: string; geminiKey?: string } | null
     ): Promise<void> => {
     try {
-      if ((auth?.provider || '').toLowerCase() === 'openrouter') {
+      const liveGeminiKey =
+        (auth?.geminiKey || '').trim() ||
+        ((auth?.provider || '').toLowerCase() !== 'openrouter' ? (auth?.apiKey || '').trim() : '');
+      if ((auth?.provider || '').toLowerCase() === 'openrouter' && !liveGeminiKey && !resolveServerGeminiKey()) {
         safeSend({
           type: 'error',
           message:
-            "OpenRouter keys can't drive the Live voice engine (that protocol is Gemini-only). Switch AI provider to Gemini in AI Settings for voice sessions — OpenRouter still powers text commands and research.",
+            "Live voice audio requires a Gemini API key (OpenRouter powers text commands, research, and visuals). Add a Gemini key in AI Settings to use Live Voice alongside OpenRouter.",
         });
         clientWs.close();
         return;
       }
-      const ai = getGeminiLiveClient((auth?.apiKey || '').trim() || undefined);
+      const ai = getGeminiLiveClient(liveGeminiKey || undefined);
       const activePlugins = normalizePluginDescriptors(sessionContext?.plugins, 30).filter(
         (p) => p.enabled
       );
@@ -925,7 +983,7 @@ async function startServer() {
                     const query = String(args.query || '');
                     const mediaType = args.mediaType === 'song' ? 'song' : 'video';
                     const results = await searchYouTube(query, {
-                      geminiKeyOverride: (auth?.apiKey || '').trim() || undefined,
+                      geminiKeyOverride: liveGeminiKey || undefined,
                     });
                     if (results.length > 0) {
                       result = {
@@ -1000,6 +1058,9 @@ async function startServer() {
                       query: String(args.query || ''),
                       depth: args.depth === 'quick' ? 'quick' : 'deep',
                       urls: Array.isArray(args.urls) ? args.urls.map((u) => String(u)) : [],
+                      runtime: liveGeminiKey
+                        ? { provider: 'gemini', apiKey: liveGeminiKey, model: '', byok: true }
+                        : undefined,
                     });
                     result = { ok: true, report };
                   } else if (call.name === 'generate_visual') {
@@ -1007,6 +1068,7 @@ async function startServer() {
                       prompt: String(args.prompt || ''),
                       style: normalizeVisualStyle(args.style),
                       aspectRatio: normalizeAspectRatio(args.aspectRatio),
+                      apiKeyOverride: liveGeminiKey || undefined,
                     });
                     result = { ok: true, visual };
                   } else if (

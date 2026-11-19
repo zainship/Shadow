@@ -1,7 +1,21 @@
 import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Check, Cpu, Eye, EyeOff, Info, KeyRound, Mic, Server, X } from 'lucide-react';
 import {
+  Check,
+  Cpu,
+  Eye,
+  EyeOff,
+  Info,
+  KeyRound,
+  Loader2,
+  Mic,
+  Server,
+  Sparkles,
+  X,
+} from 'lucide-react';
+import { API_ORIGIN } from '../lib/apiBase';
+import {
+  aiRequestHeaders,
   OPENROUTER_MODEL_SUGGESTIONS,
   type AiProviderChoice,
   type AiSettings,
@@ -35,7 +49,7 @@ const PROVIDER_OPTIONS: Array<{
   {
     id: 'openrouter',
     label: 'OpenRouter (BYOK)',
-    description: 'Use an OpenRouter key for the assistant brain: commands, research, visuals & media.',
+    description: 'Route commands, research, visuals & media to any model on OpenRouter.',
     icon: <KeyRound className="w-4 h-4 text-violet-400" />,
   },
 ];
@@ -45,11 +59,24 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
   const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [showOrKey, setShowOrKey] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [serverStatus, setServerStatus] = useState<{
+    hasServerGeminiKey?: boolean;
+    hasServerOpenRouterKey?: boolean;
+  } | null>(null);
 
   useEffect(() => {
     if (open) {
       setDraft(settings);
       setSavedFlash(false);
+      setTestResult(null);
+      void fetch(`${API_ORIGIN}/api/ai/status`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data) setServerStatus(data);
+        })
+        .catch(() => null);
     }
   }, [open, settings]);
 
@@ -63,17 +90,58 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
 
   const pickProvider = (provider: AiProviderChoice) => {
     setDraft((prev) => ({ ...prev, provider }));
+    setTestResult(null);
   };
 
+  const normalizedDraft = (): AiSettings => ({
+    ...draft,
+    geminiKey: draft.geminiKey.trim(),
+    openrouterKey: draft.openrouterKey.trim(),
+    openrouterModel: draft.openrouterModel.trim(),
+  });
+
   const handleSave = () => {
-    onSave({
-      ...draft,
-      geminiKey: draft.geminiKey.trim(),
-      openrouterKey: draft.openrouterKey.trim(),
-      openrouterModel: draft.openrouterModel.trim(),
-    });
+    onSave(normalizedDraft());
     setSavedFlash(true);
     window.setTimeout(() => setSavedFlash(false), 1600);
+  };
+
+  const handleTestKey = async () => {
+    if (testing) return;
+    setTesting(true);
+    setTestResult(null);
+    const clean = normalizedDraft();
+    try {
+      const res = await fetch(`${API_ORIGIN}/api/ai/test`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...aiRequestHeaders(clean),
+        },
+        body: JSON.stringify({}),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        provider?: string;
+        model?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.ok) {
+        setTestResult({ ok: false, text: data.error || 'Verification failed' });
+      } else {
+        setTestResult({
+          ok: true,
+          text: `Connected (${data.provider}${data.model ? ` · ${data.model}` : ''})`,
+        });
+      }
+    } catch (err) {
+      setTestResult({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Unable to reach Shadow server',
+      });
+    } finally {
+      setTesting(false);
+    }
   };
 
   const activeProviderRequiresKey =
@@ -84,24 +152,24 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/62 backdrop-blur-xl p-4"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           onClick={onClose}
         >
           <motion.div
-            className="w-full max-w-lg max-h-[88vh] overflow-y-auto rounded-2xl border border-white/10 bg-[#0b1120]/95 p-5 shadow-2xl"
-            initial={{ opacity: 0, scale: 0.96, y: 14 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.96, y: 14 }}
-            transition={{ type: 'spring', stiffness: 320, damping: 28 }}
+            className="w-full max-w-lg max-h-[88vh] overflow-y-auto rounded-[24px] border border-white/18 bg-[#0B1222]/72 backdrop-blur-3xl backdrop-saturate-150 p-5 shadow-[0_32px_90px_rgba(0,0,0,0.75),inset_0_1px_0_rgba(255,255,255,0.22)]"
+            initial={{ opacity: 0, scale: 0.94, y: 18, filter: 'blur(8px)' }}
+            animate={{ opacity: 1, scale: 1, y: 0, filter: 'blur(0px)' }}
+            exit={{ opacity: 0, scale: 0.95, y: 14, filter: 'blur(6px)' }}
+            transition={{ type: 'spring', stiffness: 370, damping: 30, mass: 0.85 }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <Cpu className="w-5 h-5 text-sky-400" />
-                <h2 className="text-base font-semibold text-white">AI Provider (BYOK)</h2>
+                <h2 className="text-base font-semibold text-white">AI Provider &amp; API Keys (BYOK)</h2>
               </div>
               <button
                 onClick={onClose}
@@ -113,9 +181,14 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
             </div>
 
             <p className="text-xs text-slate-400 leading-relaxed mb-4">
-              Keys are stored only in this browser and sent directly to your Shadow server per
-              request — they are never written to Firestore or shared with third parties.
+              Add your OpenRouter or Gemini key right here in the GUI — no <code className="text-slate-300">.env</code> editing required. Keys stay in local storage on this device and are sent only to your Shadow backend per request.
             </p>
+
+            {serverStatus && !serverStatus.hasServerGeminiKey && !serverStatus.hasServerOpenRouterKey && draft.provider === 'server' && (
+              <div className="mb-3 rounded-lg border border-amber-500/35 bg-amber-950/40 px-3 py-2 text-[11px] text-amber-200">
+                No server <code className="font-mono">.env</code> key detected locally. Select <strong>OpenRouter (BYOK)</strong> or <strong>Gemini (BYOK)</strong> below to enter your key in the GUI.
+              </div>
+            )}
 
             <div className="space-y-2 mb-4">
               {PROVIDER_OPTIONS.map((option) => {
@@ -123,6 +196,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                 return (
                   <button
                     key={option.id}
+                    type="button"
                     onClick={() => pickProvider(option.id)}
                     className={`w-full flex items-start gap-3 rounded-xl border px-3.5 py-3 text-left transition ${
                       active
@@ -161,6 +235,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                     className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 pr-10 text-sm text-slate-100 placeholder-slate-500 focus:border-sky-400/60 focus:outline-none font-mono"
                   />
                   <button
+                    type="button"
                     onClick={() => setShowGeminiKey((v) => !v)}
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
                     aria-label="Toggle key visibility"
@@ -191,6 +266,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                       className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 pr-10 text-sm text-slate-100 placeholder-slate-500 focus:border-violet-400/60 focus:outline-none font-mono"
                     />
                     <button
+                      type="button"
                       onClick={() => setShowOrKey((v) => !v)}
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
                       aria-label="Toggle key visibility"
@@ -204,7 +280,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                    Model (optional)
+                    OpenRouter Model (optional)
                   </label>
                   <input
                     type="text"
@@ -222,32 +298,68 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                     ))}
                   </datalist>
                   <p className="text-[11px] text-slate-500 mt-1.5">
-                    Any model id from openrouter.ai/models works. Leave blank for the server
-                    default (OPENROUTER_MODEL).
+                    Any model id from openrouter.ai/models works. Blank uses openai/gpt-4o-mini.
                   </p>
                 </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                    Optional Gemini Key for Live Voice &amp; Neural TTS
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showGeminiKey ? 'text' : 'password'}
+                      value={draft.geminiKey}
+                      onChange={(e) => setDraft((p) => ({ ...p, geminiKey: e.target.value }))}
+                      placeholder="AIza... (optional — instant browser speech runs without it)"
+                      spellCheck={false}
+                      autoComplete="off"
+                      className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 pr-10 text-xs text-slate-100 placeholder-slate-500 focus:border-sky-400/60 focus:outline-none font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowGeminiKey((v) => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                      aria-label="Toggle Gemini key visibility"
+                    >
+                      {showGeminiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {testResult && (
+              <div
+                className={`mb-4 rounded-lg border px-3 py-2 text-xs ${
+                  testResult.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/40 text-emerald-200'
+                    : 'border-rose-500/40 bg-rose-950/40 text-rose-200'
+                }`}
+              >
+                {testResult.text}
               </div>
             )}
 
             <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 mb-4 flex gap-2">
               <Info className="w-3.5 h-3.5 text-sky-400 shrink-0 mt-0.5" />
               <p className="text-[11px] text-slate-400 leading-relaxed">
-                Text commands, research, visual synthesis and media lookups run on your chosen
-                provider. Only voice sessions &amp; speech synthesis require Gemini (the Live voice
-                protocol and audio generation are Gemini-only).
-                {draft.provider === 'openrouter' && (
+                Commands, web research, visual generation, morning briefs, and media lookups route directly to your chosen provider. When OpenRouter is selected without a Gemini key, spoken replies automatically use built-in browser speech.
+                {draft.provider === 'openrouter' && !draft.geminiKey.trim() && (
                   <span className="flex items-center gap-1 mt-1 text-slate-300">
-                    <Mic className="w-3 h-3" /> Voice won&apos;t work while OpenRouter is selected.
+                    <Mic className="w-3 h-3" /> Real-time Live Audio sessions use Gemini (add a Gemini key above to enable both).
                   </span>
                 )}
               </p>
             </div>
 
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <button
+                type="button"
                 onClick={() => {
                   onSave({ ...draft, provider: 'server', geminiKey: '', openrouterKey: '', openrouterModel: '' });
                   setSavedFlash(true);
+                  setTestResult(null);
                   window.setTimeout(() => setSavedFlash(false), 1600);
                 }}
                 className="text-xs text-slate-400 hover:text-slate-200 transition"
@@ -261,6 +373,16 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                   </span>
                 )}
                 <button
+                  type="button"
+                  onClick={() => void handleTestKey()}
+                  disabled={testing || activeProviderRequiresKey}
+                  className="rounded-lg border border-white/15 bg-white/5 hover:bg-white/10 px-3 py-2 text-xs font-medium text-slate-200 disabled:opacity-40 inline-flex items-center gap-1.5 transition"
+                >
+                  {testing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-sky-400" />}
+                  <span>Verify Key</span>
+                </button>
+                <button
+                  type="button"
                   onClick={handleSave}
                   disabled={activeProviderRequiresKey}
                   className={`rounded-lg px-4 py-2 text-sm font-medium transition ${

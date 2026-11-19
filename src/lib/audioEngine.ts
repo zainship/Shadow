@@ -139,3 +139,19 @@ export class PcmAudioPlayer {
     this.analyser = null;
   }
 }
+
+export function speakWithBrowserSpeech(text: string): boolean {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
+  const clean = text.trim();
+  if (!clean) return false;
+  try {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(clean.slice(0, 600));
+    utterance.rate = 1.05;
+    utterance.pitch = 0.96;
+    window.speechSynthesis.speak(utterance);
+    return true;
+  } catch {
+    return false;
+  }
+}

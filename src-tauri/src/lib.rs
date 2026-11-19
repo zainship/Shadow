@@ -110,14 +110,20 @@ fn wait_for_server(deadline: Duration, mut child: Option<&mut std::process::Chil
 }
 
 /// Locate the Shadow repository checkout that powers this desktop shell.
-/// Order: explicit SHADOW_PROJECT_ROOT override, the working directory,
-/// directories above the executable (repo / src-tauri / target/release),
-/// then ~/Shadow.
+/// Order: explicit SHADOW_PROJECT_ROOT override, compile-time repo root
+/// (CARGO_MANIFEST_DIR parent), the working directory, directories above
+/// the executable, common Windows/Unix clone paths (D:\Shadow, C:\Shadow,
+/// ~/Shadow, ~/Desktop/Shadow, ~/Documents/Shadow, ~/Projects/Shadow).
 fn find_project_root() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(root) = std::env::var("SHADOW_PROJECT_ROOT") {
         if !root.trim().is_empty() {
             candidates.push(PathBuf::from(root.trim()));
+        }
+    }
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        if let Some(repo_root) = Path::new(manifest_dir).parent() {
+            candidates.push(repo_root.to_path_buf());
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -135,13 +141,53 @@ fn find_project_root() -> Option<PathBuf> {
             }
         }
     }
-    candidates.push(dirs_home().join("Shadow"));
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(PathBuf::from(r"D:\Shadow"));
+        candidates.push(PathBuf::from(r"C:\Shadow"));
+    }
+    let home = dirs_home();
+    candidates.push(home.join("Shadow"));
+    candidates.push(home.join("Desktop").join("Shadow"));
+    candidates.push(home.join("Documents").join("Shadow"));
+    candidates.push(home.join("Projects").join("Shadow"));
     candidates.into_iter().find(|d| {
         d.join("server.ts").is_file() && d.join("package.json").is_file()
     })
 }
 
+fn resolve_node_binary() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let mut win_candidates = vec![
+            PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
+        ];
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            win_candidates.push(PathBuf::from(local_app).join("Programs").join("nodejs").join("node.exe"));
+        }
+        for c in win_candidates {
+            if c.is_file() {
+                return c;
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for c in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+            let p = PathBuf::from(c);
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from("node")
+}
+
 fn spawn_server_process(root: &Path, use_tsx: bool) -> Option<std::process::Child> {
+    if use_tsx && !root.join("node_modules").join("tsx").join("dist").join("cli.mjs").is_file() {
+        return None;
+    }
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).ok()?;
     let out = fs::OpenOptions::new()
@@ -151,13 +197,18 @@ fn spawn_server_process(root: &Path, use_tsx: bool) -> Option<std::process::Chil
         .ok()?;
     let err = out.try_clone().ok()?;
 
-    let mut cmd = Command::new("node");
+    let node_bin = resolve_node_binary();
+    let mut cmd = Command::new(&node_bin);
     if use_tsx {
         // Older Node (< 23.6) cannot run TypeScript directly; the repo's
         // devDependency tsx can, without needing npx/network.
         cmd.arg(root.join("node_modules").join("tsx").join("dist").join("cli.mjs"));
     }
     cmd.arg("server.ts");
+    if root.join("dist").join("index.html").is_file() {
+        // Fast static mode (<300ms startup) instead of booting Vite dev middleware.
+        cmd.env("NODE_ENV", "production");
+    }
     cmd.current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
@@ -178,25 +229,202 @@ fn spawn_server_process(root: &Path, use_tsx: bool) -> Option<std::process::Chil
 /// nothing is listening on 127.0.0.1:3000, start it before the window opens.
 /// The spawned server is left running when the app closes so the Morning
 /// Brief scheduler keeps ticking; logs land in <repo>/data/server.log.
-fn ensure_local_server() {
-    if server_port_reachable(Duration::from_millis(600)) {
-        return;
+fn ensure_local_server() -> (bool, Option<String>, &'static str) {
+    if server_port_reachable(Duration::from_millis(450)) {
+        return (true, None, "already-running");
     }
     let Some(root) = find_project_root() else {
-        return;
+        return (false, None, "project-root-not-found");
     };
+    let root_str = root.to_string_lossy().to_string();
 
     // Node >= 23.6 strips TypeScript natively (same as `npm start`).
     if let Some(mut child) = spawn_server_process(&root, false) {
-        if wait_for_server(Duration::from_secs(8), Some(&mut child)) {
-            return;
+        if wait_for_server(Duration::from_secs(6), Some(&mut child)) {
+            return (true, Some(root_str), "started-node");
         }
         let _ = child.kill();
-        // Older Node: fall back to the bundled tsx runner.
-        if let Some(mut tsx_child) = spawn_server_process(&root, true) {
-            let _ = wait_for_server(Duration::from_secs(15), Some(&mut tsx_child));
+    }
+    // Older Node or missing native TS flag: fall back to bundled tsx runner.
+    if let Some(mut tsx_child) = spawn_server_process(&root, true) {
+        if wait_for_server(Duration::from_secs(15), Some(&mut tsx_child)) {
+            return (true, Some(root_str), "started-tsx");
+        }
+        let _ = tsx_child.kill();
+        return (false, Some(root_str), "server-exited-check-data-server-log");
+    }
+    (false, Some(root_str), "node-or-tsx-spawn-failed")
+}
+
+#[tauri::command]
+fn ensure_backend_server() -> serde_json::Value {
+    let (reachable, root, reason) = ensure_local_server();
+    serde_json::json!({
+        "reachable": reachable,
+        "root": root,
+        "reason": reason
+    })
+}
+
+#[tauri::command]
+fn get_os_permission_status() -> serde_json::Value {
+    let home = dirs_home();
+    let files_access_granted = fs::read_dir(&home).is_ok();
+
+    #[cfg(target_os = "macos")]
+    let automation_granted = Command::new("osascript")
+        .args(["-e", "tell application \"System Events\" to get name of first process"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(target_os = "windows")]
+    let automation_granted = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "$true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(target_os = "linux")]
+    let automation_granted = Command::new("sh")
+        .args(["-c", "command -v xdotool >/dev/null 2>&1 || command -v xdg-open >/dev/null 2>&1"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    #[cfg(target_os = "windows")]
+    let shell_available = true;
+    #[cfg(not(target_os = "windows"))]
+    let shell_available = Path::new("/bin/sh").exists();
+
+    serde_json::json!({
+        "platform": std::env::consts::OS,
+        "homeDir": home.to_string_lossy(),
+        "filesAccessGranted": files_access_granted,
+        "automationGranted": automation_granted,
+        "shellAvailable": shell_available
+    })
+}
+
+#[tauri::command]
+fn request_os_permission(kind: String) -> serde_json::Value {
+    let normalized = kind.trim().to_lowercase();
+
+    if normalized == "automation" || normalized == "accessibility" {
+        #[cfg(target_os = "macos")]
+        {
+            let probe = Command::new("osascript")
+                .args(["-e", "tell application \"System Events\" to get name of first process"])
+                .output();
+            let granted = probe.as_ref().map(|o| o.status.success()).unwrap_or(false);
+            if !granted {
+                let _ = Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+                    .status();
+            }
+            return serde_json::json!({
+                "ok": true,
+                "granted": granted,
+                "message": if granted {
+                    "macOS Automation permission granted."
+                } else {
+                    "Opened macOS Privacy & Security -> Automation."
+                }
+            });
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let ok = Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Get-Location | Out-Null"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            return serde_json::json!({
+                "ok": ok,
+                "granted": ok,
+                "message": if ok {
+                    "Windows desktop & PowerShell automation verified."
+                } else {
+                    "PowerShell execution is restricted on this Windows account."
+                }
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let ok = Command::new("sh")
+                .args(["-c", "command -v xdg-open >/dev/null 2>&1"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            return serde_json::json!({
+                "ok": true,
+                "granted": ok,
+                "message": if ok {
+                    "Linux desktop automation tools verified."
+                } else {
+                    "Install xdotool / xdg-utils for full Linux window automation."
+                }
+            });
         }
     }
+
+    if normalized == "files" {
+        let home_ok = fs::read_dir(dirs_home()).is_ok();
+        #[cfg(target_os = "macos")]
+        if !home_ok {
+            let _ = Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                .status();
+        }
+        #[cfg(target_os = "windows")]
+        if !home_ok {
+            let _ = Command::new("cmd")
+                .args(["/C", "start", "", "ms-settings:privacy-broadfilesystemaccess"])
+                .status();
+        }
+        return serde_json::json!({
+            "ok": true,
+            "granted": home_ok,
+            "message": if home_ok {
+                "Local home folder access verified."
+            } else {
+                "Opened OS File System Privacy settings."
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    let target_uri = match normalized.as_str() {
+        "microphone" => Some("ms-settings:privacy-microphone"),
+        "camera" => Some("ms-settings:privacy-webcam"),
+        "notifications" => Some("ms-settings:notifications"),
+        _ => None,
+    };
+    #[cfg(target_os = "macos")]
+    let target_uri = match normalized.as_str() {
+        "microphone" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"),
+        "camera" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Camera"),
+        "notifications" => Some("x-apple.systempreferences:com.apple.preference.notifications"),
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    let target_uri: Option<&str> = None;
+
+    if let Some(uri) = target_uri {
+        #[cfg(target_os = "windows")]
+        let _ = Command::new("cmd").args(["/C", "start", "", uri]).status();
+        #[cfg(target_os = "macos")]
+        let _ = Command::new("open").arg(uri).status();
+        return serde_json::json!({
+            "ok": true,
+            "granted": false,
+            "message": format!("Opened OS {} privacy settings.", normalized)
+        });
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "granted": false,
+        "message": format!("Requested {} permission in Shadow.", normalized)
+    })
 }
 
 #[tauri::command]
@@ -732,10 +960,13 @@ fn launch_background_agent() -> Result<serde_json::Value, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    ensure_local_server();
+    let _ = ensure_local_server();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_runtime_environment,
+            ensure_backend_server,
+            get_os_permission_status,
+            request_os_permission,
             open_external_url,
             execute_browser_automation,
             manage_local_files,

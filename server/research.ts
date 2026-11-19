@@ -58,9 +58,10 @@ function isInspectableSource(url: string): boolean {
 }
 
 async function generateResilient(
-  params: Parameters<ReturnType<typeof getGeminiClient>['models']['generateContent']>[0]
+  params: Parameters<ReturnType<typeof getGeminiClient>['models']['generateContent']>[0],
+  apiKeyOverride?: string
 ) {
-  const ai = getGeminiClient();
+  const ai = getGeminiClient(apiKeyOverride);
   if (Date.now() < preferLiteResearchUntil) {
     const liteConfig = params.config ? { ...params.config } : undefined;
     if (liteConfig && 'thinkingConfig' in liteConfig) {
@@ -205,6 +206,8 @@ export async function runJarvisResearch(input: {
   const allTargetUrls = Array.from(new Set([...cleanUrls, ...inlineUrls])).slice(0, 10);
 
   const useOpenRouter = input.runtime?.provider === 'openrouter' && Boolean(input.runtime.apiKey);
+  const geminiKeyOverride =
+    input.runtime?.provider === 'gemini' && input.runtime.apiKey ? input.runtime.apiKey : undefined;
 
   // Phase 1: Grounded discovery (Gemini googleSearch / OpenRouter web plugin)
   let groundedNotes = '';
@@ -257,16 +260,19 @@ export async function runJarvisResearch(input: {
       researchTools.push({ urlContext: {} });
     }
 
-    const discoveryResponse = await generateResilient({
-      model: getModelConfig().research,
-      contents: discoveryPrompt,
-      config: {
-        tools: researchTools,
-        thinkingConfig: {
-          thinkingLevel: depth === 'deep' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
+    const discoveryResponse = await generateResilient(
+      {
+        model: depth === 'quick' ? getModelConfig().fastText : getModelConfig().research,
+        contents: discoveryPrompt,
+        config: {
+          tools: researchTools,
+          ...(depth === 'deep'
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
         },
       },
-    });
+      geminiKeyOverride
+    );
 
     groundedNotes = (discoveryResponse.text || '').trim();
     const metadata = discoveryResponse.candidates?.[0]?.groundingMetadata;
@@ -334,15 +340,17 @@ export async function runJarvisResearch(input: {
       });
       parsed = JSON.parse(synthesis.text || '{}') as Partial<SynthesisDraft>;
     } else {
-      const synthResponse = await generateResilient({
-        model: getModelConfig().research,
-        contents: synthesisPrompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: SYNTHESIS_SCHEMA,
+      const synthResponse = await generateResilient(
+        {
+          model: getModelConfig().fastText,
+          contents: synthesisPrompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: SYNTHESIS_SCHEMA,
+          },
         },
-      });
+        geminiKeyOverride
+      );
       parsed = JSON.parse(synthResponse.text || '{}') as Partial<SynthesisDraft>;
     }
   } catch {

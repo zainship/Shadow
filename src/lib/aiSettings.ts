@@ -82,7 +82,13 @@ export function aiRequestHeaders(settings: AiSettings): Record<string, string> {
     if (settings.openrouterModel.trim()) {
       headers['x-shadow-model'] = settings.openrouterModel.trim();
     }
+    if (settings.geminiKey.trim()) {
+      headers['x-shadow-gemini-key'] = settings.geminiKey.trim();
+    }
     return headers;
+  }
+  if (settings.geminiKey.trim()) {
+    return { 'x-shadow-gemini-key': settings.geminiKey.trim() };
   }
   return {};
 }
@@ -92,10 +98,20 @@ export function aiSocketAuthMessage(settings: AiSettings): {
   type: 'ai_auth';
   provider?: string;
   apiKey?: string;
+  geminiKey?: string;
   model?: string;
 } {
-  if (settings.provider === 'gemini' && settings.geminiKey.trim()) {
-    return { type: 'ai_auth', provider: 'gemini', apiKey: settings.geminiKey.trim() };
+  const geminiKey = settings.geminiKey.trim() || undefined;
+  if (settings.provider === 'gemini' && geminiKey) {
+    return { type: 'ai_auth', provider: 'gemini', apiKey: geminiKey, geminiKey };
   }
-  return { type: 'ai_auth' };
+  if (settings.provider === 'openrouter' && settings.openrouterKey.trim()) {
+    return {
+      type: 'ai_auth',
+      provider: 'openrouter',
+      apiKey: settings.openrouterKey.trim(),
+      ...(geminiKey ? { geminiKey } : {}),
+    };
+  }
+  return geminiKey ? { type: 'ai_auth', geminiKey } : { type: 'ai_auth' };
 }
