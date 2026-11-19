@@ -39,16 +39,19 @@ export function preferDeepCommandDefault(): boolean {
 
 /**
  * Thinking level for the Gemini Live voice session.
- * MINIMAL keeps first-audio latency low; set SHADOW_LIVE_THINKING=off to skip
- * thinkingConfig entirely (e.g. if a custom live model rejects the field).
+ * Note: `gemini-3.8-live` rejects `thinkingConfig` (closes with code 1007).
+ * Only `gemini-3.8-live-extended-thinking` supports `thinkingConfig`
+ * (LOW, MEDIUM, or HIGH — never MINIMAL).
  */
-export function resolveLiveThinkingLevel(): ThinkingLevel | null {
-  const raw = (process.env.SHADOW_LIVE_THINKING || 'minimal').toLowerCase();
-  if (['off', 'none', 'disabled', '0'].includes(raw)) return null;
-  if (raw === 'low') return ThinkingLevel.LOW;
+export function resolveLiveThinkingLevel(liveModel = getModelConfig().live): ThinkingLevel | null {
+  if (!liveModel.includes('extended-thinking')) {
+    return null;
+  }
+  const raw = (process.env.SHADOW_LIVE_THINKING || 'low').toLowerCase();
+  if (['off', 'none', 'disabled', '0', 'minimal'].includes(raw)) return null;
   if (raw === 'medium') return ThinkingLevel.MEDIUM;
   if (raw === 'high') return ThinkingLevel.HIGH;
-  return ThinkingLevel.MINIMAL;
+  return ThinkingLevel.LOW;
 }
 
 export function resolveServerGeminiKey(): string | null {

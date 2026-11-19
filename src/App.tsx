@@ -377,6 +377,7 @@ function JarvisArcWorkspace() {
   const outputLevelRef = useRef<number>(0);
   const isMicMutedRef = useRef<boolean>(false);
   const isConnectedRef = useRef<boolean>(false);
+  const isConnectingRef = useRef<boolean>(false);
   const userTranscriptBufRef = useRef<string>('');
   const jarvisTranscriptBufRef = useRef<string>('');
   const captionTimerRef = useRef<number | null>(null);
@@ -1612,6 +1613,7 @@ function JarvisArcWorkspace() {
 
   const stopVoiceSession = useCallback(() => {
     isConnectedRef.current = false;
+    isConnectingRef.current = false;
     setIsConnected(false);
     setIsConnecting(false);
 
@@ -1643,7 +1645,8 @@ function JarvisArcWorkspace() {
 
   const startVoiceSession = useCallback(
     async (startMuted = false) => {
-      if (isConnectedRef.current || isConnecting) return;
+      if (isConnectedRef.current || isConnectingRef.current) return;
+      isConnectingRef.current = true;
       setVoiceError(null);
       setIsConnecting(true);
 
@@ -1676,6 +1679,9 @@ function JarvisArcWorkspace() {
 
         const inputCtx = new AudioContext({ sampleRate: 16000 });
         inputCtxRef.current = inputCtx;
+        if (inputCtx.state === 'suspended') {
+          await inputCtx.resume().catch(() => null);
+        }
         const source = inputCtx.createMediaStreamSource(stream);
         const analyser = inputCtx.createAnalyser();
         analyser.fftSize = 128;
@@ -1684,9 +1690,14 @@ function JarvisArcWorkspace() {
         const processor = inputCtx.createScriptProcessor(4096, 1, 1);
         processorRef.current = processor;
 
+        // Route through a muted GainNode so Windows/WebView2 drivers keep onaudioprocess active without echo
+        const silentGain = inputCtx.createGain();
+        silentGain.gain.value = 0;
+
         source.connect(analyser);
         analyser.connect(processor);
-        processor.connect(inputCtx.destination);
+        processor.connect(silentGain);
+        silentGain.connect(inputCtx.destination);
 
         isMicMutedRef.current = startMuted;
         setIsMicMuted(startMuted);
@@ -1711,6 +1722,15 @@ function JarvisArcWorkspace() {
         wsRef.current = ws;
 
         ws.onopen = () => {
+          if (wsRef.current !== ws) {
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          isConnectingRef.current = false;
           isConnectedRef.current = true;
           setIsConnected(true);
           setIsConnecting(false);
@@ -1829,6 +1849,7 @@ function JarvisArcWorkspace() {
         };
 
         ws.onerror = () => {
+          if (wsRef.current !== ws) return;
           setVoiceError(
             API_ORIGIN
               ? `WebSocket connection failed (${API_WS_BASE}/ws/live). Start "npm start" in your Shadow folder or check data/server.log.`
@@ -1838,7 +1859,7 @@ function JarvisArcWorkspace() {
         };
 
         ws.onclose = () => {
-          if (isConnectedRef.current) {
+          if (wsRef.current === ws) {
             stopVoiceSession();
           }
         };
@@ -1887,7 +1908,6 @@ function JarvisArcWorkspace() {
     },
     [
       voiceName,
-      isConnecting,
       showTransientCaption,
       handleToolAction,
       runDirectLaptopTool,

@@ -907,10 +907,12 @@ async function startServer() {
         ...jarvisToolDeclarations,
         ...buildPluginToolDeclarations(activePlugins),
       ];
-      const liveThinking = resolveLiveThinkingLevel();
+      const liveModel = getModelConfig().live;
+      const liveThinking = resolveLiveThinkingLevel(liveModel);
+      let reportedLiveError = false;
 
       session = await ai.live.connect({
-        model: getModelConfig().live,
+        model: liveModel,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -920,7 +922,7 @@ async function startServer() {
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          // MINIMAL thinking keeps first-audio latency low on the voice path.
+          // Only extended-thinking live models accept thinkingConfig (LOW/MEDIUM/HIGH).
           ...(liveThinking ? { thinkingConfig: { thinkingLevel: liveThinking } } : {}),
           tools: [{ functionDeclarations: liveToolDeclarations }],
           systemInstruction: buildShadowSystemInstruction({
@@ -1137,22 +1139,34 @@ async function startServer() {
           },
           onerror: (err: unknown) => {
             console.error('Gemini Live session error:', err);
+            reportedLiveError = true;
             safeSend({
               type: 'error',
               message: err instanceof Error ? err.message : 'Gemini Live session error',
             });
           },
-          onclose: () => {
+          onclose: (ev?: { code?: number; reason?: string }) => {
+            if (!isClosed && !reportedLiveError && ev && ((ev.code && ev.code !== 1000 && ev.code !== 1005) || ev.reason)) {
+              reportedLiveError = true;
+              safeSend({
+                type: 'error',
+                message: ev.reason
+                  ? `Voice session closed (${ev.code || 'ws'}): ${ev.reason}`
+                  : `Voice session closed unexpectedly (code ${ev.code}).`,
+              });
+            }
             safeSend({ type: 'closed' });
           },
         },
       });
     } catch (err) {
       console.error('Failed to open Gemini Live session:', err);
-      safeSend({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Could not start Gemini Live voice session.',
-      });
+      if (!isClosed) {
+        safeSend({
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Could not start Gemini Live voice session.',
+        });
+      }
       clientWs.close();
       return;
     }
@@ -1194,6 +1208,10 @@ async function startServer() {
 
     clientWs.on('close', () => {
       isClosed = true;
+      if (authTimer) {
+        clearTimeout(authTimer);
+        authTimer = null;
+      }
       for (const [, pending] of pendingClientTools) {
         clearTimeout(pending.timer);
         pending.resolve({ ok: false, error: 'Client disconnected.' });
