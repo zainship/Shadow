@@ -45,6 +45,20 @@ function hasGlobalFirebaseCli() {
   return probe.status === 0;
 }
 
+function readHostingSite(projectId) {
+  const firebaseJsonPath = path.join(rootDir, 'firebase.json');
+  if (!fs.existsSync(firebaseJsonPath)) return projectId;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(firebaseJsonPath, 'utf8'));
+    if (typeof parsed?.hosting?.site === 'string' && parsed.hosting.site.trim()) {
+      return parsed.hosting.site.trim();
+    }
+  } catch {
+    // ignore malformed firebase.json here; firebase CLI will validate it
+  }
+  return projectId;
+}
+
 const args = new Set(process.argv.slice(2));
 const skipLint = args.has('--skip-lint');
 const withRules = args.has('--with-rules');
@@ -53,10 +67,12 @@ const dryRun = args.has('--dry-run');
 const firebaseConfig = readFirebaseConfig();
 const projectId = firebaseConfig.projectId;
 const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
+const hostingSite = readHostingSite(projectId);
 
 console.log(`Shadow Firebase Hosting Deploy Workflow`);
 console.log(`  Project ID : ${projectId}`);
 console.log(`  Database ID: ${databaseId}`);
+console.log(`  Hosting Site: ${hostingSite}.web.app`);
 
 const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
@@ -91,4 +107,4 @@ if (hasGlobalFirebaseCli()) {
   run(npxCmd, ['--yes', 'firebase-tools', ...deployArgs]);
 }
 
-console.log(`\nDeployed static bundle to https://${projectId}.web.app`);
+console.log(`\nDeployed static bundle to https://${hostingSite}.web.app`);

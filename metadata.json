@@ -1,6 +1,6 @@
 {
   "name": "Jarvis Desktop",
   "description": "Voice-only desktop assistant powered by Gemini Live, Tauri browser automation, YouTube media playback, and Firebase.",
-  "requestFramePermissions": ["microphone"],
+  "requestFramePermissions": ["microphone", "camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

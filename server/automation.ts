@@ -1,7 +1,14 @@
 import { load, type CheerioAPI } from 'cheerio';
-import { Type } from '@google/genai';
+import { ThinkingLevel, Type } from '@google/genai';
 import type { FunctionDeclaration } from '@google/genai';
-import { getGeminiClient, getModelConfig, resolveServerGeminiKey, withGeminiRetry } from './gemini.ts';
+import {
+  getGeminiClient,
+  getModelConfig,
+  isOverloadOrQuotaError,
+  resolveServerGeminiKey,
+  withGeminiRetry,
+} from './gemini.ts';
+import { openRouterGenerate, type AiRuntime } from './ai-provider.ts';
 import type { PluginRuntimeDescriptor } from './plugins.ts';
 
 export interface AutomationStep {
@@ -733,27 +740,60 @@ export async function executeBrowserPlan(input: {
         }
 
         if (extractedItems.length === countBefore) {
-          // Smart fallback: Hacker News .titleline, article headlines, headings, or primary links
-          const candidates = dom('.titleline > a, article h2, article h3, h1, h2, h3, main a[href]');
-          const seen = new Set<string>();
-          candidates.each((_, el) => {
-            if (extractedItems.length >= 20) return false;
-            const node = dom(el);
-            const label = node.text().replace(/\s+/g, ' ').trim().slice(0, 180);
-            if (!label || label.length < 4 || seen.has(label)) return;
-            seen.add(label);
-            const linkEl = node.is('a[href]') ? node : node.find('a[href]').first();
-            const rawHref = linkEl.attr('href');
-            let href: string | undefined;
-            if (rawHref && !rawHref.startsWith('#') && !rawHref.startsWith('javascript:')) {
-              try {
-                href = new URL(rawHref, state.currentUrl).toString();
-              } catch {
-                // ignore
+          // Smart fallback: tables first if present, otherwise headlines/articles/links
+          const tableRows = dom('table tr');
+          if (tableRows.length >= 2) {
+            const seenRows = new Set<string>();
+            tableRows.each((_, tr) => {
+              if (extractedItems.length >= 25) return false;
+              const cells = dom(tr)
+                .find('th, td')
+                .map((__, cell) => dom(cell).text().replace(/\s+/g, ' ').trim())
+                .get()
+                .filter(Boolean);
+              if (cells.length >= 2) {
+                const label = cells[0].slice(0, 120);
+                const valueText = cells.slice(1).join(' · ').slice(0, 220);
+                const key = `${label}|${valueText}`;
+                if (!seenRows.has(key)) {
+                  seenRows.add(key);
+                  const rowLink = dom(tr).find('a[href]').first().attr('href');
+                  let href: string | undefined;
+                  if (rowLink && !rowLink.startsWith('#') && !rowLink.startsWith('javascript:')) {
+                    try {
+                      href = new URL(rowLink, state.currentUrl).toString();
+                    } catch {
+                      // ignore
+                    }
+                  }
+                  extractedItems.push({ label, value: valueText, ...(href ? { href } : {}) });
+                }
               }
-            }
-            extractedItems.push({ label, href });
-          });
+            });
+          }
+
+          if (extractedItems.length === countBefore) {
+            const candidates = dom('.titleline > a, article h2, article h3, h1, h2, h3, main a[href]');
+            const seen = new Set<string>();
+            candidates.each((_, el) => {
+              if (extractedItems.length >= 20) return false;
+              const node = dom(el);
+              const label = node.text().replace(/\s+/g, ' ').trim().slice(0, 180);
+              if (!label || label.length < 4 || seen.has(label)) return;
+              seen.add(label);
+              const linkEl = node.is('a[href]') ? node : node.find('a[href]').first();
+              const rawHref = linkEl.attr('href');
+              let href: string | undefined;
+              if (rawHref && !rawHref.startsWith('#') && !rawHref.startsWith('javascript:')) {
+                try {
+                  href = new URL(rawHref, state.currentUrl).toString();
+                } catch {
+                  // ignore
+                }
+              }
+              extractedItems.push({ label, href });
+            });
+          }
         }
 
         const added = extractedItems.length - countBefore;
@@ -809,6 +849,399 @@ export async function executeBrowserPlan(input: {
     inspection: state.inspection,
     extractedItems,
     submissionResult: state.submissionResult,
+    totalDurationMs: Date.now() - startedAll,
+    ...(errorMsg ? { error: errorMsg } : {}),
+  };
+}
+
+export interface AutonomousAgentIteration {
+  stepIndex: number;
+  action: 'inspect' | 'navigate' | 'fill_and_submit' | 'extract' | 'finish';
+  target: string;
+  value?: string;
+  rationale: string;
+  status: 'completed' | 'failed';
+  url: string;
+  title: string;
+  detail: string;
+  durationMs: number;
+}
+
+export interface AutonomousWebAgentResult {
+  ok: boolean;
+  goal: string;
+  startUrl: string;
+  finalUrl: string;
+  answer: string;
+  iterations: AutonomousAgentIteration[];
+  steps: ExecutedAutomationStep[];
+  inspection: PageInspectionResult | null;
+  extractedItems: AutomationExtractedItem[];
+  submissionResult: AutomationSubmissionResult | null;
+  totalDurationMs: number;
+  error?: string;
+}
+
+interface PlannedAgentAction {
+  action: 'navigate' | 'fill_and_submit' | 'extract' | 'finish';
+  rationale: string;
+  url?: string;
+  selector?: string;
+  fields?: Array<{ selector: string; value: string; description?: string }>;
+  submit?: boolean;
+  answer?: string;
+}
+
+function summarizeInspectionForPlanner(
+  inspection: PageInspectionResult | null,
+  extractedItems: AutomationExtractedItem[],
+  submissionResult: AutomationSubmissionResult | null
+): string {
+  if (!inspection) return 'No DOM loaded yet.';
+  const fieldsText = inspection.fields
+    .slice(0, 16)
+    .map(
+      (f) =>
+        `  - selector="${f.selector}" tag=${f.tag} type=${f.type} label="${f.label}" name="${f.name}" placeholder="${f.placeholder}"`
+    )
+    .join('\n');
+  const linksText = inspection.links
+    .slice(0, 14)
+    .map((l) => `  - "${l.text}" -> ${l.href}`)
+    .join('\n');
+  const headingsText = inspection.headings.slice(0, 8).map((h) => `  - ${h}`).join('\n');
+  const extractedText = extractedItems
+    .slice(0, 12)
+    .map((it) => `  - ${it.label}${it.value ? ` (${it.value})` : ''}${it.href ? ` [${it.href}]` : ''}`)
+    .join('\n');
+  const submitText = submissionResult
+    ? `HTTP ${submissionResult.statusCode} ${submissionResult.method} ${submissionResult.actionUrl}: ${submissionResult.bodyPreview.slice(0, 420)}`
+    : 'None yet';
+
+  return [
+    `URL: ${inspection.finalUrl} (HTTP ${inspection.statusCode})`,
+    `Title: ${inspection.title}`,
+    `Headings:\n${headingsText || '  (none)'}`,
+    `Form Fields (${inspection.fields.length}):\n${fieldsText || '  (none)'}`,
+    `Buttons: ${inspection.buttons.join(', ') || '(none)'}`,
+    `Links (${inspection.links.length}):\n${linksText || '  (none)'}`,
+    `Page Excerpt:\n${inspection.excerpt.slice(0, 650)}`,
+    `Previously Extracted Items (${extractedItems.length}):\n${extractedText || '  (none)'}`,
+    `Last Form Submission:\n${submitText}`,
+  ].join('\n\n');
+}
+
+export async function runAutonomousWebAgent(input: {
+  goal: string;
+  startUrl: string;
+  maxSteps?: number;
+  preferDeep?: boolean;
+  runtime?: AiRuntime | null;
+}): Promise<AutonomousWebAgentResult> {
+  const startedAll = Date.now();
+  const goal = (input.goal || 'Explore webpage and extract objective information').trim();
+  const startUrl = normalizeUrl(input.startUrl || 'https://news.ycombinator.com');
+  const maxSteps = Math.min(6, Math.max(2, Number(input.maxSteps) || 4));
+
+  const iterations: AutonomousAgentIteration[] = [];
+  const allSteps: ExecutedAutomationStep[] = [];
+  let currentUrl = startUrl;
+  let currentInspection: PageInspectionResult | null = null;
+  let extractedItems: AutomationExtractedItem[] = [];
+  let submissionResult: AutomationSubmissionResult | null = null;
+  let finalAnswer = '';
+  let ok = true;
+  let errorMsg: string | undefined;
+
+  // Step 0: Initial live DOM inspection
+  const initStart = Date.now();
+  const initialNav = await executeBrowserPlan({
+    goal: `Inspect ${startUrl}`,
+    targetUrl: startUrl,
+    steps: [{ action: 'navigate', selector: 'document', value: startUrl, description: `Load ${startUrl}` }],
+  });
+  currentInspection = initialNav.inspection;
+  currentUrl = initialNav.targetUrl || startUrl;
+  allSteps.push(...initialNav.steps);
+
+  iterations.push({
+    stepIndex: 1,
+    action: 'inspect',
+    target: currentUrl,
+    rationale: 'Load initial target page and inspect real DOM fields, headings, and links.',
+    status: initialNav.ok ? 'completed' : 'failed',
+    url: currentUrl,
+    title: currentInspection?.title || currentUrl,
+    detail: `HTTP ${currentInspection?.statusCode ?? 0} · ${currentInspection?.fields.length ?? 0} fields, ${currentInspection?.links.length ?? 0} links`,
+    durationMs: Date.now() - initStart,
+  });
+
+  if (!initialNav.ok && (!currentInspection || currentInspection.statusCode === 0)) {
+    return {
+      ok: false,
+      goal,
+      startUrl,
+      finalUrl: currentUrl,
+      answer: `Could not reach ${startUrl}: ${initialNav.error || currentInspection?.excerpt || 'connection failed'}.`,
+      iterations,
+      steps: allSteps,
+      inspection: currentInspection,
+      extractedItems,
+      submissionResult,
+      totalDurationMs: Date.now() - startedAll,
+      error: initialNav.error || 'Initial navigation failed',
+    };
+  }
+
+  const plannerSchema = {
+    type: Type.OBJECT,
+    properties: {
+      action: {
+        type: Type.STRING,
+        description: 'One of: navigate, fill_and_submit, extract, finish',
+      },
+      rationale: {
+        type: Type.STRING,
+        description: 'Short explanation of why this next action advances the goal.',
+      },
+      url: {
+        type: Type.STRING,
+        description: 'Absolute URL when action is navigate.',
+      },
+      selector: {
+        type: Type.STRING,
+        description: 'CSS selector when action is extract (e.g. ".titleline > a", "table", "h2, p").',
+      },
+      fields: {
+        type: Type.ARRAY,
+        description: 'Field values to fill when action is fill_and_submit.',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            selector: { type: Type.STRING },
+            value: { type: Type.STRING },
+            description: { type: Type.STRING },
+          },
+          required: ['selector', 'value'],
+        },
+      },
+      submit: {
+        type: Type.BOOLEAN,
+        description: 'True to submit the active form after filling fields.',
+      },
+      answer: {
+        type: Type.STRING,
+        description: 'Verified concise final answer when action is finish.',
+      },
+    },
+    required: ['action', 'rationale'],
+  };
+
+  const askPlannerForNextStep = async (stepNumber: number): Promise<PlannedAgentAction> => {
+    const historySummary = iterations
+      .map((it) => `Step ${it.stepIndex} [${it.action} -> ${it.target}] (${it.status}): ${it.detail}`)
+      .join('\n');
+    const prompt = [
+      `OBJECTIVE: ${goal}`,
+      `STEP BUDGET: Step ${stepNumber} of ${maxSteps} max steps.`,
+      `ACTION HISTORY:\n${historySummary}`,
+      `CURRENT OBSERVED DOM SNAPSHOT:\n${summarizeInspectionForPlanner(currentInspection, extractedItems, submissionResult)}`,
+      `Decide the single best next action:
+- Use "fill_and_submit" ONLY with real selectors listed under Form Fields above (set submit=true if ready to submit).
+- Use "extract" with an appropriate CSS selector (or empty selector for smart extraction) to pull lists, tables, or headlines if the answer is on this page and not yet extracted.
+- Use "navigate" with a concrete URL from Links above if you need to follow a relevant link.
+- Use "finish" once you have gathered enough verified evidence (from page excerpt, extracted items, or form submission response) to directly answer the objective cleanly in 2–4 crisp sentences.`,
+    ].join('\n\n');
+
+    if (input.runtime?.provider === 'openrouter') {
+      const turn = await openRouterGenerate({
+        apiKey: input.runtime.apiKey,
+        model: input.runtime.model,
+        systemInstruction: 'You are an autonomous web automation planner. Return strictly valid JSON.',
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        jsonSchema: plannerSchema as unknown as Record<string, unknown>,
+      });
+      return JSON.parse(turn.text || '{}') as PlannedAgentAction;
+    }
+
+    const ai = getGeminiClient(input.runtime?.apiKey);
+    const models = getModelConfig();
+    const callGeminiPlanner = async (useDeep: boolean, retries: number) =>
+      withGeminiRetry(
+        () =>
+          ai.models.generateContent({
+            model: useDeep ? models.deepText : models.fastText,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: {
+              systemInstruction: 'You are an autonomous web automation planner. Return strictly valid JSON matching the schema.',
+              responseMimeType: 'application/json',
+              responseSchema: plannerSchema,
+              ...(useDeep ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
+            },
+          }),
+        retries
+      );
+
+    let res;
+    const useDeepFirst = Boolean(input.preferDeep);
+    try {
+      res = await callGeminiPlanner(useDeepFirst, 0);
+    } catch (err) {
+      if (!isOverloadOrQuotaError(err)) throw err;
+      res = await callGeminiPlanner(!useDeepFirst, 1);
+    }
+    return JSON.parse(res.text || '{}') as PlannedAgentAction;
+  };
+
+  for (let iter = 2; iter <= maxSteps + 1; iter++) {
+    let plan: PlannedAgentAction;
+    const stepStarted = Date.now();
+    try {
+      plan = await askPlannerForNextStep(iter);
+    } catch (err) {
+      errorMsg = err instanceof Error ? err.message : 'Agent planner error';
+      ok = false;
+      break;
+    }
+
+    const action = (plan.action || 'finish').toLowerCase() as PlannedAgentAction['action'];
+    const rationale = String(plan.rationale || 'Advance objective').slice(0, 260);
+
+    if (action === 'finish') {
+      finalAnswer =
+        String(plan.answer || '').trim() ||
+        currentInspection?.excerpt ||
+        `Completed automation on ${currentUrl}.`;
+      iterations.push({
+        stepIndex: iter,
+        action: 'finish',
+        target: currentUrl,
+        rationale,
+        status: 'completed',
+        url: currentUrl,
+        title: currentInspection?.title || currentUrl,
+        detail: finalAnswer.slice(0, 240),
+        durationMs: Date.now() - stepStarted,
+      });
+      break;
+    }
+
+    if (action === 'navigate' && plan.url) {
+      const nextUrl = normalizeUrl(plan.url);
+      const navExec = await executeBrowserPlan({
+        goal: `Navigate to ${nextUrl}`,
+        targetUrl: nextUrl,
+        steps: [{ action: 'navigate', selector: 'document', value: nextUrl, description: `Navigate to ${nextUrl}` }],
+      });
+      if (navExec.inspection) currentInspection = navExec.inspection;
+      currentUrl = navExec.targetUrl || nextUrl;
+      allSteps.push(...navExec.steps);
+      iterations.push({
+        stepIndex: iter,
+        action: 'navigate',
+        target: currentUrl,
+        rationale,
+        status: navExec.ok ? 'completed' : 'failed',
+        url: currentUrl,
+        title: currentInspection?.title || currentUrl,
+        detail: navExec.steps[0]?.detail || `Navigated to ${currentUrl}`,
+        durationMs: Date.now() - stepStarted,
+      });
+      continue;
+    }
+
+    if (action === 'fill_and_submit') {
+      const plannedSteps: AutomationStep[] = [
+        { action: 'navigate', selector: 'document', value: currentUrl, description: `Ensure ${currentUrl} is active` },
+        ...(Array.isArray(plan.fields) ? plan.fields : []).map((f) => ({
+          action: 'fill' as const,
+          selector: String(f.selector || ''),
+          value: String(f.value || ''),
+          description: String(f.description || `Fill ${f.selector}`),
+        })),
+      ];
+      if (plan.submit !== false) {
+        plannedSteps.push({ action: 'submit', selector: 'form', value: '', description: 'Submit active form' });
+      }
+      const formExec = await executeBrowserPlan({
+        goal,
+        targetUrl: currentUrl,
+        steps: plannedSteps,
+      });
+      if (formExec.inspection) currentInspection = formExec.inspection;
+      if (formExec.submissionResult) submissionResult = formExec.submissionResult;
+      currentUrl = formExec.targetUrl || currentUrl;
+      allSteps.push(...formExec.steps.slice(1));
+      const filledSummary = (plan.fields || []).map((f) => `${f.selector}=${f.value}`).join(', ');
+      iterations.push({
+        stepIndex: iter,
+        action: 'fill_and_submit',
+        target: currentUrl,
+        value: filledSummary.slice(0, 140),
+        rationale,
+        status: formExec.ok ? 'completed' : 'failed',
+        url: currentUrl,
+        title: currentInspection?.title || currentUrl,
+        detail: formExec.submissionResult
+          ? `HTTP ${formExec.submissionResult.statusCode} · ${formExec.submissionResult.actionUrl}`
+          : `Filled ${plan.fields?.length || 0} field(s)`,
+        durationMs: Date.now() - stepStarted,
+      });
+      continue;
+    }
+
+    // Default: extract
+    const extractSel = String(plan.selector || '');
+    const extExec = await executeBrowserPlan({
+      goal,
+      targetUrl: currentUrl,
+      steps: [
+        { action: 'navigate', selector: 'document', value: currentUrl, description: `Load ${currentUrl}` },
+        { action: 'extract', selector: extractSel, value: '', description: `Extract ${extractSel || 'structured data'}` },
+      ],
+    });
+    if (extExec.inspection) currentInspection = extExec.inspection;
+    if (extExec.extractedItems.length > 0) {
+      extractedItems = [...extractedItems, ...extExec.extractedItems].slice(0, 40);
+    }
+    allSteps.push(...extExec.steps.slice(1));
+    iterations.push({
+      stepIndex: iter,
+      action: 'extract',
+      target: extractSel || 'smart-dom-extractor',
+      rationale,
+      status: extExec.ok ? 'completed' : 'failed',
+      url: currentUrl,
+      title: currentInspection?.title || currentUrl,
+      detail: `Extracted ${extExec.extractedItems.length} item(s)`,
+      durationMs: Date.now() - stepStarted,
+    });
+  }
+
+  if (!finalAnswer) {
+    if (submissionResult) {
+      finalAnswer = `Submitted form on ${submissionResult.actionUrl} (HTTP ${submissionResult.statusCode}).`;
+    } else if (extractedItems.length > 0) {
+      finalAnswer = `Extracted ${extractedItems.length} structured item(s) from ${currentInspection?.title || currentUrl}: ${extractedItems
+        .slice(0, 4)
+        .map((i) => i.label)
+        .join('; ')}.`;
+    } else {
+      finalAnswer = currentInspection?.excerpt || `Completed ${iterations.length} autonomous browser step(s) on ${currentUrl}.`;
+    }
+  }
+
+  return {
+    ok,
+    goal,
+    startUrl,
+    finalUrl: currentUrl,
+    answer: finalAnswer,
+    iterations,
+    steps: allSteps,
+    inspection: currentInspection,
+    extractedItems,
+    submissionResult,
     totalDurationMs: Date.now() - startedAll,
     ...(errorMsg ? { error: errorMsg } : {}),
   };
@@ -1189,6 +1622,67 @@ export const jarvisToolDeclarations: FunctionDeclaration[] = [
       required: ['prompt'],
     },
   },
+  {
+    name: 'inspect_web_page',
+    description:
+      'Inspects any public URL live before acting on it, returning its HTTP status, title, real form input selectors/labels, buttons, navigation links, headings, and page text excerpt.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        url: {
+          type: Type.STRING,
+          description: 'Target https:// URL to inspect.',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'run_autonomous_web_agent',
+    description:
+      'Autonomous goal-driven browser agent that inspects a live website, plans multi-hop navigation, form filling, or table/list extraction steps iteratively, verifies results, and returns a synthesized answer. Use whenever the user specifies a web goal on an unfamiliar site without exact CSS selectors.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        goal: {
+          type: Type.STRING,
+          description: 'Natural-language objective to accomplish on the target site.',
+        },
+        startUrl: {
+          type: Type.STRING,
+          description: 'Starting https:// URL.',
+        },
+        maxSteps: {
+          type: Type.NUMBER,
+          description: 'Optional iteration cap (2–6, default 4).',
+        },
+      },
+      required: ['goal', 'startUrl'],
+    },
+  },
+  {
+    name: 'set_focus_timer',
+    description:
+      'Starts, pauses, or resets a countdown Focus Timer or reminder alert inside Shadow Dynamic Island (with chime & notification on completion).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description: 'One of: start, pause, reset',
+        },
+        minutes: {
+          type: Type.NUMBER,
+          description: 'Duration in minutes when action is start (e.g. 5, 15, 25).',
+        },
+        label: {
+          type: Type.STRING,
+          description: 'Optional reminder label (e.g. "Check build", "Deep work").',
+        },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 export interface AssistantSessionContext {
@@ -1204,6 +1698,18 @@ export interface AssistantSessionContext {
     importance?: string;
   }>;
   plugins?: PluginRuntimeDescriptor[];
+  workspace?: {
+    currentDateTime?: string;
+    timeZone?: string;
+    activeDrawer?: string | null;
+    activeAutomationUrl?: string;
+    activeAutomationTitle?: string;
+    activeAutomationFields?: string[];
+    activeResearchQuery?: string;
+    activeTrackTitle?: string;
+    visionMode?: 'off' | 'camera' | 'screen';
+    shelfItems?: Array<{ name: string; kind: string; previewText?: string }>;
+  };
 }
 
 export function getActiveToolDeclarations(
@@ -1214,7 +1720,13 @@ export function getActiveToolDeclarations(
     if (decl.name === 'manage_laptop_files') return perms.files === true;
     if (decl.name === 'control_laptop_apps') return perms.apps === true;
     if (decl.name === 'execute_terminal_command') return perms.terminal === true;
-    if (decl.name === 'execute_browser_automation') return perms.browser !== false;
+    if (
+      decl.name === 'execute_browser_automation' ||
+      decl.name === 'inspect_web_page' ||
+      decl.name === 'run_autonomous_web_agent'
+    ) {
+      return perms.browser !== false;
+    }
     if (decl.name === 'research_topic') return perms.research !== false;
     if (decl.name === 'play_youtube_media' || decl.name === 'control_youtube_player') {
       return perms.youtube !== false;
@@ -1232,7 +1744,7 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
   const capabilityLines: string[] = [];
   if (perms.browser !== false) {
     capabilityLines.push(
-      '1. Professional Browser Automation: navigating websites with stateful cookies, inspecting DOM forms and links, filling text/email/select/radio/checkbox fields, clicking links/buttons, submitting forms, and extracting structured web data via execute_browser_automation.'
+      '1. Autonomous & Scripted Browser Automation: inspect_web_page (discover live forms/links/tables before acting), run_autonomous_web_agent (multi-hop iterative inspect-plan-act loop for open-ended web goals), and execute_browser_automation (deterministic ordered steps with stateful cookies, form POST submission, and structured table/link extraction).'
     );
   }
   if (perms.research !== false) {
@@ -1251,7 +1763,7 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
     );
   }
   capabilityLines.push(
-    '5. Visual Synthesis: immediately calling generate_visual whenever the user asks to draw, illustrate, visualize, diagram, chart, or wireframe something.'
+    '5. Visual Synthesis, Focus Timers & Multimodal Vision: calling generate_visual to draw diagrams/charts/wireframes, set_focus_timer to manage focus countdowns/reminders, and directly analyzing live camera/screen video frames or attached images.'
   );
 
   const memoryItems = (ctx?.memories || [])
@@ -1267,11 +1779,37 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
     (p) => `- ${p.toolName} (${p.name}, ${p.kind}): ${p.description}`
   );
 
+  const ws = ctx?.workspace;
+  const nowStr = ws?.currentDateTime || new Date().toISOString();
+  const wsLines: string[] = [`Current Date/Time: ${nowStr}${ws?.timeZone ? ` (${ws.timeZone})` : ''}`];
+  if (ws?.activeDrawer) wsLines.push(`Active Stage Open: ${ws.activeDrawer}`);
+  if (ws?.visionMode && ws.visionMode !== 'off') wsLines.push(`Live Vision Stream Active: ${ws.visionMode}`);
+  if (ws?.activeAutomationUrl) {
+    wsLines.push(
+      `Active Automation Target: ${ws.activeAutomationTitle || ''} (${ws.activeAutomationUrl})${
+        ws.activeAutomationFields && ws.activeAutomationFields.length > 0
+          ? ` | Observed fields: ${ws.activeAutomationFields.slice(0, 10).join(', ')}`
+          : ''
+      }`
+    );
+  }
+  if (ws?.activeResearchQuery) wsLines.push(`Active Research Topic: ${ws.activeResearchQuery}`);
+  if (ws?.activeTrackTitle) wsLines.push(`Currently Playing Track: ${ws.activeTrackTitle}`);
+  if (ws?.shelfItems && ws.shelfItems.length > 0) {
+    wsLines.push(
+      `Items on Notch Shelf:\n${ws.shelfItems
+        .slice(0, 4)
+        .map((s) => `  • ${s.name}${s.previewText ? `: ${s.previewText.slice(0, 220)}` : ''}`)
+        .join('\n')}`
+    );
+  }
+
   return [
-    `You are ${assistantName}, a fast, calm, articulate voice-first Progressive Web App (PWA) assistant specializing in real browser automation, deep web research, and media control.`,
+    `You are ${assistantName}, a hyper-capable, calm, articulate AI Chief-of-Staff running as a multimodal Progressive Web App (PWA) specializing in autonomous browser automation, deep web research, vision analysis, and media control.`,
     userName
       ? `Address the user naturally as "${userName}" when appropriate.`
       : 'Address the user politely and naturally.',
+    `LIVE WORKSPACE CONTEXT:\n${wsLines.join('\n')}`,
     capabilityLines.length > 0
       ? `Your active capabilities:\n${capabilityLines.join('\n')}`
       : 'All external tools are currently restricted; respond conversationally.',
@@ -1282,10 +1820,12 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
     memoryItems.length > 0
       ? `PERSISTENT LONG-TERM MEMORY (Remember and apply these facts automatically):\n${memoryItems.join('\n')}`
       : 'PERSISTENT LONG-TERM MEMORY: No stored memories yet. Whenever the user shares something important about themselves or their preferences, call save_memory right away.',
-    `Guidelines for every response:
-- Speak concisely and naturally, like an attentive chief-of-staff (1–2 crisp sentences). Never read out raw CSS selectors, URLs character-by-character, or markdown formatting aloud.
-- Always invoke the matching permitted tool or installed plugin immediately without asking redundant confirmation questions when the user's intent is clear.
-- For browser automation tasks, build complete ordered steps (navigate, fill/select by clear field names or selectors, click/submit, or extract) using real URLs and summarize the actual DOM findings, extracted items count, or HTTP submission status clearly once complete.`,
+    `Reasoning & Execution Guidelines:
+- Speak concisely and naturally, like an attentive chief-of-staff (1–3 crisp sentences). Never read out raw CSS selectors, URLs character-by-character, or markdown formatting aloud.
+- You can chain multiple tool calls in sequence when a task requires it (for example: inspect_web_page first to discover exact field selectors, then execute_browser_automation; or research_topic followed by save_memory or generate_visual).
+- For open-ended goals on unfamiliar websites where CSS selectors are unknown, prefer run_autonomous_web_agent so you observe the real DOM iteratively before acting.
+- If the user attaches a screenshot, camera frame, or file—or has Live Vision active—inspect visual details directly and answer grounded in what you observe.
+- Always invoke the matching permitted tool or installed plugin immediately without asking redundant confirmation questions when the user's intent is clear.`,
   ]
     .filter(Boolean)
     .join('\n\n');

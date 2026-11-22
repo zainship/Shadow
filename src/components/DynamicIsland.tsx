@@ -4,19 +4,23 @@ import {
   ArrowRight,
   Blocks,
   Brain,
+  Camera,
   Check,
   ChevronUp,
   Clock,
   Compass,
   Cpu,
+  Eye,
   FileText,
   Globe,
   Image as ImageIcon,
   Layers,
   Loader2,
   Lock,
+  MessageSquare,
   Mic,
   MicOff,
+  MonitorUp,
   Pause,
   Play,
   RotateCcw,
@@ -36,20 +40,25 @@ import type { ReactorCommandCue, ReactorMode } from './ArcReactorScene';
 import type { DockDrawerTab } from './IosControlDock';
 import type { NetworkTelemetry } from '../hooks/useNetworkTelemetry';
 import type {
+  CommandAttachment,
+  DialogueEntry,
   GeneratedVisual,
   ResearchReport,
+  VisionSourceMode,
   VoiceName,
   YouTubeTrack,
 } from '../types/assistant';
 
-export type DynamicIslandTab = 'now' | 'focus' | 'shelf';
+export type DynamicIslandTab = 'now' | 'thread' | 'focus' | 'shelf';
 
 interface ShelfItem {
   id: string;
   name: string;
   sizeLabel: string;
-  kind: 'file' | 'text';
+  kind: 'file' | 'text' | 'image';
   previewText?: string;
+  mimeType?: string;
+  dataBase64?: string;
 }
 
 interface DynamicIslandProps {
@@ -68,6 +77,16 @@ interface DynamicIslandProps {
   hasActivePlugins?: boolean;
   networkTelemetry?: NetworkTelemetry;
   faceAuthLockAvailable?: boolean;
+  visionMode?: VisionSourceMode;
+  visionStream?: MediaStream | null;
+  deepThinking?: boolean;
+  dialogueHistory?: DialogueEntry[];
+  timerControlEvent?: {
+    action: 'start' | 'pause' | 'reset';
+    minutes?: number;
+    label?: string;
+    nonce: number;
+  } | null;
   currentTrack: YouTubeTrack | null;
   mediaQueue?: YouTubeTrack[];
   currentResearch?: ResearchReport | null;
@@ -84,10 +103,15 @@ interface DynamicIslandProps {
   onToggleMute: () => void;
   onInterruptSpeech: () => void;
   onVoiceChange: (voice: VoiceName) => void;
+  onChangeVisionMode?: (mode: VisionSourceMode) => void;
+  onToggleDeepThinking?: (enabled: boolean) => void;
+  onClearDialogue?: () => void;
+  onTimerComplete?: (label: string) => void;
+  onShelfChange?: (items: Array<{ name: string; kind: 'file' | 'text' | 'image'; previewText?: string }>) => void;
   onChangeReactorBrightness: (brightness: number) => void;
   onSelectDrawer: (tab: DockDrawerTab) => void;
   onSelectTrack?: (track: YouTubeTrack) => void;
-  onRunCommand: (commandText: string) => void;
+  onRunCommand: (commandText: string, attachment?: CommandAttachment) => void;
   onOpenAiSettings: () => void;
   onOpenSetup: () => void;
   onLockWithFace?: () => void;
@@ -258,6 +282,11 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   hasActivePlugins = false,
   networkTelemetry,
   faceAuthLockAvailable = false,
+  visionMode = 'off',
+  visionStream = null,
+  deepThinking = false,
+  dialogueHistory = [],
+  timerControlEvent = null,
   currentTrack,
   mediaQueue = [],
   currentResearch = null,
@@ -274,6 +303,11 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   onToggleMute,
   onInterruptSpeech,
   onVoiceChange,
+  onChangeVisionMode,
+  onToggleDeepThinking,
+  onClearDialogue,
+  onTimerComplete,
+  onShelfChange,
   onChangeReactorBrightness,
   onSelectDrawer,
   onSelectTrack,
@@ -297,10 +331,57 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   const [timerDuration, setTimerDuration] = useState(25 * 60);
   const [timerRemaining, setTimerRemaining] = useState(25 * 60);
   const [timerRunning, setTimerRunning] = useState(false);
+  const [timerLabel, setTimerLabel] = useState('Focus Timer');
   const [timerCompletedFlash, setTimerCompletedFlash] = useState(false);
 
   const islandRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const quickInputRef = useRef<HTMLInputElement | null>(null);
+  const visionPreviewRef = useRef<HTMLVideoElement | null>(null);
+  const threadScrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Sync live camera / screen preview video element inside Dynamic Island
+  useEffect(() => {
+    if (visionPreviewRef.current) {
+      visionPreviewRef.current.srcObject = visionStream || null;
+      if (visionStream) {
+        void visionPreviewRef.current.play().catch(() => null);
+      }
+    }
+  }, [visionStream, expanded, activeTab]);
+
+  // Propagate shelf items to workspace context when changed
+  useEffect(() => {
+    onShelfChange?.(
+      shelfItems.map((s) => ({ name: s.name, kind: s.kind, previewText: s.previewText }))
+    );
+  }, [shelfItems, onShelfChange]);
+
+  // External voice-driven timer commands (from set_focus_timer tool)
+  useEffect(() => {
+    if (!timerControlEvent) return;
+    if (timerControlEvent.action === 'start') {
+      const secs = Math.max(60, Math.round((timerControlEvent.minutes || 25) * 60));
+      setTimerDuration(secs);
+      setTimerRemaining(secs);
+      setTimerLabel(timerControlEvent.label || 'Focus Timer');
+      setTimerCompletedFlash(false);
+      setTimerRunning(true);
+    } else if (timerControlEvent.action === 'pause') {
+      setTimerRunning(false);
+    } else if (timerControlEvent.action === 'reset') {
+      setTimerRunning(false);
+      setTimerCompletedFlash(false);
+      setTimerRemaining(timerDuration);
+    }
+  }, [timerControlEvent, timerDuration]);
+
+  // Auto-scroll Thread drawer to latest message
+  useEffect(() => {
+    if (expanded && activeTab === 'thread' && threadScrollRef.current) {
+      threadScrollRef.current.scrollTop = threadScrollRef.current.scrollHeight;
+    }
+  }, [dialogueHistory.length, expanded, activeTab]);
 
   // Clock refresh every 10s
   useEffect(() => {
@@ -321,6 +402,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
           setTimerRunning(false);
           setTimerCompletedFlash(true);
           playFocusChime();
+          onTimerComplete?.(timerLabel);
           window.setTimeout(() => setTimerCompletedFlash(false), 6000);
           return 0;
         }
@@ -328,9 +410,9 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
       });
     }, 1000);
     return () => window.clearInterval(id);
-  }, [timerRunning]);
+  }, [timerRunning, timerLabel, onTimerComplete]);
 
-  // Keyboard shortcut: Cmd/Ctrl + I toggles Dynamic Island; Escape closes
+  // Keyboard shortcuts: Cmd/Ctrl + I toggles Island; Cmd/Ctrl + K opens Command Spotlight; Escape closes
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -341,6 +423,12 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
           target.tagName === 'SELECT' ||
           target.isContentEditable);
 
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setExpanded(true);
+        window.setTimeout(() => quickInputRef.current?.focus(), 60);
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'i') {
         e.preventDefault();
         setExpanded((prev) => !prev);
@@ -411,19 +499,38 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
     const additions: ShelfItem[] = [];
     for (const file of Array.from(files).slice(0, 6)) {
       let previewText: string | undefined;
+      let dataBase64: string | undefined;
+      let kind: ShelfItem['kind'] = 'file';
       if (
+        file.size <= 3_500_000 &&
+        (file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(file.name))
+      ) {
+        kind = 'image';
+        dataBase64 = await new Promise<string | undefined>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const res = typeof reader.result === 'string' ? reader.result : '';
+            const idx = res.indexOf(',');
+            resolve(idx >= 0 ? res.slice(idx + 1) : undefined);
+          };
+          reader.onerror = () => resolve(undefined);
+          reader.readAsDataURL(file);
+        });
+      } else if (
         file.size <= 160_000 &&
         (file.type.startsWith('text/') ||
           /\.(txt|md|json|ts|tsx|js|py|rs|sh|csv|yml|yaml|html|css)$/i.test(file.name))
       ) {
-        previewText = (await file.text().catch(() => '')).slice(0, 600);
+        previewText = (await file.text().catch(() => '')).slice(0, 1200);
       }
       additions.push({
         id: `shelf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         name: file.name,
         sizeLabel: formatFileSize(file.size),
-        kind: 'file',
+        kind,
         previewText,
+        mimeType: file.type || (kind === 'image' ? 'image/jpeg' : undefined),
+        dataBase64,
       });
     }
     setShelfItems((prev) => [...additions, ...prev].slice(0, 12));
@@ -733,8 +840,17 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   </span>
                 </div>
 
-                {/* Right Region: Network Latency (Active) + Spectrum / Countdown / Time */}
+                {/* Right Region: Vision Indicator + Network Latency (Active) + Spectrum / Countdown / Time */}
                 <div className="flex items-center gap-2 shrink-0">
+                  {visionMode !== 'off' && compactKind !== 'error' && (
+                    <span
+                      title={`Live ${visionMode === 'screen' ? 'Screen' : 'Camera'} Vision active`}
+                      className="inline-flex items-center gap-1 text-[10px] font-mono text-emerald-300"
+                    >
+                      <Eye className="w-3 h-3" />
+                    </span>
+                  )}
+
                   {showNetworkStatus && networkTelemetry && compactKind !== 'error' && (
                     <span
                       title={
@@ -916,20 +1032,22 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   </div>
                 </div>
 
-                {/* Mac Segmented Mode Switcher: Now · Focus & Media · Shelf & Apps */}
-                <div className="grid grid-cols-3 gap-1 p-1 rounded-2xl bg-black/45 border border-white/[0.09] shadow-[inset_0_1px_2px_rgba(0,0,0,0.6)]">
+                {/* Mac Segmented Mode Switcher: Live Hub · Thread · Focus · Shelf */}
+                <div className="grid grid-cols-4 gap-1 p-1 rounded-2xl bg-black/45 border border-white/[0.09] shadow-[inset_0_1px_2px_rgba(0,0,0,0.6)]">
                   {(
                     [
                       { id: 'now', label: 'Live Hub' },
                       {
+                        id: 'thread',
+                        label: dialogueHistory.length > 0 ? `Thread (${dialogueHistory.length})` : 'Thread',
+                      },
+                      {
                         id: 'focus',
-                        label: timerRunning
-                          ? `Focus · ${formatTimer(timerRemaining)}`
-                          : 'Focus & Media',
+                        label: timerRunning ? `Focus · ${formatTimer(timerRemaining)}` : 'Focus',
                       },
                       {
                         id: 'shelf',
-                        label: shelfItems.length > 0 ? `Shelf (${shelfItems.length})` : 'Shelf & Apps',
+                        label: shelfItems.length > 0 ? `Shelf (${shelfItems.length})` : 'Shelf',
                       },
                     ] as const
                   ).map((tab) => {
@@ -939,7 +1057,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                         key={tab.id}
                         type="button"
                         onClick={() => setActiveTab(tab.id)}
-                        className={`relative py-1.5 px-2 rounded-xl text-[11px] font-medium transition-colors whitespace-nowrap truncate cursor-pointer ${
+                        className={`relative py-1.5 px-1.5 rounded-xl text-[11px] font-medium transition-colors whitespace-nowrap truncate cursor-pointer ${
                           selected ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
@@ -956,14 +1074,15 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   })}
                 </div>
 
-                {/* Spotlight-Grade Quick Command Bar */}
+                {/* Spotlight-Grade Quick Command Bar (Cmd+K) */}
                 <form onSubmit={handleSubmitQuickCommand} className="relative flex items-center">
                   <Sparkles className="w-3.5 h-3.5 text-sky-400 absolute left-3 pointer-events-none" />
                   <input
+                    ref={quickInputRef}
                     type="text"
                     value={quickCommand}
                     onChange={(e) => setQuickCommand(e.target.value)}
-                    placeholder={`Command ${assistantName} (e.g. fill form on httpbin, extract Hacker News)...`}
+                    placeholder={`Command ${assistantName} (Cmd+K · ask, automate, research)...`}
                     className="w-full pl-8 pr-9 py-2 rounded-xl bg-black/45 border border-white/[0.09] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-400/55 focus:bg-black/60 transition-all"
                   />
                   <button
@@ -987,6 +1106,87 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                       transition={{ duration: 0.14 }}
                       className="space-y-2.5"
                     >
+                      {/* Multimodal Live Vision & Reasoning Mode Strip */}
+                      {onChangeVisionMode && (
+                        <div className="p-2.5 rounded-2xl bg-black/38 border border-white/[0.09] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-medium text-slate-300 inline-flex items-center gap-1.5">
+                              <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                              <span>Multimodal Vision</span>
+                            </span>
+                            {onToggleDeepThinking && (
+                              <button
+                                type="button"
+                                onClick={() => onToggleDeepThinking(!deepThinking)}
+                                className={`px-2 py-0.5 rounded-md text-[10px] font-mono transition-colors cursor-pointer whitespace-nowrap ${
+                                  deepThinking
+                                    ? 'bg-indigo-500/22 text-indigo-200 border border-indigo-400/40'
+                                    : 'bg-white/[0.04] text-slate-400 border border-transparent hover:text-slate-200'
+                                }`}
+                              >
+                                {deepThinking ? 'Reasoning: Deep' : 'Reasoning: Auto'}
+                              </button>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => onChangeVisionMode('off')}
+                              className={`flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                visionMode === 'off'
+                                  ? 'bg-white/[0.1] text-white border border-white/15'
+                                  : 'bg-white/[0.03] text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              Off
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onChangeVisionMode(visionMode === 'camera' ? 'off' : 'camera')
+                              }
+                              className={`flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium inline-flex items-center justify-center gap-1 transition-colors cursor-pointer whitespace-nowrap ${
+                                visionMode === 'camera'
+                                  ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/40'
+                                  : 'bg-white/[0.03] text-slate-300 hover:text-white'
+                              }`}
+                            >
+                              <Camera className="w-3 h-3" />
+                              <span>Camera</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onChangeVisionMode(visionMode === 'screen' ? 'off' : 'screen')
+                              }
+                              className={`flex-1 py-1.5 px-2 rounded-lg text-[11px] font-medium inline-flex items-center justify-center gap-1 transition-colors cursor-pointer whitespace-nowrap ${
+                                visionMode === 'screen'
+                                  ? 'bg-sky-500/20 text-sky-200 border border-sky-400/40'
+                                  : 'bg-white/[0.03] text-slate-300 hover:text-white'
+                              }`}
+                            >
+                              <MonitorUp className="w-3 h-3" />
+                              <span>Screen</span>
+                            </button>
+                          </div>
+                          {visionStream && visionMode !== 'off' && (
+                            <div className="relative rounded-xl overflow-hidden bg-black/60 border border-white/10 h-24">
+                              <video
+                                ref={visionPreviewRef}
+                                muted
+                                playsInline
+                                autoPlay
+                                className="w-full h-full object-cover"
+                              />
+                              <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/75 text-[10px] font-mono text-emerald-300">
+                                {visionMode === 'screen' ? 'Screen Feed' : 'Camera Feed'} ·{' '}
+                                {isConnected ? '1 FPS Live' : 'Snapshot Ready'}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {/* 16-Bar Live Audio Equalizer + Inline Voice Persona Strip */}
                       <div className="p-2.5 rounded-2xl bg-black/38 border border-white/[0.09] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] space-y-2">
                         <div className="flex items-center justify-between gap-2">
@@ -1227,6 +1427,96 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                     </motion.div>
                   )}
 
+                  {activeTab === 'thread' && (
+                    <motion.div
+                      key="tab-thread"
+                      initial={{ opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -4 }}
+                      transition={{ duration: 0.14 }}
+                      className="space-y-2"
+                    >
+                      <div className="flex items-center justify-between px-1">
+                        <span className="text-[11px] font-medium text-slate-300 inline-flex items-center gap-1.5">
+                          <MessageSquare className="w-3.5 h-3.5 text-sky-400" />
+                          <span>Multi-Turn Context &amp; Agent Trace</span>
+                        </span>
+                        {dialogueHistory.length > 0 && onClearDialogue && (
+                          <button
+                            type="button"
+                            onClick={onClearDialogue}
+                            className="text-[11px] text-slate-400 hover:text-rose-300 transition-colors cursor-pointer"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+
+                      {dialogueHistory.length > 0 ? (
+                        <div
+                          ref={threadScrollRef}
+                          className="max-h-64 overflow-y-auto space-y-2 pr-0.5"
+                        >
+                          {dialogueHistory.slice(-16).map((entry) => (
+                            <div
+                              key={entry.id}
+                              className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
+                                entry.speaker === 'user'
+                                  ? 'bg-white/[0.04] border-white/10'
+                                  : 'bg-sky-500/[0.07] border-sky-400/20'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2 text-[10px] text-slate-400">
+                                <span
+                                  className={`font-semibold ${
+                                    entry.speaker === 'user' ? 'text-slate-200' : 'text-sky-300'
+                                  }`}
+                                >
+                                  {entry.speaker === 'user' ? 'You' : assistantName}
+                                  {entry.attachmentName ? ` · ${entry.attachmentName}` : ''}
+                                </span>
+                                <span className="font-mono tabular-nums">
+                                  {entry.modelUsed ? `${entry.modelUsed} · ` : ''}
+                                  {new Date(entry.timestamp).toLocaleTimeString([], {
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  })}
+                                </span>
+                              </div>
+                              <p className="text-slate-100 leading-relaxed whitespace-pre-wrap">
+                                {entry.text}
+                              </p>
+                              {entry.toolTraces && entry.toolTraces.length > 0 && (
+                                <div className="pt-1 border-t border-white/8 space-y-0.5">
+                                  {entry.toolTraces.map((tr) => (
+                                    <div
+                                      key={tr.id}
+                                      className="flex items-center justify-between gap-2 text-[10px] font-mono text-slate-400"
+                                    >
+                                      <span className="truncate">
+                                        {tr.ok ? '✓' : '✕'} {tr.name} · {tr.summary}
+                                      </span>
+                                      <span className="tabular-nums shrink-0">{tr.durationMs}ms</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-4 rounded-2xl bg-black/38 border border-white/[0.09] text-center space-y-2">
+                          <p className="text-xs text-slate-300">
+                            No conversation history yet.
+                          </p>
+                          <p className="text-[11px] text-slate-500">
+                            Speak via Voice or type a follow-up above — {assistantName} remembers context across turns and chains tools autonomously.
+                          </p>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
                   {activeTab === 'focus' && (
                     <motion.div
                       key="tab-focus"
@@ -1445,7 +1735,11 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                                 className="px-2.5 py-1.5 rounded-xl bg-white/[0.04] border border-white/8 flex items-center justify-between gap-2"
                               >
                                 <div className="flex items-center gap-2 min-w-0">
-                                  <FileText className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                  {item.kind === 'image' ? (
+                                    <ImageIcon className="w-3.5 h-3.5 text-purple-300 shrink-0" />
+                                  ) : (
+                                    <FileText className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                  )}
                                   <div className="min-w-0">
                                     <p className="text-[11px] font-medium text-slate-100 truncate">
                                       {item.name}
@@ -1454,13 +1748,23 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-1 shrink-0">
-                                  {item.previewText && (
+                                  {(item.previewText || item.dataBase64) && (
                                     <button
                                       type="button"
                                       onClick={() => {
-                                        onRunCommand(
-                                          `Summarize this dropped ${item.kind} "${item.name}":\n${item.previewText}`
-                                        );
+                                        if (item.kind === 'image' && item.dataBase64 && item.mimeType) {
+                                          onRunCommand(`Analyze this image "${item.name}" and explain key details.`, {
+                                            name: item.name,
+                                            mimeType: item.mimeType,
+                                            dataBase64: item.dataBase64,
+                                          });
+                                          return;
+                                        }
+                                        if (item.previewText) {
+                                          onRunCommand(
+                                            `Analyze and summarize this dropped ${item.kind} "${item.name}":\n${item.previewText}`
+                                          );
+                                        }
                                       }}
                                       className="px-2 py-0.5 rounded-md bg-sky-500/20 hover:bg-sky-500/35 text-[10px] font-medium text-sky-200 cursor-pointer"
                                     >
@@ -1483,7 +1787,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                           </div>
                         ) : (
                           <p className="text-[11px] text-slate-500 text-center py-1">
-                            Drag files or text onto the notch anytime to hold or ask {assistantName}.
+                            Drag images, files, or text onto the notch anytime to ask {assistantName}.
                           </p>
                         )}
                       </div>

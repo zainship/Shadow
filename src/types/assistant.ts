@@ -83,6 +83,8 @@ export interface AutomationRunState {
   inspection: PageInspectionResult | null;
   extractedItems?: AutomationExtractedItem[];
   submissionResult?: AutomationSubmissionResult | null;
+  agentIterations?: AutonomousAgentIteration[];
+  agentAnswer?: string;
   totalDurationMs?: number;
   startedAt: number;
 }
@@ -228,6 +230,67 @@ export interface DialogueEntry {
   text: string;
   timestamp: number;
   actionTag?: string;
+  toolTraces?: AgentToolTrace[];
+  groundingSources?: Array<{ title: string; url: string }>;
+  modelUsed?: string;
+  attachmentName?: string;
+}
+
+export type VisionSourceMode = 'off' | 'camera' | 'screen';
+
+export interface AgentToolTrace {
+  id: string;
+  name: string;
+  summary: string;
+  ok: boolean;
+  durationMs: number;
+}
+
+export interface CommandAttachment {
+  name: string;
+  mimeType: string;
+  dataBase64: string;
+}
+
+export interface ActiveWorkspaceContext {
+  currentDateTime: string;
+  timeZone: string;
+  activeDrawer: string | null;
+  activeAutomationUrl?: string;
+  activeAutomationTitle?: string;
+  activeAutomationFields?: string[];
+  activeResearchQuery?: string;
+  activeTrackTitle?: string;
+  visionMode?: VisionSourceMode;
+  shelfItems?: Array<{ name: string; kind: 'file' | 'text' | 'image'; previewText?: string }>;
+}
+
+export interface AutonomousAgentIteration {
+  stepIndex: number;
+  action: 'inspect' | 'navigate' | 'fill_and_submit' | 'extract' | 'finish';
+  target: string;
+  value?: string;
+  rationale: string;
+  status: 'completed' | 'failed';
+  url: string;
+  title: string;
+  detail: string;
+  durationMs: number;
+}
+
+export interface AutonomousWebAgentResult {
+  ok: boolean;
+  goal: string;
+  startUrl: string;
+  finalUrl: string;
+  answer: string;
+  iterations: AutonomousAgentIteration[];
+  steps: StepExecutionState[];
+  inspection: PageInspectionResult | null;
+  extractedItems: AutomationExtractedItem[];
+  submissionResult: AutomationSubmissionResult | null;
+  totalDurationMs: number;
+  error?: string;
 }
 
 export interface LaptopAgentHealth {

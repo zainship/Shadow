@@ -2,11 +2,13 @@ import React, { useState } from 'react';
 import { motion, useReducedMotion } from 'motion/react';
 import {
   BookmarkPlus,
+  Bot,
   Check,
   CheckCircle2,
   Clock,
   Copy,
   Database,
+  Download,
   ExternalLink,
   Globe,
   Loader2,
@@ -32,9 +34,11 @@ import {
 interface BrowserAutomationStageProps {
   run: AutomationRunState | null;
   runtime: RuntimeKind;
+  isAutomating?: boolean;
   onInspectUrl: (url: string) => void;
   onSaveAsMacro: (run: AutomationRunState) => void;
   onRunQuickDemo: (command: string) => void;
+  onRunAutonomousAgent?: (goal: string, startUrl: string) => void;
   onExecutePlan?: (plan: { goal: string; targetUrl: string; steps: AutomationStep[] }) => void;
   onClearRun?: () => void;
 }
@@ -150,14 +154,18 @@ const DEMO_PLANS: Array<{
 
 export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
   run,
+  isAutomating = false,
   onInspectUrl,
   onSaveAsMacro,
   onRunQuickDemo,
+  onRunAutonomousAgent,
   onExecutePlan,
   onClearRun,
 }) => {
   const [urlInput, setUrlInput] = useState('');
+  const [agentUrl, setAgentUrl] = useState('https://news.ycombinator.com');
   const [taskPrompt, setTaskPrompt] = useState('');
+  const [launchMode, setLaunchMode] = useState<'agent' | 'command'>('agent');
   const [copiedBlock, setCopiedBlock] = useState<'extract' | 'submit' | null>(null);
   const prefersReduced = useReducedMotion();
 
@@ -176,6 +184,12 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
     e.preventDefault();
     const clean = taskPrompt.trim();
     if (!clean) return;
+    if (launchMode === 'agent' && onRunAutonomousAgent) {
+      const target = agentUrl.trim() || 'https://news.ycombinator.com';
+      setTaskPrompt('');
+      onRunAutonomousAgent(clean, target);
+      return;
+    }
     setTaskPrompt('');
     onRunQuickDemo(clean);
   };
@@ -188,6 +202,19 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
     } catch {
       // ignore clipboard blocks
     }
+  };
+
+  const handleExportCsv = () => {
+    if (!run?.extractedItems || run.extractedItems.length === 0) return;
+    const esc = (v?: string) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = ['label,value,href', ...run.extractedItems.map((i) => `${esc(i.label)},${esc(i.value)},${esc(i.href)}`)];
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `shadow-extract-${Date.now()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleRerunCurrent = () => {
@@ -286,33 +313,90 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
           </div>
 
           <div className="max-w-lg space-y-2">
-            <h3 className="text-lg font-semibold text-slate-100">Browser Automation Engine</h3>
+            <h3 className="text-lg font-semibold text-slate-100">Autonomous Browser Engine</h3>
             <p className="text-sm text-slate-400 leading-relaxed">
-              Stateful cookie sessions, DOM selector discovery, multi-field form filling, real HTTP POST submission, and structured data extraction.
+              Iterative AI web agent that inspects live DOM forms &amp; tables, plans actions dynamically, submits HTTP requests, and exports structured data.
             </p>
           </div>
 
-          {/* Direct Natural-Language Automation Prompt */}
-          <form onSubmit={handleTaskPromptSubmit} className="w-full max-w-xl flex items-center gap-2">
-            <div className={`flex-1 ${MAC_GLASS_INPUT_WRAP}`}>
-              <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
-              <input
-                type="text"
-                value={taskPrompt}
-                onChange={(e) => setTaskPrompt(e.target.value)}
-                placeholder="Describe any web task (e.g. Open example.com and extract all links)..."
-                className="w-full bg-transparent text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={!taskPrompt.trim()}
-              className={`${MAC_GLASS_BTN_PRIMARY} disabled:opacity-40`}
-            >
-              <Play className="w-3.5 h-3.5" />
-              <span>Run</span>
-            </button>
-          </form>
+          {/* Segmented Launcher: Autonomous AI Agent vs Natural Command */}
+          <div className="w-full max-w-xl space-y-3">
+            {onRunAutonomousAgent && (
+              <div className="inline-flex p-1 rounded-xl bg-black/45 border border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setLaunchMode('agent')}
+                  className={`px-3 py-1 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                    launchMode === 'agent'
+                      ? 'bg-sky-500/20 text-sky-200 border border-sky-400/35'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>Autonomous Agent</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLaunchMode('command')}
+                  className={`px-3 py-1 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                    launchMode === 'command'
+                      ? 'bg-sky-500/20 text-sky-200 border border-sky-400/35'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Quick Command</span>
+                </button>
+              </div>
+            )}
+
+            <form onSubmit={handleTaskPromptSubmit} className="w-full space-y-2">
+              {launchMode === 'agent' && onRunAutonomousAgent && (
+                <div className={MAC_GLASS_INPUT_WRAP}>
+                  <Globe className="w-4 h-4 text-sky-300/80 shrink-0" />
+                  <input
+                    type="text"
+                    value={agentUrl}
+                    onChange={(e) => setAgentUrl(e.target.value)}
+                    placeholder="Starting URL (e.g. https://httpbin.org/forms/post)"
+                    className="w-full bg-transparent text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  />
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <div className={`flex-1 ${MAC_GLASS_INPUT_WRAP}`}>
+                  {launchMode === 'agent' ? (
+                    <Bot className="w-4 h-4 text-sky-400 shrink-0" />
+                  ) : (
+                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+                  )}
+                  <input
+                    type="text"
+                    value={taskPrompt}
+                    onChange={(e) => setTaskPrompt(e.target.value)}
+                    placeholder={
+                      launchMode === 'agent'
+                        ? 'Objective (e.g. Find the top AI-related stories and summarize them)...'
+                        : 'Describe any web task (e.g. Open example.com and extract all links)...'
+                    }
+                    className="w-full bg-transparent text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={!taskPrompt.trim() || isAutomating}
+                  className={`${MAC_GLASS_BTN_PRIMARY} disabled:opacity-40`}
+                >
+                  {isAutomating ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Play className="w-3.5 h-3.5" />
+                  )}
+                  <span>{launchMode === 'agent' ? 'Deploy Agent' : 'Run'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
 
           {/* Verified Real Automation Demos */}
           <div className="w-full max-w-2xl grid grid-cols-1 sm:grid-cols-3 gap-3 text-left">
@@ -343,11 +427,11 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
         </motion.div>
       ) : (
         <div className="flex-1 grid grid-cols-1 xl:grid-cols-12 divide-y xl:divide-y-0 xl:divide-x divide-white/10 overflow-hidden">
-          {/* Left: Step Execution Timeline */}
+          {/* Left: Step Execution Timeline & Agent Reasoning */}
           <div className="xl:col-span-5 p-5 overflow-y-auto space-y-4">
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
-                <span>Headless HTTP/DOM Engine</span>
+                <span>{run.agentIterations ? 'Autonomous AI Agent' : 'Headless HTTP/DOM Engine'}</span>
                 <span className="font-mono tabular-nums text-sky-300">
                   {run.steps.filter((s) => s.status === 'completed').length}/{run.steps.length} steps
                   {typeof run.totalDurationMs === 'number' ? ` · ${run.totalDurationMs}ms` : ''}
@@ -355,6 +439,43 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
               </div>
               <h3 className="text-base font-semibold text-slate-50">{run.goal}</h3>
             </div>
+
+            {run.agentAnswer && (
+              <div className="p-3.5 rounded-xl bg-sky-500/[0.08] border border-sky-400/30 space-y-1.5">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-sky-300">
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>Verified Agent Outcome</span>
+                </div>
+                <p className="text-xs text-slate-100 leading-relaxed">{run.agentAnswer}</p>
+              </div>
+            )}
+
+            {run.agentIterations && run.agentIterations.length > 0 && (
+              <div className="space-y-2 pt-2 border-t border-white/10">
+                <h4 className="text-xs font-semibold text-slate-300">
+                  Iterative Reasoning Loop ({run.agentIterations.length})
+                </h4>
+                <div className="space-y-2">
+                  {run.agentIterations.map((it) => (
+                    <div
+                      key={`${it.stepIndex}-${it.action}`}
+                      className="p-2.5 rounded-xl bg-white/[0.03] border border-white/10 space-y-1"
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="font-mono text-sky-300">
+                          #{it.stepIndex} · {it.action}
+                        </span>
+                        <span className="font-mono tabular-nums text-slate-400">
+                          {it.durationMs}ms · {it.status}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-200 leading-snug">{it.rationale}</p>
+                      <p className="text-[11px] font-mono text-slate-400 truncate">{it.detail}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <ol className="space-y-2 pt-2 border-t border-white/10">
               {run.steps.map((step, idx) => {
@@ -486,28 +607,38 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
             {/* Structured Extracted Data */}
             {run.extractedItems && run.extractedItems.length > 0 && (
               <div className="space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
                   <h5 className="text-xs font-semibold text-sky-300 inline-flex items-center gap-1.5">
                     <Database className="w-3.5 h-3.5" />
                     <span>Extracted Structured Data ({run.extractedItems.length})</span>
                   </h5>
-                  <button
-                    type="button"
-                    onClick={() => void handleCopyJson('extract', run.extractedItems)}
-                    className="px-2 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-[11px] text-slate-200 inline-flex items-center gap-1 cursor-pointer shrink-0"
-                  >
-                    {copiedBlock === 'extract' ? (
-                      <>
-                        <Check className="w-3 h-3 text-emerald-300" />
-                        <span>Copied JSON</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3 h-3" />
-                        <span>Copy JSON</span>
-                      </>
-                    )}
-                  </button>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleExportCsv}
+                      className="px-2 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-[11px] text-slate-200 inline-flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      <Download className="w-3 h-3 text-sky-300" />
+                      <span>Export CSV</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyJson('extract', run.extractedItems)}
+                      className="px-2 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-[11px] text-slate-200 inline-flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      {copiedBlock === 'extract' ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-300" />
+                          <span>Copied JSON</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          <span>Copy JSON</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
                 <div className={`divide-y divide-white/8 overflow-hidden ${MAC_GLASS_SUBSURFACE}`}>
                   {run.extractedItems.map((item, i) => (
@@ -516,17 +647,22 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
                       className="px-3.5 py-2 flex items-center justify-between gap-3 text-xs hover:bg-white/[0.03] transition-colors"
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <span className="font-mono text-[10px] text-slate-500 w-4 shrink-0">
+                        <span className="font-mono tabular-nums text-[10px] text-slate-500 w-4 shrink-0">
                           {i + 1}.
                         </span>
-                        <span className="text-slate-100 truncate">{item.label}</span>
+                        <div className="min-w-0">
+                          <p className="text-slate-100 truncate">{item.label}</p>
+                          {item.value && (
+                            <p className="text-[11px] text-slate-400 truncate">{item.value}</p>
+                          )}
+                        </div>
                       </div>
                       {item.href && (
                         <a
                           href={item.href}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="text-sky-400 hover:text-sky-300 shrink-0 inline-flex items-center gap-1 text-[11px]"
+                          className="text-sky-400 hover:text-sky-300 shrink-0 inline-flex items-center gap-1 text-[11px] whitespace-nowrap"
                         >
                           <span>Open</span>
                           <ExternalLink className="w-3 h-3" />

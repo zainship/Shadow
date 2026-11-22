@@ -10,9 +10,11 @@ import {
 } from 'motion/react';
 import {
   Blocks,
+  Camera,
   Check,
   Compass,
   Cpu,
+  Eye,
   Globe,
   Image,
   Layers,
@@ -20,15 +22,17 @@ import {
   Lock,
   Mic,
   MicOff,
+  MonitorUp,
   Play,
   Settings2,
   SlidersHorizontal,
+  Sparkles,
   Square,
   Sunrise,
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import type { VoiceName, WakeMode } from '../types/assistant';
+import type { VisionSourceMode, VoiceName, WakeMode } from '../types/assistant';
 
 export type DockDrawerTab =
   | 'brief'
@@ -75,6 +79,10 @@ interface IosControlDockProps {
   onOpenAiSettings?: () => void;
   aiProviderLabel?: string;
   onLockWithFace?: () => void;
+  visionMode?: VisionSourceMode;
+  onChangeVisionMode?: (mode: VisionSourceMode) => void;
+  deepThinking?: boolean;
+  onToggleDeepThinking?: (enabled: boolean) => void;
 }
 
 interface DockItemButtonProps {
@@ -199,6 +207,10 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
   onOpenAiSettings,
   aiProviderLabel,
   onLockWithFace,
+  visionMode = 'off',
+  onChangeVisionMode,
+  deepThinking = false,
+  onToggleDeepThinking,
 }) => {
   const mouseX = useMotionValue(Infinity);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -365,7 +377,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
             </div>
 
             {/* Clap Twice Wake Toggle */}
-            <div className="mb-3.5 flex items-center justify-between gap-3 px-2.5 py-2 rounded-xl bg-black/35 border border-white/8">
+            <div className="mb-3 flex items-center justify-between gap-3 px-2.5 py-2 rounded-xl bg-black/35 border border-white/8">
               <div className="min-w-0">
                 <p className="text-xs font-medium text-slate-200">Double-Clap Wake</p>
                 <p className="text-[10px] text-slate-400">
@@ -377,7 +389,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
                 role="switch"
                 aria-checked={clapWakeEnabled}
                 onClick={() => onToggleClapWake(!clapWakeEnabled)}
-                className={`relative w-10 h-5.5 rounded-full transition-colors shrink-0 ${
+                className={`relative w-10 h-5.5 rounded-full transition-colors shrink-0 cursor-pointer ${
                   clapWakeEnabled ? 'bg-sky-500' : 'bg-slate-700'
                 }`}
               >
@@ -388,6 +400,81 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
                 />
               </button>
             </div>
+
+            {/* Deep Reasoning Toggle */}
+            {onToggleDeepThinking && (
+              <div className="mb-3 flex items-center justify-between gap-3 px-2.5 py-2 rounded-xl bg-black/35 border border-white/8">
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-slate-200 inline-flex items-center gap-1.5">
+                    <Sparkles className="w-3 h-3 text-indigo-300" />
+                    <span>Deep Reasoning</span>
+                  </p>
+                  <p className="text-[10px] text-slate-400">
+                    {deepThinking ? 'Multi-step planning active' : 'Auto fast & adaptive'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={deepThinking}
+                  onClick={() => onToggleDeepThinking(!deepThinking)}
+                  className={`relative w-10 h-5.5 rounded-full transition-colors shrink-0 cursor-pointer ${
+                    deepThinking ? 'bg-indigo-500' : 'bg-slate-700'
+                  }`}
+                >
+                  <span
+                    className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                      deepThinking ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+            )}
+
+            {/* Multimodal Vision Selector */}
+            {onChangeVisionMode && (
+              <div className="space-y-1.5 mb-3.5">
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-[11px] font-medium text-slate-400 inline-flex items-center gap-1.5">
+                    <Eye className="w-3 h-3 text-emerald-400" />
+                    <span>Live Vision</span>
+                  </span>
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    {visionMode === 'off' ? 'Standby' : visionMode === 'camera' ? 'Camera' : 'Screen'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-black/45 border border-white/8">
+                  {(
+                    [
+                      { id: 'off', label: 'Off', icon: null },
+                      { id: 'camera', label: 'Camera', icon: <Camera className="w-3 h-3" /> },
+                      { id: 'screen', label: 'Screen', icon: <MonitorUp className="w-3 h-3" /> },
+                    ] as const
+                  ).map((opt) => {
+                    const selected = visionMode === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => onChangeVisionMode(opt.id)}
+                        className={`py-1 px-1.5 rounded-lg text-[11px] font-medium inline-flex items-center justify-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          selected
+                            ? opt.id === 'camera'
+                              ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-400/40'
+                              : opt.id === 'screen'
+                                ? 'bg-sky-500/25 text-sky-200 border border-sky-400/40'
+                                : 'bg-slate-700/85 text-white border border-white/12'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {opt.icon}
+                        <span>{opt.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Voice Persona Selection Rows */}
             <div className="space-y-1">

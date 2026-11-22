@@ -130,14 +130,20 @@ import {
   type LaptopPermissionRequest,
 } from './components/LaptopPermissionModal';
 import { useNetworkTelemetry } from './hooks/useNetworkTelemetry';
+import { useVisionStream } from './hooks/useVisionStream';
 import type {
+  ActiveWorkspaceContext,
+  AgentToolTrace,
   AssistantMemory,
   AutomationExtractedItem,
   AutomationRunState,
   AutomationStep,
   AutomationSubmissionResult,
   AutomationWorkflow,
+  AutonomousWebAgentResult,
+  CommandAttachment,
   CommandExecution,
+  DialogueEntry,
   FaceAuthProfile,
   GeneratedVisual,
   LaptopActionEvent,
@@ -150,6 +156,7 @@ import type {
   SetupConfig,
   ShadowPlugin,
   StepExecutionState,
+  VisionSourceMode,
   VisualAspectRatio,
   VisualStyle,
   VoiceName,
@@ -175,6 +182,49 @@ const VOICES: VoiceName[] = ['Charon', 'Fenrir', 'Zephyr', 'Kore', 'Puck'];
 const VISUALS_STORAGE_KEY = 'shadow_visuals_v1';
 const BRIEF_SEEN_STORAGE_KEY = 'shadow_brief_seen_v1';
 const REACTOR_BRIGHTNESS_STORAGE_KEY = 'shadow_reactor_brightness_v1';
+const DIALOGUE_STORAGE_KEY = 'shadow_dialogue_v1';
+const DEEP_THINKING_STORAGE_KEY = 'shadow_deep_thinking_v1';
+
+function loadDialogueHistory(): DialogueEntry[] {
+  try {
+    const raw = window.localStorage.getItem(DIALOGUE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is DialogueEntry =>
+          Boolean(item && typeof item.id === 'string' && typeof item.text === 'string')
+      )
+      .slice(-40);
+  } catch {
+    return [];
+  }
+}
+
+function saveDialogueHistory(entries: DialogueEntry[]): void {
+  try {
+    window.localStorage.setItem(DIALOGUE_STORAGE_KEY, JSON.stringify(entries.slice(-40)));
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function loadDeepThinking(): boolean {
+  try {
+    return window.localStorage.getItem(DEEP_THINKING_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function saveDeepThinking(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(DEEP_THINKING_STORAGE_KEY, enabled ? 'true' : 'false');
+  } catch {
+    // ignore storage failures
+  }
+}
 
 function loadReactorBrightness(): number {
   try {
@@ -350,8 +400,43 @@ function JarvisArcWorkspace() {
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [liveCaption, setLiveCaption] = useState<{ speaker: string; text: string } | null>(null);
   const [commandCue, setCommandCue] = useState<ReactorCommandCue | null>(null);
+  const [dialogueHistory, setDialogueHistory] = useState<DialogueEntry[]>(() =>
+    loadDialogueHistory()
+  );
+  const [deepThinking, setDeepThinking] = useState<boolean>(() => loadDeepThinking());
+  const [shelfWorkspaceItems, setShelfWorkspaceItems] = useState<
+    Array<{ name: string; kind: 'file' | 'text' | 'image'; previewText?: string }>
+  >([]);
+  const [timerControlEvent, setTimerControlEvent] = useState<{
+    action: 'start' | 'pause' | 'reset';
+    minutes?: number;
+    label?: string;
+    nonce: number;
+  } | null>(null);
   const cueTimerRef = useRef<number | null>(null);
   const cueIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    saveDialogueHistory(dialogueHistory);
+  }, [dialogueHistory]);
+
+  useEffect(() => {
+    saveDeepThinking(deepThinking);
+  }, [deepThinking]);
+
+  const appendDialogueEntry = useCallback((entry: Omit<DialogueEntry, 'id' | 'timestamp'>) => {
+    const cleanText = entry.text.trim();
+    if (!cleanText) return;
+    setDialogueHistory((prev) => [
+      ...prev.slice(-39),
+      {
+        ...entry,
+        text: cleanText,
+        id: `dlg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: Date.now(),
+      },
+    ]);
+  }, []);
 
   // Automation, Research, Visuals & YouTube Stage State
   const [automationRun, setAutomationRun] = useState<AutomationRunState | null>(null);
@@ -418,6 +503,40 @@ function JarvisArcWorkspace() {
     document.title = `${assistantName} — Voice & Browser Automation PWA`;
   }, [assistantName]);
 
+  const sendLiveVideoFrame = useCallback((base64: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'video',
+          data: base64,
+          mimeType: 'image/jpeg',
+        })
+      );
+    }
+  }, []);
+
+  const vision = useVisionStream({
+    liveStreamEnabled: isConnected,
+    onVideoFrame: sendLiveVideoFrame,
+  });
+
+  useEffect(() => {
+    if (vision.visionError) {
+      setVoiceError(vision.visionError);
+    }
+  }, [vision.visionError]);
+
+  const handleChangeVisionMode = useCallback(
+    (nextMode: VisionSourceMode) => {
+      if (nextMode === 'off') {
+        vision.stopVision();
+      } else {
+        void vision.startVision(nextMode);
+      }
+    },
+    [vision]
+  );
+
   const beginCommandCue = useCallback((kind: ReactorCommandKind, label: string) => {
     if (cueTimerRef.current) {
       window.clearTimeout(cueTimerRef.current);
@@ -464,6 +583,28 @@ function JarvisArcWorkspace() {
           label: promptText
             ? `Creating visual: ${promptText.slice(0, 44)}`
             : 'Generating visual graphic',
+        };
+      }
+      if (toolName === 'inspect_web_page') {
+        const u = String(args.url || '').trim();
+        return {
+          kind: 'automation',
+          label: u ? `Inspecting: ${u.slice(0, 44)}` : 'Inspecting live webpage DOM',
+        };
+      }
+      if (toolName === 'run_autonomous_web_agent') {
+        const g = String(args.goal || args.startUrl || '').trim();
+        return {
+          kind: 'automation',
+          label: g ? `Autonomous Agent: ${g.slice(0, 38)}` : 'Running autonomous web agent',
+        };
+      }
+      if (toolName === 'set_focus_timer') {
+        const act = String(args.action || 'start');
+        const mins = Number(args.minutes || 25);
+        return {
+          kind: 'command',
+          label: act === 'start' ? `Focus Timer: ${mins}m` : `Focus Timer: ${act}`,
         };
       }
       if (toolName === 'execute_browser_automation') {
@@ -745,7 +886,13 @@ function JarvisArcWorkspace() {
       if (toolName === 'manage_laptop_files') return p.files;
       if (toolName === 'control_laptop_apps') return p.apps;
       if (toolName === 'execute_terminal_command') return p.terminal;
-      if (toolName === 'execute_browser_automation') return p.browser;
+      if (
+        toolName === 'execute_browser_automation' ||
+        toolName === 'inspect_web_page' ||
+        toolName === 'run_autonomous_web_agent'
+      ) {
+        return p.browser;
+      }
       if (toolName === 'research_topic') return p.research;
       if (toolName === 'play_youtube_media' || toolName === 'control_youtube_player') {
         return p.youtube;
@@ -1061,14 +1208,48 @@ function JarvisArcWorkspace() {
         bodyTemplate: p.bodyTemplate,
         commandTemplate: p.commandTemplate,
       }));
+    const workspace: ActiveWorkspaceContext = {
+      currentDateTime: new Date().toLocaleString([], {
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+      activeDrawer,
+      activeAutomationUrl: automationRun?.inspection?.finalUrl || automationRun?.targetUrl,
+      activeAutomationTitle: automationRun?.inspection?.title,
+      activeAutomationFields: automationRun?.inspection?.fields
+        .map((f) => f.selector || f.label || f.name)
+        .filter(Boolean)
+        .slice(0, 12),
+      activeResearchQuery: currentResearch?.query,
+      activeTrackTitle: currentTrack?.title,
+      visionMode: vision.visionMode,
+      shelfItems: shelfWorkspaceItems.slice(0, 6),
+    };
     return {
       assistantName,
       userPreferredName: setupConfig.userPreferredName,
       permissions: setupConfig.permissions,
       memories: sortedMemories,
       plugins: activePlugins,
+      workspace,
     };
-  }, [memories, plugins, assistantName, setupConfig]);
+  }, [
+    memories,
+    plugins,
+    assistantName,
+    setupConfig,
+    activeDrawer,
+    automationRun,
+    currentResearch,
+    currentTrack,
+    vision.visionMode,
+    shelfWorkspaceItems,
+  ]);
 
   // Keyboard shortcut: 'H' toggles Cinema / Zen HUD collapse
   useEffect(() => {
@@ -1328,7 +1509,58 @@ function JarvisArcWorkspace() {
       result: Record<string, unknown>,
       transcript = ''
     ) => {
-      if (name === 'execute_browser_automation') {
+      if (name === 'inspect_web_page') {
+        const insp = result.inspection as PageInspectionResult | undefined;
+        if (insp?.finalUrl || insp?.url) {
+          const inspectedUrl = insp.finalUrl || insp.url;
+          setAutomationRun({
+            id: `inspect-${Date.now()}`,
+            goal: `Inspect ${insp.title || inspectedUrl}`,
+            targetUrl: inspectedUrl,
+            status: result.ok !== false ? 'completed' : 'failed',
+            steps: [
+              {
+                action: 'navigate',
+                selector: 'document',
+                value: inspectedUrl,
+                description: `Inspected ${insp.title || inspectedUrl}`,
+                status: result.ok !== false ? 'completed' : 'failed',
+                detail: `HTTP ${insp.statusCode} · ${insp.fields.length} field(s), ${insp.links.length} link(s)`,
+              },
+            ],
+            inspection: insp,
+            extractedItems: [],
+            submissionResult: null,
+            startedAt: Date.now(),
+          });
+          setActiveDrawer('automation');
+        }
+      } else if (name === 'run_autonomous_web_agent') {
+        const agentRes = result as unknown as AutonomousWebAgentResult;
+        setIsAutomating(false);
+        setAutomationRun({
+          id: `agent-${Date.now()}`,
+          goal: agentRes.goal || String(args.goal || 'Autonomous Web Task'),
+          targetUrl: agentRes.finalUrl || agentRes.startUrl || String(args.startUrl || ''),
+          status: agentRes.ok ? 'completed' : 'failed',
+          steps: Array.isArray(agentRes.steps) ? agentRes.steps : [],
+          inspection: agentRes.inspection ?? null,
+          extractedItems: Array.isArray(agentRes.extractedItems) ? agentRes.extractedItems : [],
+          submissionResult: agentRes.submissionResult ?? null,
+          agentIterations: Array.isArray(agentRes.iterations) ? agentRes.iterations : [],
+          agentAnswer: agentRes.answer,
+          totalDurationMs: agentRes.totalDurationMs,
+          startedAt: Date.now(),
+        });
+        setActiveDrawer('automation');
+      } else if (name === 'set_focus_timer') {
+        const rawAct = String(result.action || args.action || 'start');
+        const action: 'start' | 'pause' | 'reset' =
+          rawAct === 'pause' ? 'pause' : rawAct === 'reset' ? 'reset' : 'start';
+        const minutes = Number(result.minutes || args.minutes || 25);
+        const label = String(result.label || args.label || 'Focus Timer');
+        setTimerControlEvent({ action, minutes, label, nonce: Date.now() });
+      } else if (name === 'execute_browser_automation') {
         const goal = String(result.goal || args.goal || 'Browser Automation');
         const targetUrl = String(result.targetUrl || args.targetUrl || 'https://news.ycombinator.com');
         const steps = (Array.isArray(result.steps) ? result.steps : args.steps || []) as StepExecutionState[];
@@ -1866,7 +2098,12 @@ function JarvisArcWorkspace() {
             playerRef.current.enqueuePcmChunk(msg.data);
           } else if (msg.type === 'interrupted') {
             playerRef.current.clear();
-            if (jarvisTranscriptBufRef.current) {
+            if (userTranscriptBufRef.current.trim()) {
+              appendDialogueEntry({ speaker: 'user', text: userTranscriptBufRef.current });
+              userTranscriptBufRef.current = '';
+            }
+            if (jarvisTranscriptBufRef.current.trim()) {
+              appendDialogueEntry({ speaker: 'shadow', text: jarvisTranscriptBufRef.current });
               showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 4500);
               jarvisTranscriptBufRef.current = '';
             }
@@ -1874,12 +2111,19 @@ function JarvisArcWorkspace() {
             userTranscriptBufRef.current += msg.text;
             showTransientCaption('You', userTranscriptBufRef.current, 5000);
           } else if (msg.type === 'output_transcript' && msg.text) {
+            if (userTranscriptBufRef.current.trim()) {
+              appendDialogueEntry({ speaker: 'user', text: userTranscriptBufRef.current });
+            }
             userTranscriptBufRef.current = '';
             jarvisTranscriptBufRef.current += msg.text;
             showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 7000);
           } else if (msg.type === 'turn_complete') {
+            if (userTranscriptBufRef.current.trim()) {
+              appendDialogueEntry({ speaker: 'user', text: userTranscriptBufRef.current });
+            }
             userTranscriptBufRef.current = '';
-            if (jarvisTranscriptBufRef.current) {
+            if (jarvisTranscriptBufRef.current.trim()) {
+              appendDialogueEntry({ speaker: 'shadow', text: jarvisTranscriptBufRef.current });
               showTransientCaption(assistantNameRef.current, jarvisTranscriptBufRef.current, 6000);
               jarvisTranscriptBufRef.current = '';
             }
@@ -1902,7 +2146,11 @@ function JarvisArcWorkspace() {
                 `Generating visual: ${String(msg.args?.prompt || 'graphic').slice(0, 48)}...`,
                 5000
               );
-            } else if (msg.name === 'execute_browser_automation') {
+            } else if (
+              msg.name === 'execute_browser_automation' ||
+              msg.name === 'inspect_web_page' ||
+              msg.name === 'run_autonomous_web_agent'
+            ) {
               setIsAutomating(true);
               setActiveDrawer('automation');
             } else if (
@@ -1938,7 +2186,13 @@ function JarvisArcWorkspace() {
           } else if (msg.type === 'tool_action' && msg.name) {
             if (msg.name === 'research_topic') setIsResearching(false);
             if (msg.name === 'generate_visual') setIsGeneratingVisual(false);
-            if (msg.name === 'execute_browser_automation') setIsAutomating(false);
+            if (
+              msg.name === 'execute_browser_automation' ||
+              msg.name === 'inspect_web_page' ||
+              msg.name === 'run_autonomous_web_agent'
+            ) {
+              setIsAutomating(false);
+            }
             const cueInfo = describeToolCue(msg.name, msg.args || {});
             const actionOk = msg.result?.ok !== false;
             finishCommandCue(cueInfo.kind, cueInfo.label, actionOk);
@@ -2028,6 +2282,7 @@ function JarvisArcWorkspace() {
       beginCommandCue,
       finishCommandCue,
       runtimeInfo.isTauri,
+      appendDialogueEntry,
     ]
   );
 
@@ -2193,21 +2448,44 @@ function JarvisArcWorkspace() {
     [voiceName, showTransientCaption]
   );
 
-  // Triggered by stage demo buttons or macro replay (speaks back via non-blocking TTS, no chatbox)
+  // Triggered by Dynamic Island Spotlight, Shelf, stage demo buttons, or macro replay
   const runSpokenAction = useCallback(
-    async (commandText: string) => {
+    async (commandText: string, explicitAttachment?: CommandAttachment) => {
       const clean = commandText.trim();
-      if (!clean) return;
+      if (!clean && !explicitAttachment) return;
       setVoiceError(null);
-      showTransientCaption('You', clean, 4000);
-      beginCommandCue('command', `Processing: ${clean.slice(0, 44)}`);
+
+      let activeAttachment: CommandAttachment | undefined = explicitAttachment;
+      if (!activeAttachment && vision.visionMode !== 'off') {
+        const snapshot = vision.captureSnapshot();
+        if (snapshot) {
+          activeAttachment = snapshot;
+        }
+      }
+
+      const displayPrompt = clean || 'Analyze the current visual view.';
+      showTransientCaption('You', displayPrompt, 4000);
+      beginCommandCue('command', `Processing: ${displayPrompt.slice(0, 44)}`);
+
+      const priorHistory = dialogueHistory.slice(-10).map((d) => ({
+        speaker: d.speaker,
+        text: d.text,
+      }));
+      appendDialogueEntry({
+        speaker: 'user',
+        text: displayPrompt,
+        attachmentName: activeAttachment?.name,
+      });
 
       try {
         const res = await fetch(`${API_ORIGIN}/api/assistant/command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
-            command: clean,
+            command: displayPrompt,
+            history: priorHistory,
+            attachments: activeAttachment ? [activeAttachment] : [],
+            deepThinking,
             voiceName,
             speak: false,
             context: buildSessionContextPayload(),
@@ -2220,6 +2498,8 @@ function JarvisArcWorkspace() {
             args: Record<string, unknown>;
             result: Record<string, unknown>;
           }>;
+          toolTraces?: AgentToolTrace[];
+          modelUsed?: string;
           audioBase64?: string | null;
           error?: string;
         };
@@ -2230,13 +2510,19 @@ function JarvisArcWorkspace() {
           for (const act of data.actions) {
             const cueInfo = describeToolCue(act.name, act.args);
             beginCommandCue(cueInfo.kind, cueInfo.label);
-            await handleToolAction(act.name, act.args, act.result, clean);
+            await handleToolAction(act.name, act.args, act.result, displayPrompt);
             finishCommandCue(cueInfo.kind, cueInfo.label, act.result?.ok !== false);
           }
         } else {
           finishCommandCue('command', 'Command completed', true);
         }
         if (data.spokenText) {
+          appendDialogueEntry({
+            speaker: 'shadow',
+            text: data.spokenText,
+            toolTraces: data.toolTraces,
+            modelUsed: data.modelUsed,
+          });
           showTransientCaption(assistantNameRef.current, data.spokenText, 6000);
           if (data.audioBase64) {
             void playerRef.current.playWavBase64(data.audioBase64);
@@ -2251,6 +2537,10 @@ function JarvisArcWorkspace() {
     },
     [
       voiceName,
+      deepThinking,
+      dialogueHistory,
+      vision,
+      appendDialogueEntry,
       showTransientCaption,
       handleToolAction,
       handleSpeakText,
@@ -2344,6 +2634,154 @@ function JarvisArcWorkspace() {
       }
     },
     [isToolPermitted, beginCommandCue, finishCommandCue]
+  );
+
+  const handleRunAutonomousAgent = useCallback(
+    async (goal: string, startUrl: string) => {
+      if (!isToolPermitted('run_autonomous_web_agent')) {
+        setVoiceError('Browser Automation permission is disabled in Setup.');
+        return;
+      }
+      const cleanGoal = goal.trim();
+      const cleanUrl = startUrl.trim();
+      if (!cleanGoal || !cleanUrl) return;
+
+      setIsAutomating(true);
+      setActiveDrawer('automation');
+      setVoiceError(null);
+      beginCommandCue('automation', `Autonomous Agent: ${cleanGoal.slice(0, 38)}`);
+      showTransientCaption('You', `${cleanGoal} (${cleanUrl})`, 4000);
+
+      const runId = `agent-${Date.now()}`;
+      setAutomationRun({
+        id: runId,
+        goal: cleanGoal,
+        targetUrl: cleanUrl,
+        status: 'running',
+        steps: [
+          {
+            action: 'navigate',
+            selector: 'document',
+            value: cleanUrl,
+            description: `Inspecting ${cleanUrl} and planning autonomous actions`,
+            status: 'running',
+          },
+        ],
+        inspection: null,
+        extractedItems: [],
+        submissionResult: null,
+        agentIterations: [],
+        startedAt: Date.now(),
+      });
+
+      let execId: string | null = null;
+      if (user) {
+        try {
+          execId = await createExecutionLog(user.uid, {
+            transcript: `${cleanGoal} (${cleanUrl})`,
+            intent: 'browser_automation',
+            targetUrl: cleanUrl,
+            stepsCount: 1,
+            summary: `Autonomous Web Agent: ${cleanGoal}`,
+            runtime: runtimeInfo.runtime,
+          });
+        } catch {
+          // continue smoothly
+        }
+      }
+
+      try {
+        const res = await fetch(`${API_ORIGIN}/api/automation/agent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
+          body: JSON.stringify({ goal: cleanGoal, startUrl: cleanUrl, maxSteps: 4, deepThinking }),
+        });
+        const data = (await res.json()) as AutonomousWebAgentResult & { error?: string };
+        if (!res.ok) {
+          throw new Error(data.error || `HTTP ${res.status} autonomous agent failed`);
+        }
+
+        const resolvedStatus = data.ok ? 'completed' : 'failed';
+        setAutomationRun({
+          id: runId,
+          goal: data.goal || cleanGoal,
+          targetUrl: data.finalUrl || cleanUrl,
+          status: resolvedStatus,
+          steps: Array.isArray(data.steps) ? data.steps : [],
+          inspection: data.inspection ?? null,
+          extractedItems: Array.isArray(data.extractedItems) ? data.extractedItems : [],
+          submissionResult: data.submissionResult ?? null,
+          agentIterations: Array.isArray(data.iterations) ? data.iterations : [],
+          agentAnswer: data.answer,
+          totalDurationMs: data.totalDurationMs,
+          startedAt: Date.now(),
+        });
+
+        if (execId && user) {
+          try {
+            await finalizeExecutionLog(execId, {
+              status: resolvedStatus,
+              stepsCount: Math.max(1, data.iterations?.length || data.steps?.length || 1),
+              summary: (data.answer || cleanGoal).slice(0, 900),
+              targetUrl: data.finalUrl || cleanUrl,
+            });
+          } catch {
+            // ignore
+          }
+        }
+
+        if (data.answer) {
+          appendDialogueEntry({
+            speaker: 'shadow',
+            text: data.answer,
+            actionTag: 'autonomous-agent',
+          });
+          void handleSpeakText(data.answer);
+        }
+        finishCommandCue(
+          'automation',
+          data.ok
+            ? `Agent finished (${data.iterations?.length || 1} iterations)`
+            : 'Agent finished with issues',
+          data.ok
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Autonomous web agent failed';
+        setVoiceError(msg);
+        setAutomationRun((prev) =>
+          prev && prev.id === runId
+            ? {
+                ...prev,
+                status: 'failed',
+                agentAnswer: msg,
+                steps: prev.steps.map((s) => ({ ...s, status: 'failed', detail: msg })),
+              }
+            : prev
+        );
+        if (execId && user) {
+          void finalizeExecutionLog(execId, {
+            status: 'failed',
+            stepsCount: 1,
+            summary: msg.slice(0, 900),
+            targetUrl: cleanUrl,
+          }).catch(() => null);
+        }
+        finishCommandCue('automation', 'Autonomous agent failed', false);
+      } finally {
+        setIsAutomating(false);
+      }
+    },
+    [
+      user,
+      runtimeInfo.runtime,
+      deepThinking,
+      isToolPermitted,
+      beginCommandCue,
+      finishCommandCue,
+      showTransientCaption,
+      appendDialogueEntry,
+      handleSpeakText,
+    ]
   );
 
   const handleArrangeWindowsViaBrowserAutomation = useCallback(
@@ -3004,6 +3442,11 @@ function JarvisArcWorkspace() {
         hasActivePlugins={plugins.some((p) => p.enabled)}
         networkTelemetry={networkTelemetry}
         faceAuthLockAvailable={Boolean(faceAuthProfile && setupConfig.faceAuthEnabled)}
+        visionMode={vision.visionMode}
+        visionStream={vision.stream}
+        deepThinking={deepThinking}
+        dialogueHistory={dialogueHistory}
+        timerControlEvent={timerControlEvent}
         mediaQueue={mediaQueue}
         currentResearch={currentResearch}
         currentVisual={currentVisual}
@@ -3024,13 +3467,29 @@ function JarvisArcWorkspace() {
         }}
         onInterruptSpeech={() => playerRef.current.clear()}
         onVoiceChange={(next) => void handleVoiceChange(next)}
+        onChangeVisionMode={handleChangeVisionMode}
+        onToggleDeepThinking={setDeepThinking}
+        onClearDialogue={() => setDialogueHistory([])}
+        onTimerComplete={(label) => {
+          const msg = `${label} complete.`;
+          showTransientCaption(assistantName, msg, 7000);
+          void handleSpeakText(msg);
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            try {
+              new Notification(`${assistantName} · ${label}`, { body: msg });
+            } catch {
+              // ignore notification blocks
+            }
+          }
+        }}
+        onShelfChange={setShelfWorkspaceItems}
         onChangeReactorBrightness={setReactorBrightness}
         onSelectDrawer={setActiveDrawer}
         onSelectTrack={(track) => {
           setCurrentTrack(track);
           if (user && track.id) void updateMediaQueueStatus(track.id, 'playing');
         }}
-        onRunCommand={(cmd) => void runSpokenAction(cmd)}
+        onRunCommand={(cmd, attachment) => void runSpokenAction(cmd, attachment)}
         onOpenAiSettings={() => setAiSettingsOpen(true)}
         onOpenSetup={() => setSetupOpen(true)}
         onLockWithFace={() => {
@@ -3217,8 +3676,10 @@ function JarvisArcWorkspace() {
                 <BrowserAutomationStage
                   run={automationRun}
                   runtime={runtimeInfo.runtime}
+                  isAutomating={isAutomating}
                   onInspectUrl={(url) => void handleInspectUrl(url)}
                   onRunQuickDemo={(cmd) => void runSpokenAction(cmd)}
+                  onRunAutonomousAgent={(goal, url) => void handleRunAutonomousAgent(goal, url)}
                   onExecutePlan={(plan) => void handleExecuteAutomationPlan(plan)}
                   onClearRun={() => setAutomationRun(null)}
                   onSaveAsMacro={async (run) => {
@@ -3417,6 +3878,10 @@ function JarvisArcWorkspace() {
               ? 'OpenRouter BYOK'
               : 'AI Provider'
         }
+        visionMode={vision.visionMode}
+        onChangeVisionMode={handleChangeVisionMode}
+        deepThinking={deepThinking}
+        onToggleDeepThinking={setDeepThinking}
         onLockWithFace={() => {
           stopVoiceSession();
           setIsFaceUnlocked(false);

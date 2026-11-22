@@ -48,6 +48,7 @@ import {
   executeBrowserPlan,
   getActiveToolDeclarations,
   inspectWebPage,
+  runAutonomousWebAgent,
   synthesizeJarvisSpeech,
   type AssistantSessionContext,
 } from './server/automation.ts';
@@ -67,7 +68,7 @@ const PORT = 3000;
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '6mb' }));
 
   // The packaged desktop app (Tauri) serves the UI from the tauri:// /
   // http://tauri.localhost asset origin and calls this server on
@@ -289,6 +290,25 @@ async function startServer() {
     }
   });
 
+  // Iterative autonomous AI web agent (Inspect -> Reason -> Act -> Verify loop)
+  app.post('/api/automation/agent', async (req, res) => {
+    try {
+      const goal = String(req.body?.goal || '').trim();
+      const startUrl = String(req.body?.startUrl || req.body?.targetUrl || '').trim();
+      const maxSteps = Number(req.body?.maxSteps || 4);
+      const preferDeep = req.body?.preferDeep === true || req.body?.deepThinking === true;
+      if (!goal || !startUrl) {
+        return res.status(400).json({ ok: false, error: 'Missing goal or startUrl' });
+      }
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await runAutonomousWebAgent({ goal, startUrl, maxSteps, preferDeep, runtime });
+      return res.json(result);
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'Autonomous web agent failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
   // Text-to-speech endpoint (Gemini Flash Lite TTS -> WAV)
   app.post('/api/assistant/tts', async (req, res) => {
     try {
@@ -501,7 +521,14 @@ async function startServer() {
     if (toolName === 'manage_laptop_files' && perms.files === false) return false;
     if (toolName === 'control_laptop_apps' && perms.apps === false) return false;
     if (toolName === 'execute_terminal_command' && perms.terminal === false) return false;
-    if (toolName === 'execute_browser_automation' && perms.browser === false) return false;
+    if (
+      (toolName === 'execute_browser_automation' ||
+        toolName === 'inspect_web_page' ||
+        toolName === 'run_autonomous_web_agent') &&
+      perms.browser === false
+    ) {
+      return false;
+    }
     if (toolName === 'research_topic' && perms.research === false) return false;
     if ((toolName === 'play_youtube_media' || toolName === 'control_youtube_player') && perms.youtube === false) {
       return false;
@@ -521,13 +548,14 @@ async function startServer() {
         permissions: body.permissions ?? {},
         memories: Array.isArray(body.memories) ? body.memories.slice(0, 50) : [],
         plugins: normalizePluginDescriptors(body.plugins, 30),
+        workspace: body.workspace,
       },
       expiresAt: Date.now() + 30 * 60 * 1000,
     });
     return res.json({ ok: true, ctxId });
   });
 
-  // Natural language command endpoint (for quick-prompts, macro triggers, or text fallback with voice TTS)
+  // Natural language multi-turn & multimodal agent endpoint
   let preferLiteUntil = 0;
 
   app.post('/api/assistant/command', async (req, res) => {
@@ -535,10 +563,18 @@ async function startServer() {
       const command = String(req.body?.command || '').trim();
       const voiceName = String(req.body?.voiceName || 'Charon');
       const speak = req.body?.speak !== false;
+      const deepThinking = req.body?.deepThinking === true || req.body?.preferDeep === true;
       const context = (req.body?.context ?? undefined) as AssistantSessionContext | undefined;
-      if (!command) {
+      const rawHistory = Array.isArray(req.body?.history)
+        ? (req.body.history as Array<{ speaker?: string; text?: string }>)
+        : [];
+      const rawAttachments = Array.isArray(req.body?.attachments)
+        ? (req.body.attachments as Array<{ name?: string; mimeType?: string; dataBase64?: string }>)
+        : [];
+      if (!command && rawAttachments.length === 0) {
         return res.status(400).json({ error: 'Missing command' });
       }
+      const effectiveCommand = command || 'Analyze the attached image and summarize what you see.';
 
       const activePlugins = normalizePluginDescriptors(context?.plugins, 30).filter((p) => p.enabled);
       const pluginMap = new Map(activePlugins.map((p) => [p.toolName, p]));
@@ -553,32 +589,74 @@ async function startServer() {
       const systemInstruction = buildShadowSystemInstruction(normalizedContext);
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
 
+      // Build sanitized multi-turn conversation history + multimodal current user turn
+      const historyContents: Content[] = [];
+      for (const item of rawHistory.slice(-10)) {
+        const text = String(item?.text || '').trim().slice(0, 1200);
+        if (!text) continue;
+        const role = item?.speaker === 'shadow' ? 'model' : 'user';
+        const prev = historyContents[historyContents.length - 1];
+        if (prev && prev.role === role) {
+          prev.parts = [...(prev.parts || []), { text }];
+        } else {
+          historyContents.push({ role, parts: [{ text }] });
+        }
+      }
+      // Gemini requires history to start with a user turn if non-empty
+      while (historyContents.length > 0 && historyContents[0].role !== 'user') {
+        historyContents.shift();
+      }
+      // Ensure last history item is model so current user turn alternates cleanly
+      if (historyContents.length > 0 && historyContents[historyContents.length - 1].role === 'user') {
+        historyContents.push({ role: 'model', parts: [{ text: 'Understood.' }] });
+      }
+
+      const currentUserParts: Array<
+        { text: string } | { inlineData: { mimeType: string; data: string } }
+      > = [{ text: effectiveCommand }];
+      for (const att of rawAttachments.slice(0, 3)) {
+        const mimeType = String(att?.mimeType || '').trim();
+        const dataBase64 = String(att?.dataBase64 || '').trim();
+        if (mimeType && dataBase64 && dataBase64.length < 5_000_000) {
+          currentUserParts.push({ inlineData: { mimeType, data: dataBase64 } });
+        }
+      }
+      const initialContents: Content[] = [
+        ...historyContents,
+        { role: 'user', parts: currentUserParts },
+      ];
+
       // Shared tool executor — identical semantics for both provider paths.
       const executeToolCalls = async (
         calls: FunctionCall[]
       ): Promise<{
         actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }>;
+        traces: Array<{ id: string; name: string; summary: string; ok: boolean; durationMs: number }>;
         toolResponseParts: Array<{
           functionResponse: { id?: string; name: string; response: Record<string, unknown> };
         }>;
       }> => {
         const actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+        const traces: Array<{ id: string; name: string; summary: string; ok: boolean; durationMs: number }> = [];
         const toolResponseParts: Array<{
           functionResponse: { id?: string; name: string; response: Record<string, unknown> };
         }> = [];
 
         for (const call of calls) {
+          const startedTool = Date.now();
           const args = (call.args ?? {}) as Record<string, unknown>;
           let result: Record<string, unknown> = { ok: true };
+          let traceSummary = call.name || 'tool';
 
           if (!isToolPermitted(call.name || '', context?.permissions)) {
             result = {
               ok: false,
               permissionDenied: true,
-              error: `Permission for ${call.name} is currently disabled in laptop setup.`,
+              error: `Permission for ${call.name} is currently disabled in Setup.`,
             };
+            traceSummary = `Permission denied for ${call.name}`;
           } else if (call.name === 'play_youtube_media') {
-            const query = String(args.query || command);
+            const query = String(args.query || effectiveCommand);
             const mediaType = args.mediaType === 'song' ? 'song' : 'video';
             const results = await searchYouTube(
               query,
@@ -588,9 +666,32 @@ async function startServer() {
             );
             if (results.length > 0) {
               result = { ok: true, mediaType, selected: results[0], alternatives: results.slice(1, 4) };
+              traceSummary = `Queued "${results[0].title}"`;
             } else {
               result = { ok: false, error: `No playable YouTube videos found for "${query}".` };
+              traceSummary = `No YouTube results for ${query}`;
             }
+          } else if (call.name === 'inspect_web_page') {
+            const targetUrl = String(args.url || '');
+            const inspection = await inspectWebPage(targetUrl);
+            result = {
+              ok: inspection.statusCode >= 200 && inspection.statusCode < 400,
+              inspection,
+            };
+            traceSummary = `Inspected ${inspection.title || targetUrl} (${inspection.fields.length} fields)`;
+          } else if (call.name === 'run_autonomous_web_agent') {
+            const goal = String(args.goal || effectiveCommand);
+            const startUrl = String(args.startUrl || 'https://news.ycombinator.com');
+            const maxSteps = Number(args.maxSteps || 4);
+            const agentResult = await runAutonomousWebAgent({
+              goal,
+              startUrl,
+              maxSteps,
+              preferDeep: deepThinking,
+              runtime,
+            });
+            result = agentResult as unknown as Record<string, unknown>;
+            traceSummary = `${agentResult.iterations.length} iterations on ${agentResult.finalUrl}`;
           } else if (call.name === 'execute_browser_automation') {
             const goal = String(args.goal || 'Browser Automation');
             const targetUrl = String(args.targetUrl || '');
@@ -612,6 +713,7 @@ async function startServer() {
                 inspection,
                 requiresClientExecution: true,
               };
+              traceSummary = `Desktop layout ${goal}`;
             } else {
               const execution = await executeBrowserPlan({ goal, targetUrl, steps });
               result = {
@@ -625,11 +727,20 @@ async function startServer() {
                 totalDurationMs: execution.totalDurationMs,
                 ...(execution.error ? { error: execution.error } : {}),
               };
+              traceSummary = `${execution.steps.length} step(s) on ${execution.targetUrl}`;
             }
           } else if (call.name === 'control_youtube_player') {
             result = { ok: true, action: args.action, seconds: args.seconds ?? null };
+            traceSummary = `Player ${String(args.action || 'play')}`;
+          } else if (call.name === 'set_focus_timer') {
+            const timerAction = String(args.action || 'start');
+            const minutes = Math.min(180, Math.max(1, Number(args.minutes) || 25));
+            const label = String(args.label || 'Focus Timer').slice(0, 60);
+            result = { ok: true, action: timerAction, minutes, label };
+            traceSummary = `Timer ${timerAction}${timerAction === 'start' ? ` (${minutes}m)` : ''}`;
           } else if (call.name === 'save_voice_macro') {
             result = { ok: true, macro: args };
+            traceSummary = `Saved macro "${String(args.name || 'Macro')}"`;
           } else if (call.name === 'save_memory') {
             result = {
               ok: true,
@@ -638,22 +749,25 @@ async function startServer() {
               category: String(args.category || 'fact'),
               importance: String(args.importance || 'normal'),
             };
+            traceSummary = `Saved memory (${String(args.category || 'fact')})`;
           } else if (call.name === 'forget_memory') {
             result = {
               ok: true,
               query: String(args.query || ''),
             };
+            traceSummary = `Forgot memory matching "${String(args.query || '')}"`;
           } else if (call.name === 'research_topic') {
             const report = await runJarvisResearch({
-              query: String(args.query || command),
+              query: String(args.query || effectiveCommand),
               depth: args.depth === 'quick' ? 'quick' : 'deep',
               urls: Array.isArray(args.urls) ? args.urls.map((u) => String(u)) : [],
               runtime,
             });
             result = { ok: true, report };
+            traceSummary = `Researched ${report.sources.length} sources`;
           } else if (call.name === 'generate_visual') {
             const visualOpts: Parameters<typeof generateVisualAsset>[0] = {
-              prompt: String(args.prompt || command),
+              prompt: String(args.prompt || effectiveCommand),
               style: normalizeVisualStyle(args.style),
               aspectRatio: normalizeAspectRatio(args.aspectRatio),
             };
@@ -664,6 +778,7 @@ async function startServer() {
             }
             const visual = await generateVisualAsset(visualOpts);
             result = { ok: true, visual };
+            traceSummary = `Generated ${visual.kind}: ${visual.title}`;
           } else if (
             call.name === 'manage_laptop_files' ||
             call.name === 'control_laptop_apps' ||
@@ -675,6 +790,7 @@ async function startServer() {
               tool: call.name,
               args,
             };
+            traceSummary = `Client tool ${call.name}`;
           } else if (call.name && pluginMap.has(call.name)) {
             const plugin = pluginMap.get(call.name)!;
             if (plugin.kind === 'laptop_command') {
@@ -699,13 +815,22 @@ async function startServer() {
                   renderedCommand,
                 };
               }
+              traceSummary = `Plugin ${plugin.name}`;
             } else {
               const pluginExec = await executeHttpPlugin(plugin, args);
               result = pluginExec as unknown as Record<string, unknown>;
+              traceSummary = `${plugin.name} (${pluginExec.ok ? 'OK' : 'Failed'})`;
             }
           }
 
           actions.push({ name: call.name || 'unknown', args, result });
+          traces.push({
+            id: `trace-${Date.now()}-${traces.length}`,
+            name: call.name || 'unknown',
+            summary: traceSummary,
+            ok: result.ok !== false,
+            durationMs: Math.max(1, Date.now() - startedTool),
+          });
           toolResponseParts.push({
             functionResponse: {
               id: call.id,
@@ -715,39 +840,35 @@ async function startServer() {
           });
         }
 
-        return { actions, toolResponseParts };
+        return { actions, traces, toolResponseParts };
       };
 
       if (runtime?.provider === 'openrouter') {
-        // BYOK OpenRouter path (OpenAI-compatible tool calling)
-        const orContents: Content[] = [{ role: 'user', parts: [{ text: command }] }];
-        const firstTurn = await openRouterGenerate({
-          apiKey: runtime.apiKey,
-          model: runtime.model,
-          systemInstruction,
-          contents: orContents,
-          tools: combinedDeclarations,
-        });
-        let spokenText = firstTurn.text;
-        let actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+        const orContents: Content[] = [...initialContents];
+        let spokenText = '';
+        const actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+        const toolTraces: Array<{ id: string; name: string; summary: string; ok: boolean; durationMs: number }> = [];
 
-        if (firstTurn.functionCalls.length > 0) {
-          const executed = await executeToolCalls(firstTurn.functionCalls);
-          actions = executed.actions;
-          if (firstTurn.modelContent) {
-            const followUp = await openRouterGenerate({
-              apiKey: runtime.apiKey,
-              model: runtime.model,
-              systemInstruction,
-              contents: [...orContents, firstTurn.modelContent, { role: 'user', parts: executed.toolResponseParts }],
-              tools: combinedDeclarations,
-            });
-            spokenText = followUp.text || spokenText || 'Command executed.';
-          }
+        for (let round = 0; round < 4; round++) {
+          const turn = await openRouterGenerate({
+            apiKey: runtime.apiKey,
+            model: runtime.model,
+            systemInstruction,
+            contents: orContents,
+            tools: combinedDeclarations,
+          });
+          if (turn.text) spokenText = turn.text;
+          if (turn.functionCalls.length === 0) break;
+
+          const executed = await executeToolCalls(turn.functionCalls);
+          actions.push(...executed.actions);
+          toolTraces.push(...executed.traces);
+          if (!turn.modelContent) break;
+          orContents.push(turn.modelContent, { role: 'user', parts: executed.toolResponseParts });
         }
 
         if (!spokenText) {
-          spokenText = 'Ready.';
+          spokenText = actions.length > 0 ? 'Command executed.' : 'Ready.';
         }
 
         const companionGeminiKey = resolveCompanionGeminiKey({
@@ -761,16 +882,22 @@ async function startServer() {
         return res.json({
           spokenText,
           actions,
+          toolTraces,
+          modelUsed: runtime.model,
           audioBase64,
           audioMimeType: audioBase64 ? 'audio/wav' : null,
           provider: 'openrouter',
         });
       }
 
-      // Gemini path (server key or BYOK Gemini key)
+      // Gemini path: Gemini 4 Hydrogen with adaptive ThinkingLevel + multi-round agentic tool loop
       const ai = getGeminiClient(runtime?.apiKey);
       const models = getModelConfig();
-      const deepFirst = preferDeepCommandDefault() || req.body?.preferDeep === true;
+      const useDeepFirst =
+        deepThinking ||
+        preferDeepCommandDefault() ||
+        rawAttachments.length > 0 ||
+        rawHistory.length > 0;
 
       const runDeepTurn = (contents: Content[], retries = 0) =>
         withGeminiRetry(
@@ -781,7 +908,9 @@ async function startServer() {
               config: {
                 systemInstruction,
                 tools: [{ functionDeclarations: combinedDeclarations }],
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                thinkingConfig: {
+                  thinkingLevel: deepThinking ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
+                },
               },
             }),
           retries
@@ -801,52 +930,56 @@ async function startServer() {
           retries
         );
 
-      // Fast-first by default: quick commands no longer wait on the deep model's
-      // thinking phase. Deep model is opt-in (SHADOW_USE_DEEP_COMMAND=1 / preferDeep).
+      let activeModelLabel = models.deepText;
       const runCommandTurn = async (contents: Content[]) => {
-        if (deepFirst) {
-          if (Date.now() < preferLiteUntil) {
-            return runFastTurn(contents);
-          }
+        if (useDeepFirst || Date.now() >= preferLiteUntil) {
           try {
+            activeModelLabel = models.deepText;
             return await runDeepTurn(contents);
           } catch (err) {
             if (!isOverloadOrQuotaError(err)) throw err;
             preferLiteUntil = Date.now() + 60_000;
+            activeModelLabel = models.fastText;
             return runFastTurn(contents);
           }
         }
         try {
+          activeModelLabel = models.fastText;
           return await runFastTurn(contents);
         } catch (err) {
           if (!isOverloadOrQuotaError(err)) throw err;
-          // Fast model temporarily unavailable — one deep attempt before failing.
+          activeModelLabel = models.deepText;
           return runDeepTurn(contents);
         }
       };
 
-      const firstResponse = await runCommandTurn([{ role: 'user', parts: [{ text: command }] }]);
+      const workingContents: Content[] = [...initialContents];
+      let spokenText = '';
+      const actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+      const toolTraces: Array<{ id: string; name: string; summary: string; ok: boolean; durationMs: number }> = [];
 
-      const functionCalls = firstResponse.functionCalls ?? [];
-      let spokenText = (firstResponse.text || '').trim();
-      let actions: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }> = [];
+      for (let round = 0; round < 4; round++) {
+        const response = await runCommandTurn(workingContents);
+        const turnText = (response.text || '').trim();
+        if (turnText) spokenText = turnText;
 
-      if (functionCalls.length > 0) {
-        const executed = await executeToolCalls(functionCalls);
-        actions = executed.actions;
-        const previousContent = firstResponse.candidates?.[0]?.content;
-        if (previousContent) {
-          const followUp = await runCommandTurn([
-            { role: 'user', parts: [{ text: command }] },
-            previousContent,
-            { role: 'user', parts: executed.toolResponseParts },
-          ]);
-          spokenText = (followUp.text || spokenText || 'Command executed.').trim();
-        }
+        const calls = response.functionCalls ?? [];
+        if (calls.length === 0) break;
+
+        const executed = await executeToolCalls(calls);
+        actions.push(...executed.actions);
+        toolTraces.push(...executed.traces);
+
+        const previousContent = response.candidates?.[0]?.content;
+        if (!previousContent) break;
+        workingContents.push(previousContent, {
+          role: 'user',
+          parts: executed.toolResponseParts,
+        });
       }
 
       if (!spokenText) {
-        spokenText = 'Ready.';
+        spokenText = actions.length > 0 ? 'Command executed.' : 'Ready.';
       }
 
       const audioBase64 = speak
@@ -855,6 +988,8 @@ async function startServer() {
       return res.json({
         spokenText,
         actions,
+        toolTraces,
+        modelUsed: activeModelLabel,
         audioBase64,
         audioMimeType: audioBase64 ? 'audio/wav' : null,
         provider: 'gemini',
@@ -866,10 +1001,19 @@ async function startServer() {
     }
   });
 
+  const server = http.createServer(app);
+
   // Vite middleware or production static serving
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        ws: {
+          server,
+          path: '/__vite_hmr',
+        },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -881,10 +1025,22 @@ async function startServer() {
     });
   }
 
-  const server = http.createServer(app);
-
   // WebSocket Server for Gemini Live Voice Streaming (/ws/live)
-  const wss = new WebSocketServer({ server, path: '/ws/live' });
+  // Uses noServer so it shares the HTTP server cleanly alongside Vite's /__vite_hmr WS handler.
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    try {
+      const pathname = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
+      if (pathname === '/ws/live') {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit('connection', ws, req);
+        });
+      }
+    } catch {
+      socket.destroy();
+    }
+  });
 
   wss.on('connection', async (clientWs: WebSocket, req) => {
     const reqUrl = new URL(req.url || '/ws/live', `http://${req.headers.host || 'localhost'}`);
@@ -1138,6 +1294,30 @@ async function startServer() {
                         ...(execution.error ? { error: execution.error } : {}),
                       };
                     }
+                  } else if (call.name === 'inspect_web_page') {
+                    const targetUrl = String(args.url || '');
+                    const inspection = await inspectWebPage(targetUrl);
+                    result = {
+                      ok: inspection.statusCode >= 200 && inspection.statusCode < 400,
+                      inspection,
+                    };
+                  } else if (call.name === 'run_autonomous_web_agent') {
+                    const agentRes = await runAutonomousWebAgent({
+                      goal: String(args.goal || ''),
+                      startUrl: String(args.startUrl || 'https://news.ycombinator.com'),
+                      maxSteps: Number(args.maxSteps || 4),
+                      runtime: liveGeminiKey
+                        ? { provider: 'gemini', apiKey: liveGeminiKey, model: '', byok: true }
+                        : undefined,
+                    });
+                    result = agentRes as unknown as Record<string, unknown>;
+                  } else if (call.name === 'set_focus_timer') {
+                    result = {
+                      ok: true,
+                      action: String(args.action || 'start'),
+                      minutes: Math.min(180, Math.max(1, Number(args.minutes) || 25)),
+                      label: String(args.label || 'Focus Timer').slice(0, 60),
+                    };
                   } else if (call.name === 'control_youtube_player') {
                     result = { ok: true, action: args.action, seconds: args.seconds ?? null };
                   } else if (call.name === 'save_voice_macro') {
@@ -1277,6 +1457,7 @@ async function startServer() {
         const msg = JSON.parse(raw) as {
           type?: string;
           data?: string;
+          mimeType?: string;
           text?: string;
           callId?: string;
           result?: Record<string, unknown>;
@@ -1285,8 +1466,14 @@ async function startServer() {
           session.sendRealtimeInput({
             audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
           });
+        } else if (msg.type === 'video' && msg.data) {
+          session.sendRealtimeInput({
+            video: { data: msg.data, mimeType: msg.mimeType || 'image/jpeg' },
+          });
         } else if (msg.type === 'text' && msg.text) {
           session.sendRealtimeInput({ text: msg.text });
+        } else if (msg.type === 'context_note' && msg.text) {
+          session.sendRealtimeInput({ text: `[Workspace Context Update] ${msg.text}` });
         } else if (msg.type === 'client_tool_response' && msg.callId) {
           const pending = pendingClientTools.get(msg.callId);
           if (pending) {
