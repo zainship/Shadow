@@ -20,7 +20,6 @@ import {
   Lock,
   Mic,
   MicOff,
-  Monitor,
   Play,
   Settings2,
   SlidersHorizontal,
@@ -308,16 +307,6 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
         activeDrawer === 'plugins'
           ? 'bg-gradient-to-b from-emerald-400 to-teal-600 text-slate-950 shadow-[0_8px_20px_rgba(16,185,129,0.4),inset_0_1px_0_rgba(255,255,255,0.45)]'
           : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-emerald-300 border border-white/10 hover:border-emerald-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
-    },
-    {
-      id: 'tauri',
-      label: 'Desktop App',
-      icon: <Monitor className="w-5 h-5" />,
-      running: agentConnected,
-      accentClass:
-        activeDrawer === 'tauri'
-          ? 'bg-gradient-to-b from-slate-200 to-slate-400 text-slate-950 shadow-[0_8px_20px_rgba(226,232,240,0.3),inset_0_1px_0_rgba(255,255,255,0.7)]'
-          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-slate-200 border border-white/10 hover:border-white/30 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
     },
   ];
 

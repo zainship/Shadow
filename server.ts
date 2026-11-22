@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express from 'express';
 import fs from 'node:fs';
 import http from 'http';
@@ -44,8 +45,9 @@ import {
 import {
   buildDesktopLayoutInspection,
   buildShadowSystemInstruction,
+  executeBrowserPlan,
+  getActiveToolDeclarations,
   inspectWebPage,
-  jarvisToolDeclarations,
   synthesizeJarvisSpeech,
   type AssistantSessionContext,
 } from './server/automation.ts';
@@ -94,6 +96,70 @@ async function startServer() {
   // Health endpoint
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'shadow-desktop-server' });
+  });
+
+  // Short-lived loopback OAuth handoff for the packaged Tauri desktop shell
+  const desktopAuthSessions = new Map<
+    string,
+    {
+      createdAt: number;
+      completed: boolean;
+      idToken?: string | null;
+      accessToken?: string | null;
+    }
+  >();
+
+  const pruneDesktopAuthSessions = () => {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [key, entry] of desktopAuthSessions.entries()) {
+      if (entry.createdAt < cutoff) {
+        desktopAuthSessions.delete(key);
+      }
+    }
+  };
+
+  app.post('/api/desktop-auth/session', (_req, res) => {
+    pruneDesktopAuthSessions();
+    const nonce = crypto.randomUUID();
+    desktopAuthSessions.set(nonce, { createdAt: Date.now(), completed: false });
+    res.json({ ok: true, nonce });
+  });
+
+  app.post('/api/desktop-auth/complete', (req, res) => {
+    pruneDesktopAuthSessions();
+    const nonce = String(req.body?.nonce || '').trim();
+    const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken : null;
+    const accessToken = typeof req.body?.accessToken === 'string' ? req.body.accessToken : null;
+    const session = desktopAuthSessions.get(nonce);
+    if (!session) {
+      return res.status(404).json({ ok: false, error: 'Desktop sign-in session expired. Click Sign In again.' });
+    }
+    if (!idToken && !accessToken) {
+      return res.status(400).json({ ok: false, error: 'Missing Google OAuth token.' });
+    }
+    session.completed = true;
+    session.idToken = idToken;
+    session.accessToken = accessToken;
+    return res.json({ ok: true });
+  });
+
+  app.get('/api/desktop-auth/session/:nonce', (req, res) => {
+    pruneDesktopAuthSessions();
+    const nonce = String(req.params.nonce || '').trim();
+    const session = desktopAuthSessions.get(nonce);
+    if (!session) {
+      return res.status(404).json({ ok: false, status: 'expired' });
+    }
+    if (!session.completed) {
+      return res.json({ ok: true, status: 'pending' });
+    }
+    desktopAuthSessions.delete(nonce);
+    return res.json({
+      ok: true,
+      status: 'completed',
+      idToken: session.idToken || null,
+      accessToken: session.accessToken || null,
+    });
   });
 
   // Server AI configuration status (booleans only, never returns secret values)
@@ -203,6 +269,23 @@ async function startServer() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Page inspection failed';
       return res.status(500).json({ error: msg });
+    }
+  });
+
+  // Real multi-step HTTP/DOM browser automation executor
+  app.post('/api/automation/execute', async (req, res) => {
+    try {
+      const goal = String(req.body?.goal || 'Browser Automation').trim();
+      const targetUrl = String(req.body?.targetUrl || '').trim();
+      const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
+      if (!targetUrl && steps.length === 0) {
+        return res.status(400).json({ ok: false, error: 'Missing targetUrl or steps' });
+      }
+      const execution = await executeBrowserPlan({ goal, targetUrl, steps });
+      return res.json(execution);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Browser automation failed';
+      return res.status(500).json({ ok: false, error: msg });
     }
   });
 
@@ -460,7 +543,7 @@ async function startServer() {
       const activePlugins = normalizePluginDescriptors(context?.plugins, 30).filter((p) => p.enabled);
       const pluginMap = new Map(activePlugins.map((p) => [p.toolName, p]));
       const combinedDeclarations = [
-        ...jarvisToolDeclarations,
+        ...getActiveToolDeclarations(context?.permissions),
         ...buildPluginToolDeclarations(activePlugins),
       ];
       const normalizedContext: AssistantSessionContext = {
@@ -509,6 +592,7 @@ async function startServer() {
               result = { ok: false, error: `No playable YouTube videos found for "${query}".` };
             }
           } else if (call.name === 'execute_browser_automation') {
+            const goal = String(args.goal || 'Browser Automation');
             const targetUrl = String(args.targetUrl || '');
             const steps = Array.isArray(args.steps) ? args.steps : [];
             const hasArrangeStep = steps.some(
@@ -518,21 +602,30 @@ async function startServer() {
                 String((s as Record<string, unknown>).action || '').toLowerCase() === 'arrange_windows'
             );
             const isDesktopLayout = targetUrl.toLowerCase().startsWith('desktop://') || hasArrangeStep;
-            const inspection = targetUrl.toLowerCase().startsWith('desktop://')
-              ? buildDesktopLayoutInspection(steps, targetUrl)
-              : targetUrl
-                ? await inspectWebPage(targetUrl)
-                : isDesktopLayout
-                  ? buildDesktopLayoutInspection(steps, 'desktop://window-layout')
-                  : null;
-            result = {
-              ok: true,
-              goal: args.goal,
-              targetUrl: inspection?.finalUrl || targetUrl || 'desktop://window-layout',
-              steps,
-              inspection,
-              requiresClientExecution: isDesktopLayout,
-            };
+            if (isDesktopLayout) {
+              const inspection = buildDesktopLayoutInspection(steps, targetUrl || 'desktop://window-layout');
+              result = {
+                ok: true,
+                goal,
+                targetUrl: inspection.finalUrl,
+                steps,
+                inspection,
+                requiresClientExecution: true,
+              };
+            } else {
+              const execution = await executeBrowserPlan({ goal, targetUrl, steps });
+              result = {
+                ok: execution.ok,
+                goal: execution.goal,
+                targetUrl: execution.targetUrl,
+                steps: execution.steps,
+                inspection: execution.inspection,
+                extractedItems: execution.extractedItems,
+                submissionResult: execution.submissionResult,
+                totalDurationMs: execution.totalDurationMs,
+                ...(execution.error ? { error: execution.error } : {}),
+              };
+            }
           } else if (call.name === 'control_youtube_player') {
             result = { ok: true, action: args.action, seconds: args.seconds ?? null };
           } else if (call.name === 'save_voice_macro') {
@@ -904,7 +997,7 @@ async function startServer() {
       );
       const pluginMap = new Map(activePlugins.map((p) => [p.toolName, p]));
       const liveToolDeclarations = [
-        ...jarvisToolDeclarations,
+        ...getActiveToolDeclarations(sessionContext?.permissions),
         ...buildPluginToolDeclarations(activePlugins),
       ];
       const liveModel = getModelConfig().live;
@@ -998,6 +1091,7 @@ async function startServer() {
                       result = { ok: false, error: `No YouTube results found for ${query}` };
                     }
                   } else if (call.name === 'execute_browser_automation') {
+                    const goal = String(args.goal || 'Browser Automation');
                     const targetUrl = String(args.targetUrl || '');
                     const steps = Array.isArray(args.steps) ? args.steps : [];
                     const hasArrangeStep = steps.some(
@@ -1009,35 +1103,41 @@ async function startServer() {
                     );
                     const isDesktopLayout =
                       targetUrl.toLowerCase().startsWith('desktop://') || hasArrangeStep;
-                    const inspection = targetUrl.toLowerCase().startsWith('desktop://')
-                      ? buildDesktopLayoutInspection(steps, targetUrl)
-                      : targetUrl
-                        ? await inspectWebPage(targetUrl)
-                        : isDesktopLayout
-                          ? buildDesktopLayoutInspection(steps, 'desktop://window-layout')
-                          : null;
 
-                    let clientExecuted = false;
-                    let agentResult: Record<string, unknown> | null = null;
                     if (isDesktopLayout) {
-                      agentResult = await requestClientToolExecution('execute_browser_automation', {
-                        goal: args.goal,
+                      const inspection = buildDesktopLayoutInspection(
+                        steps,
+                        targetUrl || 'desktop://window-layout'
+                      );
+                      const agentResult = await requestClientToolExecution('execute_browser_automation', {
+                        goal,
                         targetUrl: targetUrl || 'desktop://window-layout',
                         steps,
                       });
-                      clientExecuted = true;
+                      result = {
+                        ok: Boolean(agentResult.ok),
+                        goal,
+                        targetUrl: inspection.finalUrl,
+                        steps,
+                        inspection,
+                        clientExecuted: true,
+                        agentResult,
+                        error: !agentResult.ok ? agentResult.error : undefined,
+                      };
+                    } else {
+                      const execution = await executeBrowserPlan({ goal, targetUrl, steps });
+                      result = {
+                        ok: execution.ok,
+                        goal: execution.goal,
+                        targetUrl: execution.targetUrl,
+                        steps: execution.steps,
+                        inspection: execution.inspection,
+                        extractedItems: execution.extractedItems,
+                        submissionResult: execution.submissionResult,
+                        totalDurationMs: execution.totalDurationMs,
+                        ...(execution.error ? { error: execution.error } : {}),
+                      };
                     }
-
-                    result = {
-                      ok: agentResult ? Boolean(agentResult.ok) : true,
-                      goal: args.goal,
-                      targetUrl: inspection?.finalUrl || targetUrl || 'desktop://window-layout',
-                      steps,
-                      inspection,
-                      clientExecuted,
-                      agentResult,
-                      error: agentResult && !agentResult.ok ? agentResult.error : undefined,
-                    };
                   } else if (call.name === 'control_youtube_player') {
                     result = { ok: true, action: args.action, seconds: args.seconds ?? null };
                   } else if (call.name === 'save_voice_macro') {

@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import {
+  GoogleAuthProvider,
+  getRedirectResult,
+  onAuthStateChanged,
+  signInWithCredential,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+  type User,
+} from 'firebase/auth';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
   Blocks,
@@ -33,6 +42,7 @@ import {
 } from './components/MacWindowShell';
 import { MorningBriefStage } from './components/MorningBriefStage';
 import { PluginsStage, type PluginActivityLog } from './components/PluginsStage';
+import { PWAInstallButton } from './components/PWAInstallButton';
 import { ResearchStage } from './components/ResearchStage';
 import { VisualsStage } from './components/VisualsStage';
 import {
@@ -101,6 +111,7 @@ import {
   ensureDesktopBackendServer,
   executeLaptopTool,
   invokeDesktopBrowserAutomation,
+  invokeDesktopOpenUrl,
   type DesktopRuntimeInfo,
 } from './lib/tauriBridge';
 import { requestNativeOsPermission } from './lib/osPermissions';
@@ -118,10 +129,13 @@ import {
   LaptopPermissionModal,
   type LaptopPermissionRequest,
 } from './components/LaptopPermissionModal';
+import { useNetworkTelemetry } from './hooks/useNetworkTelemetry';
 import type {
   AssistantMemory,
+  AutomationExtractedItem,
   AutomationRunState,
   AutomationStep,
+  AutomationSubmissionResult,
   AutomationWorkflow,
   CommandExecution,
   FaceAuthProfile,
@@ -382,6 +396,7 @@ function JarvisArcWorkspace() {
   const jarvisTranscriptBufRef = useRef<string>('');
   const captionTimerRef = useRef<number | null>(null);
   const spaceHoldActiveRef = useRef<boolean>(false);
+  const desktopAuthPollRef = useRef<number | null>(null);
   const sessionUnlockedOnceRef = useRef<boolean>(false);
   const clapListenerRef = useRef<StandbyClapListener>(new StandbyClapListener());
   const mutedClapAnalyzerRef = useRef<DoubleClapAnalyzer>(new DoubleClapAnalyzer());
@@ -400,7 +415,7 @@ function JarvisArcWorkspace() {
   assistantNameRef.current = assistantName;
 
   useEffect(() => {
-    document.title = `${assistantName} — Voice Desktop & Browser Assistant`;
+    document.title = `${assistantName} — Voice & Browser Automation PWA`;
   }, [assistantName]);
 
   const beginCommandCue = useCallback((kind: ReactorCommandKind, label: string) => {
@@ -588,6 +603,11 @@ function JarvisArcWorkspace() {
     let unsubMemories: (() => void) | null = null;
     let unsubPlugins: (() => void) | null = null;
 
+    void getRedirectResult(auth).catch((err) => {
+      const msg = err instanceof Error ? err.message : '';
+      if (msg) setAuthError(msg);
+    });
+
     const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
       if (unsubWorkflows) unsubWorkflows();
       if (unsubExecutions) unsubExecutions();
@@ -606,6 +626,11 @@ function JarvisArcWorkspace() {
       setAuthReady(true);
 
       if (nextUser) {
+        if (desktopAuthPollRef.current) {
+          window.clearInterval(desktopAuthPollRef.current);
+          desktopAuthPollRef.current = null;
+        }
+        setAuthError(null);
         try {
           const profile = await ensureUserProfile(nextUser);
           if (profile.voiceName) setVoiceName(profile.voiceName);
@@ -1073,7 +1098,17 @@ function JarvisArcWorkspace() {
       rawSteps: AutomationStep[],
       inspection: PageInspectionResult | null,
       transcript: string,
-      options?: { skipClientInvocation?: boolean; gap?: number }
+      options?: {
+        skipClientInvocation?: boolean;
+        gap?: number;
+        preExecuted?: {
+          steps?: StepExecutionState[];
+          extractedItems?: AutomationExtractedItem[];
+          submissionResult?: AutomationSubmissionResult | null;
+          totalDurationMs?: number;
+          ok?: boolean;
+        };
+      }
     ) => {
       setIsAutomating(true);
       setActiveDrawer('automation');
@@ -1084,12 +1119,12 @@ function JarvisArcWorkspace() {
           : [
               {
                 action: 'navigate',
-                selector: 'body',
+                selector: 'document',
                 value: targetUrl,
                 description: `Open ${targetUrl}`,
               },
             ];
-      const steps: StepExecutionState[] = baseSteps.map((s) => ({
+      const initialSteps: StepExecutionState[] = baseSteps.map((s) => ({
         ...s,
         status: 'pending',
       }));
@@ -1100,8 +1135,10 @@ function JarvisArcWorkspace() {
         goal,
         targetUrl,
         status: 'running',
-        steps,
+        steps: initialSteps,
         inspection,
+        extractedItems: [],
+        submissionResult: null,
         startedAt: Date.now(),
       });
 
@@ -1112,7 +1149,7 @@ function JarvisArcWorkspace() {
             transcript: transcript || goal,
             intent: 'browser_automation',
             targetUrl,
-            stepsCount: steps.length,
+            stepsCount: initialSteps.length,
             summary: goal,
             runtime: runtimeInfo.runtime,
           });
@@ -1127,7 +1164,17 @@ function JarvisArcWorkspace() {
       const canReachLaptop =
         runtimeInfo.isTauri || (agentHealth.reachable && agentHealth.authenticated);
 
-      let tauriOk = true;
+      let execOk = true;
+      let resolvedSteps: StepExecutionState[] = initialSteps.map((s) => ({
+        ...s,
+        status: 'completed',
+      }));
+      let resolvedInspection: PageInspectionResult | null = inspection;
+      let resolvedExtracted: AutomationExtractedItem[] = options?.preExecuted?.extractedItems || [];
+      let resolvedSubmission: AutomationSubmissionResult | null =
+        options?.preExecuted?.submissionResult ?? null;
+      let resolvedDuration: number | undefined = options?.preExecuted?.totalDurationMs;
+
       if (!options?.skipClientInvocation && canReachLaptop && (runtimeInfo.isTauri || isDesktopLayout)) {
         try {
           const tauriRes = await invokeDesktopBrowserAutomation({
@@ -1136,77 +1183,107 @@ function JarvisArcWorkspace() {
             steps: baseSteps,
             gap: options?.gap,
           });
-          tauriOk = tauriRes.executedInDesktop;
-          if (isDesktopLayout) {
-            setLaptopActions((prev) => [
-              {
-                id: `lap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                tool: 'execute_browser_automation',
-                summary: goal,
-                ok: tauriRes.executedInDesktop,
-                output: tauriRes.stdout || tauriRes.stderr || goal,
-                timestamp: Date.now(),
-                runtime: runtimeInfo.isTauri ? 'tauri-native' : 'laptop-agent',
-              },
-              ...prev.slice(0, 24),
-            ]);
-          }
+          execOk = tauriRes.executedInDesktop;
         } catch {
-          tauriOk = false;
+          execOk = false;
         }
-      }
-
-      for (let i = 0; i < steps.length; i++) {
+      } else if (options?.preExecuted?.steps && options.preExecuted.steps.length > 0) {
+        resolvedSteps = options.preExecuted.steps;
+        execOk = options.preExecuted.ok !== false;
+      } else if (!isDesktopLayout) {
+        // Mark first step as actively running while server engine executes real HTTP/DOM steps
         setAutomationRun((prev) => {
           if (!prev || prev.id !== runId) return prev;
           return {
             ...prev,
             steps: prev.steps.map((st, idx) =>
-              idx === i ? { ...st, status: 'running' as const } : st
+              idx === 0 ? { ...st, status: 'running' as const } : st
             ),
           };
         });
 
-        await new Promise((r) => setTimeout(r, 360));
+        try {
+          const execRes = await fetch(`${API_ORIGIN}/api/automation/execute`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ goal, targetUrl, steps: baseSteps }),
+          });
+          const data = (await execRes.json()) as {
+            ok?: boolean;
+            targetUrl?: string;
+            steps?: StepExecutionState[];
+            inspection?: PageInspectionResult | null;
+            extractedItems?: AutomationExtractedItem[];
+            submissionResult?: AutomationSubmissionResult | null;
+            totalDurationMs?: number;
+            error?: string;
+          };
+          if (!execRes.ok) {
+            throw new Error(data.error || 'Automation execution failed');
+          }
+          execOk = data.ok !== false;
+          if (Array.isArray(data.steps) && data.steps.length > 0) {
+            resolvedSteps = data.steps;
+          }
+          if (data.inspection !== undefined) {
+            resolvedInspection = data.inspection;
+          }
+          resolvedExtracted = Array.isArray(data.extractedItems) ? data.extractedItems : [];
+          resolvedSubmission = data.submissionResult ?? null;
+          resolvedDuration = data.totalDurationMs;
+          if (data.error && !execOk) {
+            setVoiceError(data.error);
+          }
+        } catch (err) {
+          execOk = false;
+          const msg = err instanceof Error ? err.message : 'Browser automation failed';
+          setVoiceError(msg);
+          resolvedSteps = initialSteps.map((st, idx) =>
+            idx === 0 ? { ...st, status: 'failed', detail: msg } : { ...st, status: 'failed' }
+          );
+        }
+      }
 
-        const step = steps[i];
+      // Smoothly reveal real step results in the timeline
+      for (let i = 0; i < resolvedSteps.length; i++) {
+        setAutomationRun((prev) => {
+          if (!prev || prev.id !== runId) return prev;
+          return {
+            ...prev,
+            steps: prev.steps.map((st, idx) =>
+              idx === i ? { ...resolvedSteps[i], status: 'running' as const } : st
+            ),
+          };
+        });
+
+        await new Promise((r) => setTimeout(r, 140));
+
         setAutomationRun((prev) => {
           if (!prev || prev.id !== runId) return prev;
           const updatedSteps = prev.steps.map((st, idx) =>
-            idx === i ? { ...st, status: 'completed' as const } : st
+            idx === i ? resolvedSteps[i] : st
           );
-
-          let updatedInspection = prev.inspection;
-          if (updatedInspection && step.action === 'fill' && step.value) {
-            const selLower = step.selector.toLowerCase();
-            const descLower = step.description.toLowerCase();
-            let matched = false;
-            const newFields = updatedInspection.fields.map((f) => {
-              const fieldMatches =
-                (f.selector && f.selector.toLowerCase() === selLower) ||
-                (f.name && selLower.includes(f.name.toLowerCase())) ||
-                (f.id && selLower.includes(f.id.toLowerCase())) ||
-                (f.label && descLower.includes(f.label.toLowerCase()));
-              if (fieldMatches && !matched) {
-                matched = true;
-                return { ...f, filledValue: step.value };
-              }
-              return f;
-            });
-            updatedInspection = { ...updatedInspection, fields: newFields };
-          }
-
           return {
             ...prev,
             steps: updatedSteps,
-            inspection: updatedInspection,
           };
         });
       }
 
-      const finalStatus = tauriOk ? 'completed' : 'failed';
+      const finalStatus = execOk ? 'completed' : 'failed';
       setAutomationRun((prev) =>
-        prev && prev.id === runId ? { ...prev, status: finalStatus } : prev
+        prev && prev.id === runId
+          ? {
+              ...prev,
+              status: finalStatus,
+              targetUrl: resolvedInspection?.finalUrl || targetUrl,
+              steps: resolvedSteps,
+              inspection: resolvedInspection,
+              extractedItems: resolvedExtracted,
+              submissionResult: resolvedSubmission,
+              totalDurationMs: resolvedDuration,
+            }
+          : prev
       );
       setIsAutomating(false);
 
@@ -1214,9 +1291,9 @@ function JarvisArcWorkspace() {
         try {
           await finalizeExecutionLog(execId, {
             status: finalStatus,
-            stepsCount: steps.length,
-            summary: `${goal} (${steps.length} steps)`,
-            targetUrl: inspection?.finalUrl || targetUrl,
+            stepsCount: resolvedSteps.length,
+            summary: `${goal} (${resolvedSteps.length} steps)`,
+            targetUrl: resolvedInspection?.finalUrl || targetUrl,
           });
         } catch {
           // ignore
@@ -1224,6 +1301,24 @@ function JarvisArcWorkspace() {
       }
     },
     [user, runtimeInfo, agentHealth.reachable, agentHealth.authenticated]
+  );
+
+  const handleExecuteAutomationPlan = useCallback(
+    async (plan: { goal: string; targetUrl: string; steps: AutomationStep[] }) => {
+      if (!isToolPermitted('execute_browser_automation')) {
+        setVoiceError('Browser Automation permission is disabled in Setup.');
+        return;
+      }
+      beginCommandCue('automation', `Automating: ${plan.goal.slice(0, 44)}`);
+      try {
+        await runAutomationSequence(plan.goal, plan.targetUrl, plan.steps, null, plan.goal);
+        finishCommandCue('automation', plan.goal.slice(0, 48), true);
+      } catch (err) {
+        finishCommandCue('automation', 'Automation failed', false);
+        setVoiceError(err instanceof Error ? err.message : 'Browser automation failed');
+      }
+    },
+    [isToolPermitted, beginCommandCue, finishCommandCue, runAutomationSequence]
   );
 
   const handleToolAction = useCallback(
@@ -1234,12 +1329,28 @@ function JarvisArcWorkspace() {
       transcript = ''
     ) => {
       if (name === 'execute_browser_automation') {
-        const goal = String(args.goal || 'Browser Automation');
+        const goal = String(result.goal || args.goal || 'Browser Automation');
         const targetUrl = String(result.targetUrl || args.targetUrl || 'https://news.ycombinator.com');
-        const steps = (Array.isArray(result.steps) ? result.steps : args.steps || []) as AutomationStep[];
+        const steps = (Array.isArray(result.steps) ? result.steps : args.steps || []) as StepExecutionState[];
         const inspection = (result.inspection as PageInspectionResult | null) ?? null;
+        const extractedItems = Array.isArray(result.extractedItems)
+          ? (result.extractedItems as AutomationExtractedItem[])
+          : [];
+        const submissionResult =
+          (result.submissionResult as AutomationSubmissionResult | null | undefined) ?? null;
+        const totalDurationMs =
+          typeof result.totalDurationMs === 'number' ? result.totalDurationMs : undefined;
         await runAutomationSequence(goal, targetUrl, steps, inspection, transcript || goal, {
           skipClientInvocation: Boolean(result.clientExecuted),
+          preExecuted: steps.some((s) => s.status && s.status !== 'pending')
+            ? {
+                steps,
+                extractedItems,
+                submissionResult,
+                totalDurationMs,
+                ok: result.ok !== false,
+              }
+            : undefined,
         });
       } else if (name === 'play_youtube_media') {
         const selected = result.selected as YouTubeTrack | undefined;
@@ -1924,6 +2035,7 @@ function JarvisArcWorkspace() {
     return () => {
       if (cueTimerRef.current) window.clearTimeout(cueTimerRef.current);
       if (captionTimerRef.current) window.clearTimeout(captionTimerRef.current);
+      if (desktopAuthPollRef.current) window.clearInterval(desktopAuthPollRef.current);
       clapListenerRef.current.stop();
       stopVoiceSession();
       playerRef.current.dispose();
@@ -2191,31 +2303,41 @@ function JarvisArcWorkspace() {
       }
       setActiveDrawer('automation');
       beginCommandCue('automation', `Inspecting: ${url.slice(0, 44)}`);
+      const started = performance.now();
       try {
         const res = await fetch(`${API_ORIGIN}/api/automation/inspect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
         });
-        const inspection = (await res.json()) as PageInspectionResult;
+        const payload = (await res.json()) as PageInspectionResult & { error?: string };
+        if (!res.ok || payload.error) {
+          throw new Error(payload.error || `HTTP ${res.status} inspecting ${url}`);
+        }
+        const elapsedMs = Math.max(1, Math.round(performance.now() - started));
         setAutomationRun({
           id: `inspect-${Date.now()}`,
-          goal: `Inspect ${inspection.title || url}`,
-          targetUrl: inspection.finalUrl || url,
+          goal: `Inspect ${payload.title || url}`,
+          targetUrl: payload.finalUrl || url,
           status: 'completed',
           steps: [
             {
               action: 'navigate',
               selector: 'document',
-              value: inspection.finalUrl || url,
-              description: `Loaded ${inspection.title || url}`,
+              value: payload.finalUrl || url,
+              description: `Loaded ${payload.title || url}`,
               status: 'completed',
+              durationMs: elapsedMs,
+              detail: `HTTP ${payload.statusCode} · ${payload.fields.length} field(s), ${payload.links.length} link(s)`,
             },
           ],
-          inspection,
+          inspection: payload,
+          extractedItems: [],
+          submissionResult: null,
+          totalDurationMs: elapsedMs,
           startedAt: Date.now(),
         });
-        finishCommandCue('automation', `Inspected ${inspection.title || url}`, true);
+        finishCommandCue('automation', `Inspected ${payload.title || url}`, true);
       } catch (err) {
         finishCommandCue('automation', 'Page inspection failed', false);
         setVoiceError(err instanceof Error ? err.message : 'Inspection failed');
@@ -2498,9 +2620,101 @@ function JarvisArcWorkspace() {
 
   const handleSignIn = async () => {
     setAuthError(null);
+
+    if (runtimeInfo.isTauri) {
+      try {
+        await ensureDesktopBackendServer();
+        const startRes = await fetch(`${API_ORIGIN}/api/desktop-auth/session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const startData = (await startRes.json()) as { ok?: boolean; nonce?: string; error?: string };
+        if (!startRes.ok || !startData.nonce) {
+          throw new Error(startData.error || 'Local Shadow server is unavailable for Sign-In.');
+        }
+
+        const nonce = startData.nonce;
+        const authUrl = `http://localhost:3000/?desktopAuth=${encodeURIComponent(nonce)}`;
+        const opened = await invokeDesktopOpenUrl(authUrl);
+        if (!opened) {
+          throw new Error('Could not open your system browser for Google Sign-In.');
+        }
+
+        showTransientCaption(assistantNameRef.current, 'Finish Google Sign-In in your browser...', 6000);
+
+        if (desktopAuthPollRef.current) {
+          window.clearInterval(desktopAuthPollRef.current);
+          desktopAuthPollRef.current = null;
+        }
+
+        const startedAt = Date.now();
+        desktopAuthPollRef.current = window.setInterval(async () => {
+          if (Date.now() - startedAt > 150000) {
+            if (desktopAuthPollRef.current) {
+              window.clearInterval(desktopAuthPollRef.current);
+              desktopAuthPollRef.current = null;
+            }
+            setAuthError('Google Sign-In timed out. Click Sign In to try again.');
+            return;
+          }
+          try {
+            const pollRes = await fetch(`${API_ORIGIN}/api/desktop-auth/session/${encodeURIComponent(nonce)}`);
+            if (pollRes.status === 404) {
+              if (desktopAuthPollRef.current) {
+                window.clearInterval(desktopAuthPollRef.current);
+                desktopAuthPollRef.current = null;
+              }
+              return;
+            }
+            const pollData = (await pollRes.json()) as {
+              status?: string;
+              idToken?: string | null;
+              accessToken?: string | null;
+            };
+            if (pollData.status === 'completed') {
+              if (desktopAuthPollRef.current) {
+                window.clearInterval(desktopAuthPollRef.current);
+                desktopAuthPollRef.current = null;
+              }
+              const cred = GoogleAuthProvider.credential(
+                pollData.idToken ?? null,
+                pollData.accessToken ?? null
+              );
+              await signInWithCredential(auth, cred);
+              showTransientCaption(assistantNameRef.current, 'Signed in with Google.', 3500);
+            }
+          } catch {
+            // Transient poll error; keep polling until timeout
+          }
+        }, 1200);
+        return;
+      } catch (err) {
+        setAuthError(err instanceof Error ? err.message : 'Desktop Google Sign-In failed.');
+        return;
+      }
+    }
+
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
+      const code =
+        typeof err === 'object' && err && 'code' in err ? String((err as { code?: string }).code) : '';
+      if (code === 'auth/popup-blocked') {
+        const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+        if (!inIframe) {
+          try {
+            await signInWithRedirect(auth, googleProvider);
+            return;
+          } catch (redirectErr) {
+            setAuthError(
+              redirectErr instanceof Error ? redirectErr.message : 'Google Sign-In failed.'
+            );
+            return;
+          }
+        }
+        setAuthError('Popup was blocked by your browser. Allow popups for this tab and try Sign In again.');
+        return;
+      }
       setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed');
     }
   };
@@ -2660,6 +2874,17 @@ function JarvisArcWorkspace() {
                               : 'Click Core or Press Speak'
                           : 'Click Core or Press Speak';
 
+  const isAppActive =
+    isConnected ||
+    isConnecting ||
+    isAssistantSpeaking ||
+    isResearching ||
+    isGeneratingVisual ||
+    isAutomating ||
+    Boolean(commandCue?.active);
+
+  const networkTelemetry = useNetworkTelemetry(isAppActive);
+
   const briefPending = Boolean(
     briefToday && briefToday.date === todayKey() && briefSeenDate !== briefToday.date
   );
@@ -2696,6 +2921,14 @@ function JarvisArcWorkspace() {
         </motion.button>
 
         <div className="pointer-events-auto flex items-center gap-2 shrink-0">
+          {!networkTelemetry.isOnline && (
+            <span className="px-2.5 py-1 rounded-lg border border-rose-400/35 bg-rose-500/15 text-[11px] font-medium text-rose-200 whitespace-nowrap shrink-0">
+              Offline
+            </span>
+          )}
+
+          <PWAInstallButton />
+
           <motion.button
             type="button"
             whileHover={prefersReduced ? undefined : { scale: 1.03 }}
@@ -2769,7 +3002,7 @@ function JarvisArcWorkspace() {
               : 'Server Default'
         }
         hasActivePlugins={plugins.some((p) => p.enabled)}
-        agentConnected={(agentHealth.reachable && agentHealth.authenticated) || runtimeInfo.isTauri}
+        networkTelemetry={networkTelemetry}
         faceAuthLockAvailable={Boolean(faceAuthProfile && setupConfig.faceAuthEnabled)}
         mediaQueue={mediaQueue}
         currentResearch={currentResearch}
@@ -2844,27 +3077,6 @@ function JarvisArcWorkspace() {
             </motion.div>
           )}
         </AnimatePresence>
-
-        {(voiceError || authError) && (
-          <motion.div
-            initial={prefersReduced ? { opacity: 0 } : { opacity: 0, y: 8, scale: 0.96 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={MAC_SPRING_CONTROL}
-            className="pointer-events-auto mt-3 px-4 py-2 rounded-xl bg-rose-950/70 backdrop-blur-2xl border border-rose-400/35 text-xs text-rose-100 flex items-center gap-3 shadow-xl"
-          >
-            <span>{voiceError || authError}</span>
-            <button
-              type="button"
-              onClick={() => {
-                setVoiceError(null);
-                setAuthError(null);
-              }}
-              className="text-rose-300 underline cursor-pointer"
-            >
-              Dismiss
-            </button>
-          </motion.div>
-        )}
       </div>
 
       {/* macOS Vibrancy Glass Window Stage Overlay */}
@@ -3007,6 +3219,8 @@ function JarvisArcWorkspace() {
                   runtime={runtimeInfo.runtime}
                   onInspectUrl={(url) => void handleInspectUrl(url)}
                   onRunQuickDemo={(cmd) => void runSpokenAction(cmd)}
+                  onExecutePlan={(plan) => void handleExecuteAutomationPlan(plan)}
+                  onClearRun={() => setAutomationRun(null)}
                   onSaveAsMacro={async (run) => {
                     if (!user) {
                       await handleSignIn();
@@ -3042,19 +3256,11 @@ function JarvisArcWorkspace() {
                   onRequireAuth={() => void handleSignIn()}
                   onRunWorkflow={async (wf) => {
                     if (user) void incrementWorkflowRunCount(wf.id, wf.runCount);
-                    const inspectionRes = await fetch(`${API_ORIGIN}/api/automation/inspect`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ url: wf.targetUrl }),
-                    }).catch(() => null);
-                    const inspection = inspectionRes?.ok
-                      ? ((await inspectionRes.json()) as PageInspectionResult)
-                      : null;
                     await runAutomationSequence(
                       wf.name,
                       wf.targetUrl,
                       wf.steps,
-                      inspection,
+                      null,
                       wf.voiceTrigger
                     );
                   }}
@@ -3225,7 +3431,6 @@ function JarvisArcWorkspace() {
         initialAiSettings={aiSettings}
         existingFaceAuth={faceAuthProfile}
         onSaveAiSettings={(nextAi) => setAiSettingsState(nextAi)}
-        onConfirmPolicyChange={(confirm) => setConfirmLaptopActions(confirm)}
         onClose={() => setSetupOpen(false)}
         onComplete={async ({
           config,

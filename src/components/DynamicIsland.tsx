@@ -17,7 +17,6 @@ import {
   Lock,
   Mic,
   MicOff,
-  Monitor,
   Pause,
   Play,
   RotateCcw,
@@ -35,6 +34,7 @@ import {
 } from 'lucide-react';
 import type { ReactorCommandCue, ReactorMode } from './ArcReactorScene';
 import type { DockDrawerTab } from './IosControlDock';
+import type { NetworkTelemetry } from '../hooks/useNetworkTelemetry';
 import type {
   GeneratedVisual,
   ResearchReport,
@@ -66,7 +66,7 @@ interface DynamicIslandProps {
   isAutomating: boolean;
   briefPending: boolean;
   hasActivePlugins?: boolean;
-  agentConnected?: boolean;
+  networkTelemetry?: NetworkTelemetry;
   faceAuthLockAvailable?: boolean;
   currentTrack: YouTubeTrack | null;
   mediaQueue?: YouTubeTrack[];
@@ -256,7 +256,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   isAutomating,
   briefPending,
   hasActivePlugins = false,
-  agentConnected = false,
+  networkTelemetry,
   faceAuthLockAvailable = false,
   currentTrack,
   mediaQueue = [],
@@ -470,6 +470,17 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
     commandCue || isConnecting || isResearching || isGeneratingVisual || isAutomating
   );
 
+  const isActiveState =
+    isConnected ||
+    isConnecting ||
+    isBusyActivity ||
+    isAssistantSpeaking ||
+    Boolean(commandCue?.active);
+
+  const showNetworkStatus = Boolean(
+    networkTelemetry && (isActiveState || !networkTelemetry.isOnline)
+  );
+
   const compactKind: 'error' | 'activity' | 'voice' | 'media' | 'timer' | 'idle' = errorMessage
     ? 'error'
     : isBusyActivity
@@ -495,7 +506,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   const timerProgress = timerDuration > 0 ? (timerDuration - timerRemaining) / timerDuration : 0;
 
   const stageApps: Array<{
-    id: Exclude<DockDrawerTab, null>;
+    id: Exclude<DockDrawerTab, null> | 'setup';
     label: string;
     icon: React.ReactNode;
     running: boolean;
@@ -543,10 +554,10 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
       running: hasActivePlugins,
     },
     {
-      id: 'tauri',
-      label: 'Desktop',
-      icon: <Monitor className="w-4 h-4 text-slate-200" />,
-      running: agentConnected,
+      id: 'setup',
+      label: 'Setup',
+      icon: <Settings2 className="w-4 h-4 text-slate-200" />,
+      running: false,
     },
   ];
 
@@ -722,8 +733,36 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   </span>
                 </div>
 
-                {/* Right Region: Spectrum / Countdown / Time */}
+                {/* Right Region: Network Latency (Active) + Spectrum / Countdown / Time */}
                 <div className="flex items-center gap-2 shrink-0">
+                  {showNetworkStatus && networkTelemetry && compactKind !== 'error' && (
+                    <span
+                      title={
+                        networkTelemetry.isOnline
+                          ? `Network latency: ${networkTelemetry.latencyMs !== null ? `${networkTelemetry.latencyMs}ms` : 'connected'}`
+                          : 'Network offline'
+                      }
+                      className="inline-flex items-center gap-1 text-[10px] font-mono tabular-nums text-slate-400/90"
+                    >
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          !networkTelemetry.isOnline || networkTelemetry.quality === 'poor'
+                            ? 'bg-rose-400'
+                            : networkTelemetry.quality === 'fair'
+                              ? 'bg-amber-400'
+                              : 'bg-emerald-400'
+                        }`}
+                      />
+                      <span>
+                        {!networkTelemetry.isOnline
+                          ? 'Offline'
+                          : networkTelemetry.latencyMs !== null
+                            ? `${networkTelemetry.latencyMs}ms`
+                            : 'Live'}
+                      </span>
+                    </span>
+                  )}
+
                   {compactKind === 'error' ? (
                     <button
                       type="button"
@@ -791,9 +830,31 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                       )}
                     </span>
                     <div className="min-w-0">
-                      <p className="text-xs font-semibold text-slate-100 truncate">
-                        {assistantName}
-                      </p>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <p className="text-xs font-semibold text-slate-100 truncate">
+                          {assistantName}
+                        </p>
+                        {showNetworkStatus && networkTelemetry && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono tabular-nums text-slate-400 shrink-0">
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full ${
+                                !networkTelemetry.isOnline || networkTelemetry.quality === 'poor'
+                                  ? 'bg-rose-400'
+                                  : networkTelemetry.quality === 'fair'
+                                    ? 'bg-amber-400'
+                                    : 'bg-emerald-400'
+                              }`}
+                            />
+                            <span>
+                              {!networkTelemetry.isOnline
+                                ? 'Offline'
+                                : networkTelemetry.latencyMs !== null
+                                  ? `${networkTelemetry.latencyMs}ms`
+                                  : 'Connected'}
+                            </span>
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[11px] text-slate-400 truncate">
                         {errorMessage || commandCue?.label || statusText}
                       </p>
@@ -902,7 +963,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                     type="text"
                     value={quickCommand}
                     onChange={(e) => setQuickCommand(e.target.value)}
-                    placeholder={`Command ${assistantName} (e.g. research AI chips, open VS Code)...`}
+                    placeholder={`Command ${assistantName} (e.g. fill form on httpbin, extract Hacker News)...`}
                     className="w-full pl-8 pr-9 py-2 rounded-xl bg-black/45 border border-white/[0.09] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-400/55 focus:bg-black/60 transition-all"
                   />
                   <button
@@ -1143,10 +1204,10 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                               },
                             },
                             {
-                              label: 'Desktop Control',
-                              icon: <Monitor className="w-3.5 h-3.5 text-slate-200" />,
+                              label: 'Web Automation',
+                              icon: <Globe className="w-3.5 h-3.5 text-sky-300" />,
                               onClick: () => {
-                                onSelectDrawer('tauri');
+                                onSelectDrawer('automation');
                                 setExpanded(false);
                               },
                             },
@@ -1434,6 +1495,11 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                             key={app.id}
                             type="button"
                             onClick={() => {
+                              if (app.id === 'setup') {
+                                setExpanded(false);
+                                onOpenSetup();
+                                return;
+                              }
                               onSelectDrawer(activeDrawer === app.id ? null : app.id);
                               setExpanded(false);
                             }}

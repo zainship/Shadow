@@ -32,6 +32,23 @@ export interface AutomationStep {
 export interface StepExecutionState extends AutomationStep {
   status: 'pending' | 'running' | 'completed' | 'failed';
   detail?: string;
+  durationMs?: number;
+  matchedSelector?: string;
+}
+
+export interface AutomationExtractedItem {
+  label: string;
+  value?: string;
+  href?: string;
+}
+
+export interface AutomationSubmissionResult {
+  method: string;
+  actionUrl: string;
+  statusCode: number;
+  contentType: string;
+  bodyPreview: string;
+  parsedJson?: unknown;
 }
 
 export interface InspectedField {
@@ -64,6 +81,9 @@ export interface AutomationRunState {
   status: 'idle' | 'running' | 'completed' | 'failed';
   steps: StepExecutionState[];
   inspection: PageInspectionResult | null;
+  extractedItems?: AutomationExtractedItem[];
+  submissionResult?: AutomationSubmissionResult | null;
+  totalDurationMs?: number;
   startedAt: number;
 }
 

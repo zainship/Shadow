@@ -1,0 +1,50 @@
+name: Deploy Shadow to Firebase Hosting
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build static bundle
+        run: npm run build
+
+      - name: Verify dist output and read Firebase project ID
+        id: firebase_meta
+        run: |
+          test -f dist/index.html
+          PROJECT_ID=$(node -e "console.log(require('./firebase-applet-config.json').projectId)")
+          echo "project_id=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Firebase Hosting (Service Account)
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT != '' || secrets.FIREBASE_SERVICE_ACCOUNT_GEN_LANG_CLIENT_0109825597 != '' }}
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT || secrets.FIREBASE_SERVICE_ACCOUNT_GEN_LANG_CLIENT_0109825597 }}
+          channelId: live
+          projectId: ${{ steps.firebase_meta.outputs.project_id }}
+
+      - name: Deploy to Firebase Hosting (Firebase Token Fallback)
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT == '' && secrets.FIREBASE_SERVICE_ACCOUNT_GEN_LANG_CLIENT_0109825597 == '' && secrets.FIREBASE_TOKEN != '' }}
+        run: npx --yes firebase-tools deploy --only hosting --project "${{ steps.firebase_meta.outputs.project_id }}" --token "${{ secrets.FIREBASE_TOKEN }}"

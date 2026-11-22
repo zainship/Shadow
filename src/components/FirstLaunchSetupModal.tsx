@@ -11,10 +11,8 @@ import {
   Cpu,
   Eye,
   EyeOff,
-  FolderOpen,
   Globe,
   KeyRound,
-  Laptop,
   Loader2,
   Lock,
   Mic,
@@ -23,7 +21,6 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
-  Terminal,
   Trash2,
   UserCheck,
   X,
@@ -52,11 +49,6 @@ import {
   type OsPermissionSnapshot,
   type OsPermissionState,
 } from '../lib/osPermissions';
-import {
-  ALL_GRANTED_PERMISSIONS,
-  loadConfirmLaptopActions,
-  saveConfirmLaptopActions,
-} from '../lib/setupStorage';
 import type {
   FaceAuthProfile,
   MemoryCategory,
@@ -105,27 +97,9 @@ const PERMISSION_ITEMS: Array<{
   icon: React.ReactNode;
 }> = [
   {
-    key: 'files',
-    label: 'Files & Folders',
-    description: 'Read, write, search, organize, and manage files on your laptop.',
-    icon: <FolderOpen className="w-4 h-4 text-sky-400" />,
-  },
-  {
-    key: 'apps',
-    label: 'Desktop Apps',
-    description: 'Open, focus, quit, and automate installed desktop applications.',
-    icon: <Laptop className="w-4 h-4 text-sky-400" />,
-  },
-  {
-    key: 'terminal',
-    label: 'Terminal & Background Jobs',
-    description: 'Run shell commands and persistent background processes.',
-    icon: <Terminal className="w-4 h-4 text-sky-400" />,
-  },
-  {
     key: 'browser',
     label: 'Browser Automation',
-    description: 'Open sites, inspect pages, fill forms, and run multi-step web flows.',
+    description: 'Open sites, inspect DOM selectors, fill & submit web forms, and extract data.',
     icon: <Globe className="w-4 h-4 text-sky-400" />,
   },
   {
@@ -162,16 +136,12 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
   existingFaceAuth,
   onClose,
   onSaveAiSettings,
-  onConfirmPolicyChange,
   onComplete,
 }) => {
   const [stepIdx, setStepIdx] = useState(0);
   const [userPreferredName, setUserPreferredName] = useState(initialConfig.userPreferredName);
   const [assistantName, setAssistantName] = useState(initialConfig.assistantName || 'Shadow');
   const [permissions, setPermissions] = useState<ShadowPermissions>({ ...initialConfig.permissions });
-  const [confirmLaptopActions, setConfirmLaptopActions] = useState<boolean>(() =>
-    loadConfirmLaptopActions()
-  );
   const [osSnapshot, setOsSnapshot] = useState<OsPermissionSnapshot | null>(null);
   const [requestingOsKind, setRequestingOsKind] = useState<string | null>(null);
   const [permFeedback, setPermFeedback] = useState<string | null>(null);
@@ -221,7 +191,6 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     setUserPreferredName(initialConfig.userPreferredName);
     setAssistantName(initialConfig.assistantName || 'Shadow');
     setPermissions({ ...initialConfig.permissions });
-    setConfirmLaptopActions(loadConfirmLaptopActions());
     setPermFeedback(null);
     setFaceAuthEnabled(initialConfig.faceAuthEnabled);
     setClapWakeEnabled(initialConfig.clapWakeEnabled);
@@ -534,10 +503,10 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
             <div className="px-6 py-4 border-b border-white/12 flex items-center justify-between gap-4 bg-white/[0.04]">
               <div className="space-y-0.5">
                 <h2 className="text-base font-semibold text-slate-100">
-                  {isFirstLaunch ? 'First-Launch Laptop Setup' : `${displayAssistant} Setup & Permissions`}
+                  {isFirstLaunch ? 'First-Launch PWA Setup' : `${displayAssistant} Setup & Permissions`}
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Personalize identity, grant laptop permissions, seed memory, and configure face lock.
+                  Personalize identity, grant browser permissions, seed memory, and configure face lock.
                 </p>
               </div>
 
@@ -639,7 +608,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-[#070A10] border border-slate-700 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
                   />
                   <p className="text-xs text-slate-500">
-                    Used across voice greetings, live captions, system prompts, and the desktop HUD.
+                    Used across voice greetings, live captions, system prompts, and the PWA HUD.
                   </p>
                 </div>
 
@@ -683,7 +652,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
 
                 {serverAiStatus && !serverAiStatus.hasServerGeminiKey && !serverAiStatus.hasServerOpenRouterKey && aiDraft.provider === 'server' && (
                   <div className="rounded-xl border border-amber-500/35 bg-amber-950/40 px-3.5 py-2.5 text-xs text-amber-200">
-                    No server <code className="font-mono">.env</code> key was detected on this laptop. Pick <strong>OpenRouter (BYOK)</strong> or <strong>Gemini (BYOK)</strong> below and paste your API key.
+                    No server <code className="font-mono">.env</code> key was detected. Pick <strong>OpenRouter (BYOK)</strong> or <strong>Gemini (BYOK)</strong> below and paste your API key.
                   </div>
                 )}
 
@@ -883,17 +852,16 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                 transition={{ duration: 0.16 }}
                 className="space-y-4"
               >
-                {/* Real OS & Hardware Device Permissions */}
+                {/* Real Browser & Device Permissions */}
                 <div className="p-3.5 rounded-2xl bg-white/[0.04] border border-white/12 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <h3 className="text-xs font-semibold text-slate-100 flex items-center gap-1.5">
                         <ShieldCheck className="w-4 h-4 text-sky-400" />
-                        <span>Real Laptop &amp; Device Permissions</span>
+                        <span>Browser &amp; Device Permissions</span>
                       </h3>
                       <p className="text-[11px] text-slate-400 mt-0.5">
-                        Trigger real OS permission dialogs for Microphone, Camera, Notifications
-                        {osSnapshot?.isTauri ? ', Files & Desktop Automation' : ''}.
+                        Grant native browser access for Microphone, Camera, and Notifications.
                       </p>
                     </div>
                     <button
@@ -911,7 +879,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                     {(
                       [
                         {
@@ -932,18 +900,6 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                           state: osSnapshot?.notifications ?? ('prompt' as OsPermissionState),
                           icon: <Bell className="w-3.5 h-3.5 text-amber-300" />,
                         },
-                        ...(osSnapshot?.isTauri
-                          ? [
-                              {
-                                id: 'automation' as const,
-                                label: `OS Automation (${osSnapshot.osPlatform})`,
-                                state: osSnapshot.automationGranted
-                                  ? ('granted' as OsPermissionState)
-                                  : ('prompt' as OsPermissionState),
-                                icon: <Laptop className="w-3.5 h-3.5 text-violet-300" />,
-                              },
-                            ]
-                          : []),
                       ] as const
                     ).map((item) => {
                       const badgeClass =
@@ -987,7 +943,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                             {requestingOsKind === item.id
                               ? 'Checking...'
                               : item.state === 'denied'
-                                ? 'OS Settings'
+                                ? 'Settings'
                                 : item.state === 'granted'
                                   ? 'Re-check'
                                   : 'Grant'}
@@ -1004,42 +960,11 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                   )}
                 </div>
 
-                {/* Runtime Approval Policy */}
-                <label className="p-3 rounded-xl border border-white/12 bg-white/[0.03] flex items-start justify-between gap-3 cursor-pointer">
-                  <div className="min-w-0">
-                    <p className="text-xs font-medium text-slate-100">
-                      Ask confirmation before Files, Apps, or Terminal actions
-                    </p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">
-                      Shows a live Allow Once / Always Allow / Deny prompt whenever {displayAssistant}{' '}
-                      attempts a laptop action.
-                    </p>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={confirmLaptopActions}
-                    onChange={(e) => {
-                      const next = e.target.checked;
-                      setConfirmLaptopActions(next);
-                      saveConfirmLaptopActions(next);
-                      onConfirmPolicyChange?.(next);
-                    }}
-                    className="mt-0.5 rounded border-slate-700 bg-[#070A10] shrink-0"
-                  />
-                </label>
-
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-xs text-slate-400">
-                    Choose which laptop capabilities {displayAssistant} is permitted to execute.
+                    Choose which web capabilities {displayAssistant} is permitted to execute.
                   </p>
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setPermissions({ ...ALL_GRANTED_PERMISSIONS })}
-                      className="px-2.5 py-1 rounded-md border border-slate-700 bg-[#070A10] text-[11px] text-slate-200 hover:border-sky-500/50 whitespace-nowrap cursor-pointer"
-                    >
-                      Allow All
-                    </button>
                     <button
                       type="button"
                       onClick={() =>
@@ -1051,12 +976,12 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                           research: true,
                           youtube: true,
                           memory: true,
-                          faceAuth: false,
+                          faceAuth: true,
                         })
                       }
-                      className="px-2.5 py-1 rounded-md border border-slate-700 bg-[#070A10] text-[11px] text-slate-300 hover:border-slate-500 whitespace-nowrap cursor-pointer"
+                      className="px-2.5 py-1 rounded-md border border-slate-700 bg-[#070A10] text-[11px] text-slate-200 hover:border-sky-500/50 whitespace-nowrap cursor-pointer"
                     >
-                      Web &amp; Media Only
+                      Enable All PWA Features
                     </button>
                   </div>
                 </div>
@@ -1132,7 +1057,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                       type="text"
                       value={draftContent}
                       onChange={(e) => setDraftContent(e.target.value)}
-                      placeholder="e.g., My main projects live in ~/Developer and I prefer VS Code + Chrome."
+                      placeholder="e.g., I prefer concise morning briefs on AI news and structured JSON output."
                       maxLength={600}
                       className="flex-1 min-w-[220px] px-3.5 py-2 rounded-xl bg-[#070A10] border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
                     />
