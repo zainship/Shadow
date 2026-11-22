@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "shadow-solodev",
     "public": "dist",
     "ignore": [
       "firebase.json",
