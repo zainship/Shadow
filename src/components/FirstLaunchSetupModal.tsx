@@ -25,7 +25,7 @@ import {
   UserCheck,
   X,
 } from 'lucide-react';
-import { API_ORIGIN } from '../lib/apiBase';
+import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
 import {
   aiRequestHeaders,
   DEFAULT_AI_SETTINGS,
@@ -203,8 +203,8 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     setCameraError(null);
     setCaptureProgress(0);
     void refreshOsPermissions();
-    void fetch(`${API_ORIGIN}/api/ai/status`)
-      .then((r) => (r.ok ? r.json() : null))
+    void fetch(`${getApiOrigin()}/api/ai/status`)
+      .then((r) => (r.ok ? parseJsonSafely<{ hasServerGeminiKey?: boolean; hasServerOpenRouterKey?: boolean }>(r) : null))
       .then((data) => {
         if (data) setServerAiStatus(data);
       })
@@ -399,7 +399,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     setKeyTestResult(null);
     const clean = normalizedAiDraft();
     try {
-      const res = await fetch(`${API_ORIGIN}/api/ai/test`, {
+      const res = await fetch(`${getApiOrigin()}/api/ai/test`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -407,14 +407,21 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
         },
         body: JSON.stringify({}),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafely<{
         ok?: boolean;
         provider?: string;
         model?: string;
         error?: string;
-      };
-      if (!res.ok || !data.ok) {
-        setKeyTestResult({ ok: false, text: data.error || 'Verification failed' });
+      }>(res);
+      if (!res.ok || !data?.ok) {
+        setKeyTestResult({
+          ok: false,
+          text:
+            data?.error ||
+            (data
+              ? 'Verification failed'
+              : 'Static PWA mode: enter a Shadow Server URL in AI Keys to test server keys.'),
+        });
       } else {
         setKeyTestResult({
           ok: true,

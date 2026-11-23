@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { API_ORIGIN } from '../lib/apiBase';
+import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
 
 export interface NetworkTelemetry {
   isOnline: boolean;
@@ -22,15 +22,18 @@ export function useNetworkTelemetry(isActive: boolean): NetworkTelemetry {
 
     const started = performance.now();
     try {
-      const res = await fetch(`${API_ORIGIN}/api/health?t=${Date.now()}`, {
+      const res = await fetch(`${getApiOrigin()}/api/health?t=${Date.now()}`, {
         cache: 'no-store',
         signal: AbortSignal.timeout(4000),
       });
       if (res.ok) {
-        const rtt = Math.max(1, Math.round(performance.now() - started));
-        setIsOnline(true);
-        setLatencyMs(rtt);
-        return;
+        const data = await parseJsonSafely<{ ok?: boolean; service?: string }>(res);
+        if (data?.ok && data?.service === 'shadow-desktop-server') {
+          const rtt = Math.max(1, Math.round(performance.now() - started));
+          setIsOnline(true);
+          setLatencyMs(rtt);
+          return;
+        }
       }
     } catch {
       // Fall back to Navigator Network Information RTT if available
@@ -44,6 +47,8 @@ export function useNetworkTelemetry(isActive: boolean): NetworkTelemetry {
     } else if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setIsOnline(false);
       setLatencyMs(null);
+    } else {
+      setIsOnline(true);
     }
   }, []);
 

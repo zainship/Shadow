@@ -13,7 +13,14 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { API_ORIGIN } from '../lib/apiBase';
+import {
+  checkShadowBackendHealth,
+  getApiOrigin,
+  loadSavedServerUrl,
+  normalizeServerUrl,
+  parseJsonSafely,
+  saveServerUrl,
+} from '../lib/apiBase';
 import {
   aiRequestHeaders,
   OPENROUTER_MODEL_SUGGESTIONS,
@@ -61,22 +68,42 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
   const [savedFlash, setSavedFlash] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [serverUrlDraft, setServerUrlDraft] = useState<string>(() => loadSavedServerUrl());
+  const [backendReachable, setBackendReachable] = useState<boolean | null>(null);
   const [serverStatus, setServerStatus] = useState<{
     hasServerGeminiKey?: boolean;
     hasServerOpenRouterKey?: boolean;
   } | null>(null);
 
+  const refreshBackendProbe = async (candidateUrl?: string) => {
+    const origin =
+      candidateUrl !== undefined ? normalizeServerUrl(candidateUrl) : getApiOrigin();
+    const ok = await checkShadowBackendHealth(origin);
+    setBackendReachable(ok);
+    if (!ok) {
+      setServerStatus(null);
+      return false;
+    }
+    try {
+      const res = await fetch(`${origin}/api/ai/status`);
+      const data = await parseJsonSafely<{
+        hasServerGeminiKey?: boolean;
+        hasServerOpenRouterKey?: boolean;
+      }>(res);
+      if (res.ok && data) setServerStatus(data);
+    } catch {
+      // ignore
+    }
+    return true;
+  };
+
   useEffect(() => {
     if (open) {
       setDraft(settings);
+      setServerUrlDraft(loadSavedServerUrl());
       setSavedFlash(false);
       setTestResult(null);
-      void fetch(`${API_ORIGIN}/api/ai/status`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (data) setServerStatus(data);
-        })
-        .catch(() => null);
+      void refreshBackendProbe();
     }
   }, [open, settings]);
 
@@ -101,8 +128,11 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
   });
 
   const handleSave = () => {
+    const savedUrl = saveServerUrl(serverUrlDraft);
+    setServerUrlDraft(savedUrl);
     onSave(normalizedDraft());
     setSavedFlash(true);
+    void refreshBackendProbe(savedUrl);
     window.setTimeout(() => setSavedFlash(false), 1600);
   };
 
@@ -111,8 +141,21 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     setTesting(true);
     setTestResult(null);
     const clean = normalizedDraft();
+    const savedUrl = saveServerUrl(serverUrlDraft);
+    setServerUrlDraft(savedUrl);
+    const activeOrigin = savedUrl || getApiOrigin();
     try {
-      const res = await fetch(`${API_ORIGIN}/api/ai/test`, {
+      const healthy = await refreshBackendProbe(activeOrigin);
+      if (!healthy) {
+        setTestResult({
+          ok: false,
+          text: activeOrigin
+            ? `Cannot reach Shadow server at ${activeOrigin}. Ensure "npm start" is running.`
+            : 'Static PWA mode: no Shadow backend at this origin. Enter a Shadow Server URL below (e.g. http://127.0.0.1:3000) or use OpenRouter BYOK.',
+        });
+        return;
+      }
+      const res = await fetch(`${activeOrigin}/api/ai/test`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -120,14 +163,14 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
         },
         body: JSON.stringify({}),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafely<{
         ok?: boolean;
         provider?: string;
         model?: string;
         error?: string;
-      };
-      if (!res.ok || !data.ok) {
-        setTestResult({ ok: false, text: data.error || 'Verification failed' });
+      }>(res);
+      if (!res.ok || !data?.ok) {
+        setTestResult({ ok: false, text: data?.error || 'Verification failed' });
       } else {
         setTestResult({
           ok: true,
@@ -184,11 +227,58 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
               Add your OpenRouter or Gemini key right here in the GUI — no <code className="text-slate-300">.env</code> editing required. Keys stay in local storage on this device and are sent only to your Shadow backend per request.
             </p>
 
-            {serverStatus && !serverStatus.hasServerGeminiKey && !serverStatus.hasServerOpenRouterKey && draft.provider === 'server' && (
+            {backendReachable === false && (
+              <div className="mb-3 rounded-lg border border-sky-500/35 bg-sky-950/35 px-3 py-2 text-[11px] text-sky-200 leading-relaxed">
+                <strong>Standalone PWA Mode:</strong> Static hosting has no built-in Shadow server. Browser Voice &amp; local tools run automatically; optionally connect a running Shadow Server URL below for Gemini Live audio, web automation &amp; YouTube search.
+              </div>
+            )}
+
+            {backendReachable !== false && serverStatus && !serverStatus.hasServerGeminiKey && !serverStatus.hasServerOpenRouterKey && draft.provider === 'server' && (
               <div className="mb-3 rounded-lg border border-amber-500/35 bg-amber-950/40 px-3 py-2 text-[11px] text-amber-200">
                 No server <code className="font-mono">.env</code> key detected locally. Select <strong>OpenRouter (BYOK)</strong> or <strong>Gemini (BYOK)</strong> below to enter your key in the GUI.
               </div>
             )}
+
+            <div className="mb-4 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-3">
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <label className="text-xs font-medium text-slate-300">
+                  Shadow Server URL (optional)
+                </label>
+                {backendReachable !== null && (
+                  <span
+                    className={`text-[10px] font-medium ${
+                      backendReachable ? 'text-emerald-400' : 'text-slate-400'
+                    }`}
+                  >
+                    {backendReachable ? 'Backend online' : 'Standalone mode'}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="url"
+                  value={serverUrlDraft}
+                  onChange={(e) => setServerUrlDraft(e.target.value)}
+                  placeholder="Blank = same origin, or http://127.0.0.1:3000"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="flex-1 rounded-lg border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:border-sky-400/60 focus:outline-none font-mono"
+                />
+                {serverUrlDraft && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setServerUrlDraft('');
+                      saveServerUrl('');
+                      void refreshBackendProbe('');
+                    }}
+                    className="rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 px-2.5 py-1.5 text-[11px] text-slate-300 transition"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
 
             <div className="space-y-2 mb-4">
               {PROVIDER_OPTIONS.map((option) => {
@@ -357,9 +447,12 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
               <button
                 type="button"
                 onClick={() => {
+                  setServerUrlDraft('');
+                  saveServerUrl('');
                   onSave({ ...draft, provider: 'server', geminiKey: '', openrouterKey: '', openrouterModel: '' });
                   setSavedFlash(true);
                   setTestResult(null);
+                  void refreshBackendProbe('');
                   window.setTimeout(() => setSavedFlash(false), 1600);
                 }}
                 className="text-xs text-slate-400 hover:text-slate-200 transition"

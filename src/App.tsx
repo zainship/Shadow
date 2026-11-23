@@ -116,7 +116,31 @@ import {
 } from './lib/tauriBridge';
 import { requestNativeOsPermission } from './lib/osPermissions';
 import { buildWindowLayoutInspection } from './lib/windowLayout';
-import { API_ORIGIN, API_WS_BASE } from './lib/apiBase';
+import {
+  checkShadowBackendHealth,
+  getApiOrigin,
+  getApiWsBase,
+  parseJsonSafely,
+} from './lib/apiBase';
+
+interface BrowserSpeechRecognitionEvent {
+  resultIndex: number;
+  results: ArrayLike<{
+    isFinal: boolean;
+    0?: { transcript?: string };
+  }>;
+}
+
+interface BrowserSpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((ev: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((ev: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
 import {
   aiRequestHeaders,
   aiSocketAuthMessage,
@@ -338,15 +362,22 @@ function JarvisArcWorkspace() {
   }, [aiSettings]);
 
   useEffect(() => {
-    void fetch(`${API_ORIGIN}/api/ai/status`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: { hasServerGeminiKey?: boolean } | null) => {
-        if (data && typeof data.hasServerGeminiKey === 'boolean') {
-          serverHasGeminiKeyRef.current = data.hasServerGeminiKey;
-        }
-      })
-      .catch(() => null);
-  }, []);
+    const origin = getApiOrigin();
+    void checkShadowBackendHealth(origin).then((healthy) => {
+      if (!healthy) {
+        serverHasGeminiKeyRef.current = false;
+        return;
+      }
+      void fetch(`${origin}/api/ai/status`)
+        .then((r) => (r.ok ? parseJsonSafely<{ hasServerGeminiKey?: boolean }>(r) : null))
+        .then((data) => {
+          if (data && typeof data.hasServerGeminiKey === 'boolean') {
+            serverHasGeminiKeyRef.current = data.hasServerGeminiKey;
+          }
+        })
+        .catch(() => null);
+    });
+  }, [aiSettingsOpen]);
   const [faceAuthProfile, setFaceAuthProfile] = useState<FaceAuthProfile | null>(() =>
     loadLocalFaceAuth()
   );
@@ -485,6 +516,11 @@ function JarvisArcWorkspace() {
   const sessionUnlockedOnceRef = useRef<boolean>(false);
   const clapListenerRef = useRef<StandbyClapListener>(new StandbyClapListener());
   const mutedClapAnalyzerRef = useRef<DoubleClapAnalyzer>(new DoubleClapAnalyzer());
+  const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const browserVoiceActiveRef = useRef<boolean>(false);
+  const runSpokenActionRef = useRef<(commandText: string, explicitAttachment?: CommandAttachment) => Promise<void>>(
+    async () => {}
+  );
   const [clapStatus, setClapStatus] = useState<ClapListenerStatus>('idle');
   const clapWakeEnabledRef = useRef<boolean>(setupConfig.clapWakeEnabled);
   clapWakeEnabledRef.current = setupConfig.clapWakeEnabled;
@@ -1384,12 +1420,12 @@ function JarvisArcWorkspace() {
         });
 
         try {
-          const execRes = await fetch(`${API_ORIGIN}/api/automation/execute`, {
+          const execRes = await fetch(`${getApiOrigin()}/api/automation/execute`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ goal, targetUrl, steps: baseSteps }),
           });
-          const data = (await execRes.json()) as {
+          const data = await parseJsonSafely<{
             ok?: boolean;
             targetUrl?: string;
             steps?: StepExecutionState[];
@@ -1398,9 +1434,12 @@ function JarvisArcWorkspace() {
             submissionResult?: AutomationSubmissionResult | null;
             totalDurationMs?: number;
             error?: string;
-          };
-          if (!execRes.ok) {
-            throw new Error(data.error || 'Automation execution failed');
+          }>(execRes);
+          if (!execRes.ok || !data) {
+            throw new Error(
+              data?.error ||
+                'Shadow backend is unreachable at this URL. Start your local server or set a Server URL in AI Keys.'
+            );
           }
           execOk = data.ok !== false;
           if (Array.isArray(data.steps) && data.steps.length > 0) {
@@ -1957,8 +1996,21 @@ function JarvisArcWorkspace() {
   const stopVoiceSession = useCallback(() => {
     isConnectedRef.current = false;
     isConnectingRef.current = false;
+    browserVoiceActiveRef.current = false;
     setIsConnected(false);
     setIsConnecting(false);
+
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.onresult = null;
+        speechRecognitionRef.current.onerror = null;
+        speechRecognitionRef.current.onend = null;
+        speechRecognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
+      speechRecognitionRef.current = null;
+    }
 
     if (processorRef.current) {
       processorRef.current.disconnect();
@@ -1999,24 +2051,22 @@ function JarvisArcWorkspace() {
       mutedClapAnalyzerRef.current.reset();
 
       try {
-        const ctxPromise = fetch(`${API_ORIGIN}/api/assistant/context`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildSessionContextPayload()),
-        })
-          .then((r) => (r.ok ? (r.json() as Promise<{ ctxId?: string }>) : null))
-          .catch(() => null);
+        const apiOrigin = getApiOrigin();
+        const apiWsBase = getApiWsBase();
+        const backendHealthyPromise = checkShadowBackendHealth(apiOrigin);
 
-        const [stream, ctxData] = await Promise.all([
-          navigator.mediaDevices.getUserMedia({
-            audio: {
-              channelCount: 1,
-              sampleRate: 16000,
-              echoCancellation: true,
-              noiseSuppression: true,
-            },
-          }),
-          ctxPromise,
+        const streamPromise = navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+
+        const [stream, backendHealthy] = await Promise.all([
+          streamPromise,
+          backendHealthyPromise,
         ]);
         micStreamRef.current = stream;
 
@@ -2045,23 +2095,131 @@ function JarvisArcWorkspace() {
         isMicMutedRef.current = startMuted;
         setIsMicMuted(startMuted);
 
-        const ctxQuery = ctxData?.ctxId ? `&ctx=${encodeURIComponent(ctxData.ctxId)}` : '';
+        // Standalone Static PWA Fallback (e.g. Firebase Hosting without a backend server):
+        // Use browser-native SpeechRecognition + local/BYOK command handling instead of failing WS.
+        if (!backendHealthy) {
+          const SpeechRecCtor =
+            typeof window !== 'undefined'
+              ? (
+                  window as unknown as {
+                    SpeechRecognition?: new () => BrowserSpeechRecognition;
+                    webkitSpeechRecognition?: new () => BrowserSpeechRecognition;
+                  }
+                ).SpeechRecognition ||
+                (
+                  window as unknown as {
+                    webkitSpeechRecognition?: new () => BrowserSpeechRecognition;
+                  }
+                ).webkitSpeechRecognition
+              : undefined;
 
-        if (API_ORIGIN && !ctxData) {
-          await ensureDesktopBackendServer();
-          const healthy = await fetch(`${API_ORIGIN}/api/health`, {
-            signal: AbortSignal.timeout(2000),
-          })
-            .then((r) => r.ok)
-            .catch(() => false);
-          if (!healthy) {
+          if (!SpeechRecCtor) {
             throw new Error(
-              'Local Shadow server (127.0.0.1:3000) is not running. Run "npm start" in your Shadow folder, or check data/server.log.'
+              apiOrigin
+                ? `Shadow server unreachable at ${apiOrigin}. Start "npm start" or clear the Server URL in AI Keys.`
+                : 'No Shadow backend at this URL and browser speech recognition is unavailable. Type in Spotlight or set a Shadow Server URL in AI Keys.'
             );
           }
+
+          browserVoiceActiveRef.current = true;
+          isConnectingRef.current = false;
+          isConnectedRef.current = true;
+          setIsConnected(true);
+          setIsConnecting(false);
+
+          const recognition = new SpeechRecCtor();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang =
+            typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+
+          recognition.onresult = (event) => {
+            if (isMicMutedRef.current || !isConnectedRef.current) return;
+            let interim = '';
+            let finalized = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+              const resItem = event.results[i];
+              const chunk = resItem?.[0]?.transcript || '';
+              if (resItem?.isFinal) {
+                finalized += chunk;
+              } else {
+                interim += chunk;
+              }
+            }
+            if (interim.trim()) {
+              showTransientCaption('You', interim.trim(), 3000);
+            }
+            if (finalized.trim()) {
+              void runSpokenActionRef.current(finalized.trim());
+            }
+          };
+
+          recognition.onerror = (ev) => {
+            if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+              setVoiceError('Microphone speech recognition permission denied.');
+              stopVoiceSession();
+            }
+          };
+
+          recognition.onend = () => {
+            if (
+              isConnectedRef.current &&
+              browserVoiceActiveRef.current &&
+              speechRecognitionRef.current === recognition
+            ) {
+              try {
+                recognition.start();
+              } catch {
+                // ignore restart race
+              }
+            }
+          };
+
+          speechRecognitionRef.current = recognition;
+          recognition.start();
+
+          processor.onaudioprocess = (e) => {
+            if (!isConnectedRef.current) return;
+            const samples = e.inputBuffer.getChannelData(0);
+            if (
+              isMicMutedRef.current &&
+              clapWakeEnabledRef.current &&
+              mutedClapAnalyzerRef.current.processSamples(samples, 16000)
+            ) {
+              playWakeChime();
+              isMicMutedRef.current = false;
+              setIsMicMuted(false);
+              showTransientCaption(
+                assistantNameRef.current,
+                'Double-clap detected. Mic live.',
+                3500
+              );
+            }
+          };
+
+          showTransientCaption(
+            assistantNameRef.current,
+            'Browser voice online (standalone mode). Listening.',
+            4000
+          );
+          return;
         }
 
-        const ws = new WebSocket(`${API_WS_BASE}/ws/live?voice=${voiceName}${ctxQuery}`);
+        const ctxData = await fetch(`${apiOrigin}/api/assistant/context`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(buildSessionContextPayload()),
+        })
+          .then((r) => (r.ok ? parseJsonSafely<{ ctxId?: string }>(r) : null))
+          .catch(() => null);
+
+        const ctxQuery = ctxData?.ctxId ? `&ctx=${encodeURIComponent(ctxData.ctxId)}` : '';
+
+        if (apiOrigin && !ctxData) {
+          await ensureDesktopBackendServer();
+        }
+
+        const ws = new WebSocket(`${apiWsBase}/ws/live?voice=${voiceName}${ctxQuery}`);
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -2215,10 +2373,11 @@ function JarvisArcWorkspace() {
 
         ws.onerror = () => {
           if (wsRef.current !== ws) return;
+          const wsOrigin = getApiWsBase();
           setVoiceError(
-            API_ORIGIN
-              ? `WebSocket connection failed (${API_WS_BASE}/ws/live). Start "npm start" in your Shadow folder or check data/server.log.`
-              : 'WebSocket connection error. Verify server availability.'
+            getApiOrigin()
+              ? `WebSocket connection failed (${wsOrigin}/ws/live). Ensure your Shadow server is running.`
+              : 'Live voice WebSocket dropped. Click the Core to reconnect.'
           );
           stopVoiceSession();
         };
@@ -2419,6 +2578,7 @@ function JarvisArcWorkspace() {
       if (!clean) return;
       showTransientCaption(assistantNameRef.current, clean, 7000);
       const settings = aiSettingsRef.current;
+      const apiOrigin = getApiOrigin();
       const canUseNeuralTts =
         Boolean(settings.geminiKey.trim()) ||
         (settings.provider !== 'openrouter' && serverHasGeminiKeyRef.current);
@@ -2429,13 +2589,13 @@ function JarvisArcWorkspace() {
       }
 
       try {
-        const res = await fetch(`${API_ORIGIN}/api/assistant/tts`, {
+        const res = await fetch(`${apiOrigin}/api/assistant/tts`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(settings) },
           body: JSON.stringify({ text: clean, voiceName }),
         });
-        const data = (await res.json()) as { audioBase64?: string | null; error?: string };
-        if (!res.ok) throw new Error(data.error || 'TTS failed');
+        const data = await parseJsonSafely<{ audioBase64?: string | null; error?: string }>(res);
+        if (!res.ok || !data) throw new Error(data?.error || 'TTS failed');
         if (data.audioBase64) {
           await playerRef.current.playWavBase64(data.audioBase64);
         } else {
@@ -2448,7 +2608,7 @@ function JarvisArcWorkspace() {
     [voiceName, showTransientCaption]
   );
 
-  // Triggered by Dynamic Island Spotlight, Shelf, stage demo buttons, or macro replay
+  // Triggered by Dynamic Island Spotlight, Browser Voice fallback, Shelf, stage demo buttons, or macro replay
   const runSpokenAction = useCallback(
     async (commandText: string, explicitAttachment?: CommandAttachment) => {
       const clean = commandText.trim();
@@ -2477,8 +2637,163 @@ function JarvisArcWorkspace() {
         attachmentName: activeAttachment?.name,
       });
 
+      const apiOrigin = getApiOrigin();
+      const lower = displayPrompt.toLowerCase();
+
+      const executeStandaloneFallback = async (): Promise<boolean> => {
+        // 1) Focus Timer intents
+        if (/\btimer\b|\bpomodoro\b|\bfocus\b/.test(lower)) {
+          let action = 'start';
+          if (/\bpause\b/.test(lower)) action = 'pause';
+          else if (/\bresume\b|\bcontinue\b/.test(lower)) action = 'resume';
+          else if (/\bstop\b|\bcancel\b|\breset\b|\bclear\b/.test(lower)) action = 'stop';
+          const minsMatch = lower.match(/(\d{1,3})\s*(?:min|minute|minutes|m)\b/);
+          const minutes = minsMatch ? Math.min(180, Math.max(1, Number(minsMatch[1]))) : 25;
+          await handleToolAction(
+            'set_focus_timer',
+            { action, minutes, label: 'Focus Timer' },
+            { ok: true, action, minutes, label: 'Focus Timer' },
+            displayPrompt
+          );
+          const reply =
+            action === 'start'
+              ? `Focus timer set for ${minutes} minutes.`
+              : `Focus timer ${action}d.`;
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('command', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
+        // 2) Memory intents
+        const rememberMatch = displayPrompt.match(/^(?:remember(?:\s+that)?|save\s+memory)\s+(.+)/i);
+        if (rememberMatch?.[1]) {
+          const content = rememberMatch[1].trim();
+          await handleToolAction(
+            'save_memory',
+            { content, category: 'fact', importance: 'normal' },
+            { ok: true, saved: true, content, category: 'fact', importance: 'normal' },
+            displayPrompt
+          );
+          const reply = `Saved to memory: ${content}`;
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('memory', 'Memory saved', true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
+        const forgetMatch = displayPrompt.match(/^forget\s+(.+)/i);
+        if (forgetMatch?.[1]) {
+          const query = forgetMatch[1].trim();
+          await handleToolAction('forget_memory', { query }, { ok: true, query }, displayPrompt);
+          const reply = `Cleared matching memories for "${query}".`;
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('memory', 'Memory updated', true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
+        // 3) Drawer switching
+        if (/\b(?:open|show)\s+(?:youtube|music|media)\b/i.test(lower)) {
+          setActiveDrawer('youtube');
+          const reply = 'Opened YouTube stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('youtube', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:browser|automation)\b/i.test(lower)) {
+          setActiveDrawer('automation');
+          const reply = 'Opened Browser Automation stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('automation', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:research|brief)\b/i.test(lower)) {
+          setActiveDrawer('research');
+          const reply = 'Opened Research stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('research', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:visual|visuals|image|canvas)\b/i.test(lower)) {
+          setActiveDrawer('visuals');
+          const reply = 'Opened Visuals stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('visuals', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:plugin|plugins)\b/i.test(lower)) {
+          setActiveDrawer('plugins');
+          const reply = 'Opened Plugins stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('plugin', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:close|hide)\s+(?:drawer|panel|stage)\b/i.test(lower)) {
+          setActiveDrawer(null);
+          const reply = 'Closed active stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('command', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
+        // 4) OpenRouter BYOK direct browser execution (supports CORS directly)
+        const settings = aiSettingsRef.current;
+        if (settings.provider === 'openrouter' && settings.openrouterKey.trim()) {
+          const model = settings.openrouterModel.trim() || 'openai/gpt-4o-mini';
+          const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${settings.openrouterKey.trim()}`,
+              'HTTP-Referer': typeof window !== 'undefined' ? window.location.origin : 'https://shadow-solodev.web.app',
+              'X-Title': assistantNameRef.current,
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                {
+                  role: 'system',
+                  content: `You are ${assistantNameRef.current}, a concise voice-first AI assistant running in standalone PWA mode. Keep answers sharp and speakable.`,
+                },
+                ...priorHistory.map((h) => ({
+                  role: h.speaker === 'user' ? 'user' : 'assistant',
+                  content: h.text,
+                })),
+                { role: 'user', content: displayPrompt },
+              ],
+            }),
+          });
+          const orData = await parseJsonSafely<{
+            choices?: Array<{ message?: { content?: string } }>;
+            error?: { message?: string };
+          }>(orRes);
+          if (!orRes.ok) {
+            throw new Error(orData?.error?.message || `OpenRouter HTTP ${orRes.status}`);
+          }
+          const reply = orData?.choices?.[0]?.message?.content?.trim() || 'Done.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply, modelUsed: model });
+          finishCommandCue('command', 'Command completed', true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
+        const standaloneHint =
+          'Running in standalone PWA mode. Timer, Memory, and Stage controls work offline; add an OpenRouter key or Shadow Server URL in AI Keys for full AI & web automation.';
+        appendDialogueEntry({ speaker: 'shadow', text: standaloneHint });
+        finishCommandCue('command', 'Standalone PWA mode', true);
+        void handleSpeakText(standaloneHint);
+        return true;
+      };
+
       try {
-        const res = await fetch(`${API_ORIGIN}/api/assistant/command`, {
+        const res = await fetch(`${apiOrigin}/api/assistant/command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
@@ -2491,7 +2806,7 @@ function JarvisArcWorkspace() {
             context: buildSessionContextPayload(),
           }),
         });
-        const data = (await res.json()) as {
+        const data = await parseJsonSafely<{
           spokenText?: string;
           actions?: Array<{
             name: string;
@@ -2502,7 +2817,12 @@ function JarvisArcWorkspace() {
           modelUsed?: string;
           audioBase64?: string | null;
           error?: string;
-        };
+        }>(res);
+
+        if (!data) {
+          await executeStandaloneFallback();
+          return;
+        }
 
         if (!res.ok) throw new Error(data.error || 'Command failed');
 
@@ -2531,6 +2851,18 @@ function JarvisArcWorkspace() {
           }
         }
       } catch (err) {
+        if (err instanceof TypeError) {
+          try {
+            await executeStandaloneFallback();
+            return;
+          } catch (fallbackErr) {
+            finishCommandCue('command', 'Command failed', false);
+            setVoiceError(
+              fallbackErr instanceof Error ? fallbackErr.message : 'Unable to execute command.'
+            );
+            return;
+          }
+        }
         finishCommandCue('command', 'Command failed', false);
         setVoiceError(err instanceof Error ? err.message : 'Unable to execute command.');
       }
@@ -2550,6 +2882,7 @@ function JarvisArcWorkspace() {
       finishCommandCue,
     ]
   );
+  runSpokenActionRef.current = runSpokenAction;
 
   const handleSearchAndPlayYouTube = useCallback(
     async (query: string, mediaType: 'song' | 'video') => {
@@ -2560,10 +2893,15 @@ function JarvisArcWorkspace() {
       setActiveDrawer('youtube');
       beginCommandCue('youtube', `YouTube: ${query.slice(0, 44)}`);
       try {
-        const res = await fetch(`${API_ORIGIN}/api/youtube/search?q=${encodeURIComponent(query)}`, {
+        const res = await fetch(`${getApiOrigin()}/api/youtube/search?q=${encodeURIComponent(query)}`, {
           headers: aiRequestHeaders(aiSettingsRef.current),
         });
-        const data = (await res.json()) as { results?: YouTubeTrack[] };
+        const data = await parseJsonSafely<{ results?: YouTubeTrack[]; error?: string }>(res);
+        if (!data) {
+          finishCommandCue('youtube', 'Shadow server required', false);
+          setVoiceError('YouTube search requires a connected Shadow server (set Shadow Server URL in AI Keys).');
+          return;
+        }
         const first = data.results?.[0];
         if (!first) {
           finishCommandCue('youtube', 'No matching tracks found', false);
@@ -2595,14 +2933,19 @@ function JarvisArcWorkspace() {
       beginCommandCue('automation', `Inspecting: ${url.slice(0, 44)}`);
       const started = performance.now();
       try {
-        const res = await fetch(`${API_ORIGIN}/api/automation/inspect`, {
+        const res = await fetch(`${getApiOrigin()}/api/automation/inspect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
         });
-        const payload = (await res.json()) as PageInspectionResult & { error?: string };
-        if (!res.ok || payload.error) {
-          throw new Error(payload.error || `HTTP ${res.status} inspecting ${url}`);
+        const payload = await parseJsonSafely<PageInspectionResult & { error?: string }>(res);
+        if (!res.ok || !payload || payload.error) {
+          throw new Error(
+            payload?.error ||
+              (payload
+                ? `HTTP ${res.status} inspecting ${url}`
+                : 'Page inspection requires a connected Shadow server (set Shadow Server URL in AI Keys).')
+          );
         }
         const elapsedMs = Math.max(1, Math.round(performance.now() - started));
         setAutomationRun({
@@ -2691,14 +3034,19 @@ function JarvisArcWorkspace() {
       }
 
       try {
-        const res = await fetch(`${API_ORIGIN}/api/automation/agent`, {
+        const res = await fetch(`${getApiOrigin()}/api/automation/agent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ goal: cleanGoal, startUrl: cleanUrl, maxSteps: 4, deepThinking }),
         });
-        const data = (await res.json()) as AutonomousWebAgentResult & { error?: string };
-        if (!res.ok) {
-          throw new Error(data.error || `HTTP ${res.status} autonomous agent failed`);
+        const data = await parseJsonSafely<AutonomousWebAgentResult & { error?: string }>(res);
+        if (!res.ok || !data) {
+          throw new Error(
+            data?.error ||
+              (data
+                ? `HTTP ${res.status} autonomous agent failed`
+                : 'Autonomous web agent requires a connected Shadow server (set Shadow Server URL in AI Keys).')
+          );
         }
 
         const resolvedStatus = data.ok ? 'completed' : 'failed';
@@ -2836,21 +3184,22 @@ function JarvisArcWorkspace() {
 
   const refreshBriefs = useCallback(async () => {
     try {
+      const origin = getApiOrigin();
       const [todayRes, historyRes] = await Promise.all([
-        fetch(`${API_ORIGIN}/api/brief/today`),
-        fetch(`${API_ORIGIN}/api/brief/history?limit=20`),
+        fetch(`${origin}/api/brief/today`),
+        fetch(`${origin}/api/brief/history?limit=20`),
       ]);
       if (todayRes.ok) {
-        const data = (await todayRes.json()) as {
+        const data = await parseJsonSafely<{
           brief?: MorningBrief | null;
           config?: MorningBriefConfig;
-        };
-        if (data.brief !== undefined) setBriefToday(data.brief ?? null);
-        if (data.config) setBriefConfig(data.config);
+        }>(todayRes);
+        if (data?.brief !== undefined) setBriefToday(data.brief ?? null);
+        if (data?.config) setBriefConfig(data.config);
       }
       if (historyRes.ok) {
-        const data = (await historyRes.json()) as { briefs?: MorningBrief[] };
-        if (Array.isArray(data.briefs)) setBriefHistory(data.briefs);
+        const data = await parseJsonSafely<{ briefs?: MorningBrief[] }>(historyRes);
+        if (data && Array.isArray(data.briefs)) setBriefHistory(data.briefs);
       }
     } catch {
       // briefs are optional; ignore fetch failures silently
@@ -2881,13 +3230,13 @@ function JarvisArcWorkspace() {
     setVoiceError(null);
     beginCommandCue('research', 'Compiling morning brief');
     try {
-      const res = await fetch(`${API_ORIGIN}/api/brief/run`, {
+      const res = await fetch(`${getApiOrigin()}/api/brief/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
         body: JSON.stringify({ voiceName }),
       });
-      const data = (await res.json()) as { brief?: MorningBrief; error?: string };
-      if (!res.ok) throw new Error(data.error || 'Morning Brief failed');
+      const data = await parseJsonSafely<{ brief?: MorningBrief; error?: string }>(res);
+      if (!res.ok || !data) throw new Error(data?.error || 'Morning Brief requires a connected Shadow server.');
       if (data.brief) {
         setBriefToday(data.brief);
         markBriefSeen(data.brief.date);
@@ -2913,13 +3262,13 @@ function JarvisArcWorkspace() {
 
   const handleSaveBriefConfig = useCallback(async (next: MorningBriefConfig) => {
     try {
-      const res = await fetch(`${API_ORIGIN}/api/brief/config`, {
+      const res = await fetch(`${getApiOrigin()}/api/brief/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(next),
       });
-      const data = (await res.json()) as { config?: MorningBriefConfig; error?: string };
-      if (!res.ok || !data.config) throw new Error(data.error || 'Could not save brief settings');
+      const data = await parseJsonSafely<{ config?: MorningBriefConfig; error?: string }>(res);
+      if (!res.ok || !data?.config) throw new Error(data?.error || 'Could not save brief settings');
       setBriefConfig(data.config);
     } catch (err) {
       setVoiceError(err instanceof Error ? err.message : 'Could not save brief settings');
@@ -2941,18 +3290,23 @@ function JarvisArcWorkspace() {
       beginCommandCue('research', `Researching: ${clean.slice(0, 44)}`);
 
       try {
-        const res = await fetch(`${API_ORIGIN}/api/research/run`, {
+        const res = await fetch(`${getApiOrigin()}/api/research/run`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ query: clean, depth, urls, voiceName, speak: false }),
         });
-        const data = (await res.json()) as {
+        const data = await parseJsonSafely<{
           report?: ResearchReport;
           audioBase64?: string | null;
           error?: string;
-        };
-        if (!res.ok || !data.report) {
-          throw new Error(data.error || 'Research request failed');
+        }>(res);
+        if (!res.ok || !data?.report) {
+          throw new Error(
+            data?.error ||
+              (data
+                ? 'Research request failed'
+                : 'Deep research requires a connected Shadow server (set Shadow Server URL in AI Keys).')
+          );
         }
         await handleToolAction(
           'research_topic',
@@ -3003,7 +3357,7 @@ function JarvisArcWorkspace() {
       beginCommandCue('visuals', `Creating visual: ${clean.slice(0, 40)}`);
 
       try {
-        const res = await fetch(`${API_ORIGIN}/api/visuals/generate`, {
+        const res = await fetch(`${getApiOrigin()}/api/visuals/generate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({
@@ -3015,14 +3369,19 @@ function JarvisArcWorkspace() {
             speak: false,
           }),
         });
-        const data = (await res.json()) as {
+        const data = await parseJsonSafely<{
           ok?: boolean;
           visual?: GeneratedVisual;
           audioBase64?: string | null;
           error?: string;
-        };
-        if (!res.ok || !data.visual) {
-          throw new Error(data.error || 'Visual generation failed');
+        }>(res);
+        if (!res.ok || !data?.visual) {
+          throw new Error(
+            data?.error ||
+              (data
+                ? 'Visual generation failed'
+                : 'Visual generation requires a connected Shadow server (set Shadow Server URL in AI Keys).')
+          );
         }
         await handleToolAction(
           'generate_visual',
@@ -3062,13 +3421,14 @@ function JarvisArcWorkspace() {
     if (runtimeInfo.isTauri) {
       try {
         await ensureDesktopBackendServer();
-        const startRes = await fetch(`${API_ORIGIN}/api/desktop-auth/session`, {
+        const apiOrigin = getApiOrigin();
+        const startRes = await fetch(`${apiOrigin}/api/desktop-auth/session`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
         });
-        const startData = (await startRes.json()) as { ok?: boolean; nonce?: string; error?: string };
-        if (!startRes.ok || !startData.nonce) {
-          throw new Error(startData.error || 'Local Shadow server is unavailable for Sign-In.');
+        const startData = await parseJsonSafely<{ ok?: boolean; nonce?: string; error?: string }>(startRes);
+        if (!startRes.ok || !startData?.nonce) {
+          throw new Error(startData?.error || 'Local Shadow server is unavailable for Sign-In.');
         }
 
         const nonce = startData.nonce;
@@ -3096,7 +3456,7 @@ function JarvisArcWorkspace() {
             return;
           }
           try {
-            const pollRes = await fetch(`${API_ORIGIN}/api/desktop-auth/session/${encodeURIComponent(nonce)}`);
+            const pollRes = await fetch(`${apiOrigin}/api/desktop-auth/session/${encodeURIComponent(nonce)}`);
             if (pollRes.status === 404) {
               if (desktopAuthPollRef.current) {
                 window.clearInterval(desktopAuthPollRef.current);
@@ -3104,12 +3464,12 @@ function JarvisArcWorkspace() {
               }
               return;
             }
-            const pollData = (await pollRes.json()) as {
+            const pollData = await parseJsonSafely<{
               status?: string;
               idToken?: string | null;
               accessToken?: string | null;
-            };
-            if (pollData.status === 'completed') {
+            }>(pollRes);
+            if (pollData?.status === 'completed') {
               if (desktopAuthPollRef.current) {
                 window.clearInterval(desktopAuthPollRef.current);
                 desktopAuthPollRef.current = null;
@@ -3191,12 +3551,24 @@ function JarvisArcWorkspace() {
     ): Promise<PluginExecutionResult> => {
       const started = Date.now();
       beginCommandCue('plugin', `Plugin: ${plugin.name}`);
-      const res = await fetch(`${API_ORIGIN}/api/plugins/execute`, {
+      const res = await fetch(`${getApiOrigin()}/api/plugins/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plugin, args }),
       });
-      const data = (await res.json()) as PluginExecutionResult;
+      const data = await parseJsonSafely<PluginExecutionResult>(res);
+      if (!data) {
+        finishCommandCue('plugin', 'Shadow server required', false);
+        return {
+          ok: false,
+          pluginId: plugin.id,
+          pluginName: plugin.name,
+          toolName: plugin.toolName,
+          kind: plugin.kind,
+          latencyMs: Date.now() - started,
+          error: 'Plugin execution requires a connected Shadow server (set Shadow Server URL in AI Keys).',
+        };
+      }
       if (data.requiresClientExecution && data.renderedCommand) {
         const laptopRes = await runDirectLaptopTool('execute_terminal_command', {
           command: data.renderedCommand,

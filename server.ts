@@ -70,15 +70,26 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '6mb' }));
 
-  // The packaged desktop app (Tauri) serves the UI from the tauri:// /
-  // http://tauri.localhost asset origin and calls this server on
-  // 127.0.0.1:3000 cross-origin. Allow exactly those origins (plus local
-  // dev pages); any other origin keeps default browser rules.
+  // Allow packaged Tauri shell, local dev servers, Firebase Hosting PWA domains,
+  // and any explicit CORS_ALLOWED_ORIGINS entries to reach this server.
   const localUiOrigin =
     /^(tauri|asset|ipc):\/\/localhost$|^https?:\/\/tauri\.localhost$|^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+  const firebaseHostingOrigin =
+    /^https:\/\/(shadow-solodev|gen-lang-client-0109825597)\.(web\.app|firebaseapp\.com)$/;
+  const extraCorsOrigins = new Set(
+    (process.env.CORS_ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
   app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && localUiOrigin.test(origin)) {
+    const isAllowed =
+      Boolean(origin) &&
+      (localUiOrigin.test(origin!) ||
+        firebaseHostingOrigin.test(origin!) ||
+        extraCorsOrigins.has(origin!));
+    if (origin && isAllowed) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader(
@@ -86,6 +97,9 @@ async function startServer() {
         'Content-Type, Accept, x-shadow-provider, x-shadow-key, x-shadow-model, x-shadow-gemini-key'
       );
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      if (req.headers['access-control-request-private-network'] === 'true') {
+        res.setHeader('Access-Control-Allow-Private-Network', 'true');
+      }
       if (req.method === 'OPTIONS') {
         res.sendStatus(204);
         return;
