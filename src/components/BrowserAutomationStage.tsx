@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion, useReducedMotion } from 'motion/react';
 import {
   BookmarkPlus,
@@ -173,9 +173,13 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
   const statusCode = run?.inspection?.statusCode;
   const statusHealthy = typeof statusCode === 'number' && statusCode >= 200 && statusCode < 400;
 
+  useEffect(() => {
+    setUrlInput(activeUrl);
+  }, [activeUrl]);
+
   const handleInspectSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const target = urlInput.trim() || activeUrl;
+    const target = urlInput.trim();
     if (!target) return;
     onInspectUrl(target);
   };
@@ -251,7 +255,7 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
             )}
             <input
               type="text"
-              value={urlInput || activeUrl}
+              value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
               placeholder="Enter website URL to inspect DOM selectors..."
               className="w-full bg-transparent text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none"

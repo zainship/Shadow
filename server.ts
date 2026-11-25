@@ -212,14 +212,34 @@ async function startServer() {
         });
       }
       const ai = getGeminiClient(runtime.apiKey);
-      const response = await ai.models.generateContent({
-        model: getModelConfig().fastText,
-        contents: 'Reply with OK.',
-      });
+      const models = getModelConfig();
+      let modelUsed = models.fastText;
+      let response;
+      try {
+        response = await withGeminiRetry(
+          () =>
+            ai.models.generateContent({
+              model: models.fastText,
+              contents: 'Reply with OK.',
+            }),
+          1
+        );
+      } catch (err) {
+        if (!isOverloadOrQuotaError(err)) throw err;
+        modelUsed = models.deepText;
+        response = await withGeminiRetry(
+          () =>
+            ai.models.generateContent({
+              model: models.deepText,
+              contents: 'Reply with OK.',
+            }),
+          0
+        );
+      }
       return res.json({
         ok: true,
         provider: 'gemini',
-        model: getModelConfig().fastText,
+        model: modelUsed,
         reply: (response.text || 'OK').trim().slice(0, 60),
       });
     } catch (err) {
@@ -930,7 +950,7 @@ async function startServer() {
           retries
         );
 
-      const runFastTurn = (contents: Content[], retries = 0) =>
+      const runFastTurn = (contents: Content[], retries = 1) =>
         withGeminiRetry(
           () =>
             ai.models.generateContent({
@@ -944,9 +964,9 @@ async function startServer() {
           retries
         );
 
-      let activeModelLabel = models.deepText;
+      let activeModelLabel = models.fastText;
       const runCommandTurn = async (contents: Content[]) => {
-        if (useDeepFirst || Date.now() >= preferLiteUntil) {
+        if (useDeepFirst && Date.now() >= preferLiteUntil) {
           try {
             activeModelLabel = models.deepText;
             return await runDeepTurn(contents);

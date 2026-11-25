@@ -63,6 +63,7 @@ const args = new Set(process.argv.slice(2));
 const skipLint = args.has('--skip-lint');
 const withRules = args.has('--with-rules');
 const dryRun = args.has('--dry-run');
+const debugMode = args.has('--debug');
 
 const firebaseConfig = readFirebaseConfig();
 const projectId = firebaseConfig.projectId;
@@ -99,12 +100,23 @@ const deployArgs = ['deploy', '--only', onlyTargets, '--project', projectId];
 if (process.env.FIREBASE_TOKEN) {
   deployArgs.push('--token', process.env.FIREBASE_TOKEN);
 }
+if (debugMode) {
+  deployArgs.push('--debug');
+}
+
+const existingNodeOpts = process.env.NODE_OPTIONS || '';
+const firebaseEnv = {
+  ...process.env,
+  NODE_OPTIONS: existingNodeOpts.includes('--dns-result-order=')
+    ? existingNodeOpts
+    : `${existingNodeOpts} --dns-result-order=ipv4first`.trim(),
+};
 
 if (hasGlobalFirebaseCli()) {
-  run('firebase', deployArgs);
+  run('firebase', deployArgs, { env: firebaseEnv });
 } else {
   const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-  run(npxCmd, ['--yes', 'firebase-tools', ...deployArgs]);
+  run(npxCmd, ['--yes', 'firebase-tools', ...deployArgs], { env: firebaseEnv });
 }
 
 console.log(`\nDeployed static bundle to https://${hostingSite}.web.app`);

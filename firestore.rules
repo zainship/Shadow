@@ -114,7 +114,7 @@ service cloud.firestore {
         && data.keys().hasOnly(['ownerId', 'transcript', 'intent', 'targetUrl', 'status', 'stepsCount', 'summary', 'runtime', 'createdAt', 'updatedAt'])
         && isValidId(data.ownerId)
         && data.transcript is string && data.transcript.size() >= 1 && data.transcript.size() <= 500
-        && data.intent in ['browser_automation', 'youtube_play', 'youtube_control', 'workflow_run', 'research', 'plugin_run', 'conversation']
+        && data.intent in ['browser_automation', 'youtube_play', 'youtube_control', 'workflow_run', 'research', 'plugin_run', 'visual_generate', 'conversation']
         && data.targetUrl is string && data.targetUrl.size() <= 1000
         && data.status in ['running', 'completed', 'failed']
         && data.stepsCount is int && data.stepsCount >= 0 && data.stepsCount <= 50

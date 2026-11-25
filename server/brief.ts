@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ThinkingLevel, Type } from '@google/genai';
 import { openRouterGenerate, resolveAiRuntime, type AiRuntime } from './ai-provider.ts';
-import { getGeminiClient, getModelConfig, withGeminiRetry } from './gemini.ts';
+import { getGeminiClient, getModelConfig, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
 import { runJarvisResearch } from './research.ts';
 import { synthesizeJarvisSpeech } from './automation.ts';
 
@@ -251,6 +251,7 @@ function parseCompose(text: string): ComposedBrief {
 
 async function composeBrief(
   topics: string[],
+  reports: Array<ResearchResult | null>,
   digest: string,
   runtime: AiRuntime | null
 ): Promise<ComposedBrief> {
@@ -269,19 +270,60 @@ async function composeBrief(
   }
 
   const ai = getGeminiClient(runtime?.apiKey);
-  const response = await withGeminiRetry(() =>
-    ai.models.generateContent({
-      model: getModelConfig().fastText,
-      contents: userText,
-      config: {
-        systemInstruction: COMPOSE_SYSTEM,
-        responseMimeType: 'application/json',
-        responseSchema: composeSchema,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
-    })
-  );
-  return parseCompose(response.text ?? '');
+  const models = getModelConfig();
+  try {
+    const response = await withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: models.fastText,
+          contents: userText,
+          config: {
+            systemInstruction: COMPOSE_SYSTEM,
+            responseMimeType: 'application/json',
+            responseSchema: composeSchema,
+          },
+        }),
+      1
+    );
+    return parseCompose(response.text ?? '');
+  } catch (fastErr) {
+    if (!isOverloadOrQuotaError(fastErr)) throw fastErr;
+    try {
+      const response = await withGeminiRetry(
+        () =>
+          ai.models.generateContent({
+            model: models.deepText,
+            contents: userText,
+            config: {
+              systemInstruction: COMPOSE_SYSTEM,
+              responseMimeType: 'application/json',
+              responseSchema: composeSchema,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          }),
+        0
+      );
+      return parseCompose(response.text ?? '');
+    } catch {
+      const sections = topics.map((topic, i) => {
+        const rep = reports[i];
+        const bullets =
+          rep && rep.keyFindings.length > 0
+            ? rep.keyFindings.slice(0, 3).map((b) => b.slice(0, 240))
+            : [`Checked live updates for ${topic}.`];
+        return { title: topic.slice(0, 90), bullets };
+      });
+      const firstLead = reports.find((r) => r?.executiveSummary)?.executiveSummary;
+      const headline = (firstLead || `Morning Brief across ${topics.length} tracked topics.`).slice(0, 110);
+      const spokenParts = sections.map((s) => `${s.title}: ${s.bullets[0] || ''}`).join(' ');
+      return {
+        headline,
+        sections,
+        action: `Review your top findings for ${topics[0]} and prioritize today's key task.`,
+        spokenSummary: `Good morning. ${headline} ${spokenParts}`.slice(0, 600),
+      };
+    }
+  }
 }
 
 let running = false;
@@ -325,7 +367,7 @@ export async function runMorningBrief(
       })
       .join('\n\n');
 
-    const composed = await composeBrief(topics, digest, input.runtime ?? null);
+    const composed = await composeBrief(topics, topics.map((_, i) => reportFor(i)), digest, input.runtime ?? null);
     const voiceName = input.voiceName?.trim() || config.voiceName || 'Charon';
     const audioBase64 = await synthesizeJarvisSpeech(
       composed.spokenSummary,

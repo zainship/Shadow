@@ -794,6 +794,28 @@ export async function executeBrowserPlan(input: {
               extractedItems.push({ label, href });
             });
           }
+
+          if (extractedItems.length === countBefore) {
+            const textBlocks = dom('main p, article p, p, li');
+            const seenText = new Set<string>();
+            textBlocks.each((_, el) => {
+              if (extractedItems.length >= 15) return false;
+              const node = dom(el);
+              const label = node.text().replace(/\s+/g, ' ').trim().slice(0, 200);
+              if (!label || label.length < 15 || seenText.has(label)) return;
+              seenText.add(label);
+              const rawHref = node.find('a[href]').first().attr('href');
+              let href: string | undefined;
+              if (rawHref && !rawHref.startsWith('#') && !rawHref.startsWith('javascript:')) {
+                try {
+                  href = new URL(rawHref, state.currentUrl).toString();
+                } catch {
+                  // ignore
+                }
+              }
+              extractedItems.push({ label, ...(href ? { href } : {}) });
+            });
+          }
         }
 
         const added = extractedItems.length - countBefore;

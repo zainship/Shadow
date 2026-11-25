@@ -213,7 +213,7 @@
         },
         "intent": {
           "type": "string",
-          "enum": ["browser_automation", "youtube_play", "youtube_control", "workflow_run", "research", "plugin_run", "conversation"]
+          "enum": ["browser_automation", "youtube_play", "youtube_control", "workflow_run", "research", "plugin_run", "visual_generate", "conversation"]
         },
         "targetUrl": {
           "type": "string",
