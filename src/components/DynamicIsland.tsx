@@ -2,8 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
   ArrowRight,
+  AudioLines,
   Blocks,
+  BookOpen,
   Brain,
+  CalendarCheck2,
   Camera,
   Check,
   ChevronUp,
@@ -23,6 +26,7 @@ import {
   MonitorUp,
   Pause,
   Play,
+  Radio,
   RotateCcw,
   Settings2,
   Sparkles,
@@ -647,6 +651,30 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
       label: 'YouTube',
       icon: <Play className="w-4 h-4 text-rose-400 fill-current" />,
       running: Boolean(currentTrack),
+    },
+    {
+      id: 'workspace',
+      label: 'Workspace',
+      icon: <CalendarCheck2 className="w-4 h-4 text-cyan-300" />,
+      running: false,
+    },
+    {
+      id: 'meetings',
+      label: 'Meetings',
+      icon: <AudioLines className="w-4 h-4 text-fuchsia-300" />,
+      running: false,
+    },
+    {
+      id: 'vault',
+      label: 'Vault & Git',
+      icon: <BookOpen className="w-4 h-4 text-teal-300" />,
+      running: false,
+    },
+    {
+      id: 'triggers',
+      label: 'Triggers',
+      icon: <Radio className="w-4 h-4 text-violet-300" />,
+      running: false,
     },
     {
       id: 'macros',
@@ -1792,7 +1820,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                         )}
                       </div>
 
-                      {/* All 8 Stage Launchers */}
+                      {/* All 12 Stage Launchers */}
                       <div className="grid grid-cols-4 gap-1.5">
                         {stageApps.map((app) => (
                           <button

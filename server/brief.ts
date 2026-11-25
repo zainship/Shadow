@@ -5,6 +5,7 @@ import { openRouterGenerate, resolveAiRuntime, type AiRuntime } from './ai-provi
 import { getGeminiClient, getModelConfig, isOverloadOrQuotaError, withGeminiRetry } from './gemini.ts';
 import { runJarvisResearch } from './research.ts';
 import { synthesizeJarvisSpeech } from './automation.ts';
+import { fetchWorkspaceDigestForBrief } from './workspace.ts';
 
 // ---------------------------------------------------------------------------
 // Morning Brief — scheduled daily digest.
@@ -37,6 +38,7 @@ export interface MorningBrief {
   audioBase64?: string | null;
   topics: string[];
   provider: string;
+  workspaceDigestIncluded?: boolean;
 }
 
 export interface MorningBriefConfig {
@@ -329,7 +331,12 @@ async function composeBrief(
 let running = false;
 
 export async function runMorningBrief(
-  input: { runtime?: AiRuntime | null; voiceName?: string } = {}
+  input: {
+    runtime?: AiRuntime | null;
+    voiceName?: string;
+    workspaceToken?: string;
+    tasks?: Array<{ title: string; dueAt?: string; priority?: string }>;
+  } = {}
 ): Promise<MorningBrief> {
   if (running) {
     throw new Error('A Morning Brief is already being generated.');
@@ -343,13 +350,34 @@ export async function runMorningBrief(
       throw new Error('No topics configured. Add at least one topic in Brief settings.');
     }
 
-    const research = await Promise.allSettled(
-      topics.map((topic) => runJarvisResearch({ query: topic, depth: 'quick', runtime: input.runtime ?? null }))
-    );
+    const [research, workspaceDigest] = await Promise.all([
+      Promise.allSettled(
+        topics.map((topic) => runJarvisResearch({ query: topic, depth: 'quick', runtime: input.runtime ?? null }))
+      ),
+      fetchWorkspaceDigestForBrief(input.workspaceToken),
+    ]);
     const reportFor = (i: number): ResearchResult | null =>
       research[i].status === 'fulfilled' ? (research[i] as PromiseFulfilledResult<ResearchResult>).value : null;
 
-    const digest = topics
+    const cleanTasks = Array.isArray(input.tasks)
+      ? input.tasks
+          .filter((t) => t && String(t.title || '').trim())
+          .slice(0, 8)
+      : [];
+    const tasksBlock =
+      cleanTasks.length > 0
+        ? `PENDING TASKS & REMINDERS:\n${cleanTasks
+            .map(
+              (t) =>
+                `- ${String(t.title).trim().slice(0, 140)}${t.priority ? ` [${t.priority}]` : ''}${t.dueAt ? ` (due ${t.dueAt})` : ''}`
+            )
+            .join('\n')}`
+        : '';
+
+    const assistantAgendaBlocks = [workspaceDigest, tasksBlock].filter(Boolean).join('\n\n');
+    const composeTopics = assistantAgendaBlocks ? [...topics, 'Daily Agenda & Priorities'] : topics;
+
+    const researchDigest = topics
       .map((topic, i) => {
         const report = reportFor(i);
         if (!report) {
@@ -367,7 +395,14 @@ export async function runMorningBrief(
       })
       .join('\n\n');
 
-    const composed = await composeBrief(topics, topics.map((_, i) => reportFor(i)), digest, input.runtime ?? null);
+    const fullDigest = assistantAgendaBlocks
+      ? `${researchDigest}\n\nTOPIC: Daily Agenda & Priorities\n${assistantAgendaBlocks}`
+      : researchDigest;
+
+    const reportsList = topics.map((_, i) => reportFor(i));
+    if (assistantAgendaBlocks) reportsList.push(null);
+
+    const composed = await composeBrief(composeTopics, reportsList, fullDigest, input.runtime ?? null);
     const voiceName = input.voiceName?.trim() || config.voiceName || 'Charon';
     const audioBase64 = await synthesizeJarvisSpeech(
       composed.spokenSummary,
@@ -380,15 +415,21 @@ export async function runMorningBrief(
       date: localDateKey(),
       generatedAt: Date.now(),
       headline: composed.headline,
-      sections: topics.map((topic, i) => {
+      sections: composeTopics.map((topic, i) => {
         const composedSection = composed.sections[i];
-        const report = reportFor(i);
-        const bullets = (
-          composedSection?.bullets?.length
-            ? composedSection.bullets
+        const report = i < topics.length ? reportFor(i) : null;
+        const fallbackBullets =
+          i >= topics.length
+            ? assistantAgendaBlocks
+                .split('\n')
+                .filter((line) => line.startsWith('- '))
+                .slice(0, 4)
+                .map((line) => line.slice(2))
             : (report?.keyFindings || []).slice(0, 3).length > 0
               ? (report?.keyFindings || []).slice(0, 3)
-              : ['Research unavailable for this topic right now.']
+              : ['Research unavailable for this topic right now.'];
+        const bullets = (
+          composedSection?.bullets?.length ? composedSection.bullets : fallbackBullets
         ).map((b) => String(b).slice(0, 240));
         return {
           title: String(composedSection?.title || topic).slice(0, 90),
@@ -399,7 +440,8 @@ export async function runMorningBrief(
       action: composed.action,
       spokenSummary: composed.spokenSummary,
       audioBase64: audioBase64 || null,
-      topics,
+      topics: composeTopics,
+      workspaceDigestIncluded: Boolean(assistantAgendaBlocks),
       provider:
         input.runtime?.provider === 'openrouter'
           ? `openrouter (${input.runtime.model})`

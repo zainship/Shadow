@@ -261,6 +261,9 @@ export function MorningBriefStage({
               </p>
               <p className="text-[11px] text-slate-500">
                 {displayed.date} · {timeOfDay(displayed.generatedAt)} · {providerLabel}
+                {displayed.workspaceDigestIncluded
+                  ? ' · Workspace & Tasks synced'
+                  : ' · Connect Workspace or add Tasks to enrich'}
               </p>
             </div>
             <div className="flex items-center gap-2">

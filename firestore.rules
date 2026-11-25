@@ -114,7 +114,7 @@ service cloud.firestore {
         && data.keys().hasOnly(['ownerId', 'transcript', 'intent', 'targetUrl', 'status', 'stepsCount', 'summary', 'runtime', 'createdAt', 'updatedAt'])
         && isValidId(data.ownerId)
         && data.transcript is string && data.transcript.size() >= 1 && data.transcript.size() <= 500
-        && data.intent in ['browser_automation', 'youtube_play', 'youtube_control', 'workflow_run', 'research', 'plugin_run', 'visual_generate', 'conversation']
+        && data.intent in ['browser_automation', 'youtube_play', 'youtube_control', 'workflow_run', 'research', 'plugin_run', 'visual_generate', 'workspace', 'meeting', 'vault', 'schedule', 'devops', 'conversation']
         && data.targetUrl is string && data.targetUrl.size() <= 1000
         && data.status in ['running', 'completed', 'failed']
         && data.stepsCount is int && data.stepsCount >= 0 && data.stepsCount <= 50
@@ -236,6 +236,61 @@ service cloud.firestore {
         && data.bodyTemplate is string && data.bodyTemplate.size() <= 1500
         && data.commandTemplate is string && data.commandTemplate.size() <= 500
         && data.runCount is int && data.runCount >= 0 && data.runCount <= 1000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTask(data) {
+      return data.keys().hasAll(['ownerId', 'title', 'status', 'priority', 'dueAt', 'notes', 'reminded', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'title', 'status', 'priority', 'dueAt', 'notes', 'reminded', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+        && data.status in ['pending', 'done']
+        && data.priority in ['low', 'medium', 'high']
+        && data.dueAt is string && data.dueAt.size() <= 64
+        && data.notes is string && data.notes.size() <= 600
+        && data.reminded is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMeetingActionItem(item) {
+      return item is map
+        && item.keys().hasAll(['text', 'assignee', 'dueHint'])
+        && item.keys().hasOnly(['text', 'assignee', 'dueHint'])
+        && item.text is string && item.text.size() >= 1 && item.text.size() <= 240
+        && item.assignee is string && item.assignee.size() <= 80
+        && item.dueHint is string && item.dueHint.size() <= 80;
+    }
+
+    function isValidMeeting(data) {
+      return data.keys().hasAll(['ownerId', 'title', 'summary', 'transcript', 'keyDecisions', 'actionItems', 'topics', 'durationSeconds', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'title', 'summary', 'transcript', 'keyDecisions', 'actionItems', 'topics', 'durationSeconds', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 1500
+        && data.transcript is string && data.transcript.size() >= 1 && data.transcript.size() <= 16000
+        && data.keyDecisions is list && data.keyDecisions.size() <= 10
+        && (data.keyDecisions.size() == 0 || (data.keyDecisions[0] is string && data.keyDecisions[0].size() <= 260))
+        && data.actionItems is list && data.actionItems.size() <= 10
+        && (data.actionItems.size() == 0 || isValidMeetingActionItem(data.actionItems[0]))
+        && data.topics is list && data.topics.size() <= 8
+        && (data.topics.size() == 0 || (data.topics[0] is string && data.topics[0].size() <= 60))
+        && data.durationSeconds is int && data.durationSeconds >= 0 && data.durationSeconds <= 86400
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidVaultDoc(data) {
+      return data.keys().hasAll(['ownerId', 'vaultId', 'title', 'sourceType', 'summary', 'chunkCount', 'embedded', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'vaultId', 'title', 'sourceType', 'summary', 'chunkCount', 'embedded', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.vaultId is string && data.vaultId.size() >= 1 && data.vaultId.size() <= 64 && data.vaultId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && data.sourceType in ['note', 'file', 'pdf', 'repo', 'meeting', 'url']
+        && data.summary is string && data.summary.size() <= 400
+        && data.chunkCount is int && data.chunkCount >= 0 && data.chunkCount <= 500
+        && data.embedded is bool
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -458,6 +513,55 @@ service cloud.firestore {
             && incoming().runCount == existing().runCount + 1)
         );
       allow delete: if isValidId(pluginId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 8. Personal Tasks & Due Reminders
+    match /tasks/{taskId} {
+      allow get: if isValidId(taskId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(taskId)
+        && isSignedIn()
+        && isValidTask(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(taskId)
+        && isSignedIn()
+        && isValidTask(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'status', 'priority', 'dueAt', 'notes', 'reminded', 'updatedAt']);
+      allow delete: if isValidId(taskId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 9. Meeting Companion Notes & Transcripts
+    match /meetings/{meetingId} {
+      allow get: if isValidId(meetingId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(meetingId)
+        && isSignedIn()
+        && isValidMeeting(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(meetingId) && isSignedIn() && existing().ownerId == request.auth.uid;
+    }
+
+    // 10. Personal Knowledge Vault Metadata
+    match /vaultDocs/{docId} {
+      allow get: if isValidId(docId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(docId)
+        && isSignedIn()
+        && isValidVaultDoc(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(docId) && isSignedIn() && existing().ownerId == request.auth.uid;
     }
   }
 }

@@ -9,7 +9,10 @@ import {
   type MotionValue,
 } from 'motion/react';
 import {
+  AudioLines,
   Blocks,
+  BookOpen,
+  CalendarCheck2,
   Camera,
   Check,
   Compass,
@@ -24,6 +27,7 @@ import {
   MicOff,
   MonitorUp,
   Play,
+  Radio,
   Settings2,
   SlidersHorizontal,
   Sparkles,
@@ -40,6 +44,10 @@ export type DockDrawerTab =
   | 'visuals'
   | 'automation'
   | 'youtube'
+  | 'workspace'
+  | 'meetings'
+  | 'vault'
+  | 'triggers'
   | 'macros'
   | 'plugins'
   | 'tauri'
@@ -64,6 +72,8 @@ interface IosControlDockProps {
   isAutomating: boolean;
   hasActiveVisual?: boolean;
   hasActiveTrack: boolean;
+  hasPendingTasks?: boolean;
+  hasWorkspaceConnected?: boolean;
   hasActivePlugins?: boolean;
   agentConnected?: boolean;
   voiceName: VoiceName;
@@ -192,6 +202,8 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
   isAutomating,
   hasActiveVisual = false,
   hasActiveTrack,
+  hasPendingTasks = false,
+  hasWorkspaceConnected = false,
   hasActivePlugins = false,
   agentConnected = false,
   voiceName,
@@ -299,6 +311,46 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
         activeDrawer === 'youtube'
           ? 'bg-gradient-to-b from-rose-500 to-red-600 text-white shadow-[0_8px_20px_rgba(244,63,94,0.45),inset_0_1px_0_rgba(255,255,255,0.35)]'
           : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-rose-400 border border-white/10 hover:border-rose-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
+    },
+    {
+      id: 'workspace',
+      label: 'Workspace',
+      icon: <CalendarCheck2 className="w-5 h-5" />,
+      running: hasPendingTasks || hasWorkspaceConnected,
+      accentClass:
+        activeDrawer === 'workspace'
+          ? 'bg-gradient-to-b from-cyan-400 to-blue-600 text-white shadow-[0_8px_20px_rgba(34,211,238,0.45),inset_0_1px_0_rgba(255,255,255,0.35)]'
+          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-cyan-300 border border-white/10 hover:border-cyan-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
+    },
+    {
+      id: 'meetings',
+      label: 'Meetings',
+      icon: <AudioLines className="w-5 h-5" />,
+      running: false,
+      accentClass:
+        activeDrawer === 'meetings'
+          ? 'bg-gradient-to-b from-fuchsia-400 to-purple-600 text-white shadow-[0_8px_20px_rgba(217,70,239,0.45),inset_0_1px_0_rgba(255,255,255,0.35)]'
+          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-fuchsia-300 border border-white/10 hover:border-fuchsia-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
+    },
+    {
+      id: 'vault',
+      label: 'Vault & Git',
+      icon: <BookOpen className="w-5 h-5" />,
+      running: false,
+      accentClass:
+        activeDrawer === 'vault'
+          ? 'bg-gradient-to-b from-teal-400 to-emerald-600 text-slate-950 shadow-[0_8px_20px_rgba(45,212,191,0.45),inset_0_1px_0_rgba(255,255,255,0.45)]'
+          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-teal-300 border border-white/10 hover:border-teal-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
+    },
+    {
+      id: 'triggers',
+      label: 'Triggers',
+      icon: <Radio className="w-5 h-5" />,
+      running: false,
+      accentClass:
+        activeDrawer === 'triggers'
+          ? 'bg-gradient-to-b from-violet-400 to-indigo-600 text-white shadow-[0_8px_20px_rgba(139,92,246,0.45),inset_0_1px_0_rgba(255,255,255,0.35)]'
+          : 'bg-gradient-to-b from-slate-800/95 to-slate-900/95 text-violet-300 border border-white/10 hover:border-violet-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]',
     },
     {
       id: 'macros',
@@ -562,7 +614,7 @@ export const IosControlDock: React.FC<IosControlDockProps> = ({
             <div
               onMouseMove={(e) => mouseX.set(e.clientX)}
               onMouseLeave={() => mouseX.set(Infinity)}
-              className="px-2.5 sm:px-3.5 pt-2.5 pb-1.5 rounded-[24px] sm:rounded-[28px] bg-[#0B111E]/58 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_22px_56px_rgba(0,0,0,0.62),inset_0_1px_0_rgba(255,255,255,0.24)] flex items-end gap-1.5 sm:gap-2.5"
+              className="px-2.5 sm:px-3.5 pt-2.5 pb-1.5 rounded-[24px] sm:rounded-[28px] bg-[#0B111E]/58 backdrop-blur-3xl backdrop-saturate-150 border border-white/18 shadow-[0_22px_56px_rgba(0,0,0,0.62),inset_0_1px_0_rgba(255,255,255,0.24)] flex items-end gap-1.5 sm:gap-2.5 max-w-[94vw] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
             >
               {/* Primary Voice Core Squircle */}
               <DockItemButton

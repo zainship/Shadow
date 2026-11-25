@@ -78,6 +78,9 @@ export interface AutomationRunState {
   id: string;
   goal: string;
   targetUrl: string;
+  engine?: 'playwright' | 'http-dom';
+  playwrightAvailable?: boolean;
+  screenshotBase64?: string | null;
   status: 'idle' | 'running' | 'completed' | 'failed';
   steps: StepExecutionState[];
   inspection: PageInspectionResult | null;
@@ -187,6 +190,11 @@ export interface CommandExecution {
     | 'research'
     | 'plugin_run'
     | 'visual_generate'
+    | 'workspace'
+    | 'meeting'
+    | 'vault'
+    | 'schedule'
+    | 'devops'
     | 'conversation';
   targetUrl: string;
   status: 'running' | 'completed' | 'failed';
@@ -263,6 +271,10 @@ export interface ActiveWorkspaceContext {
   activeTrackTitle?: string;
   visionMode?: VisionSourceMode;
   shelfItems?: Array<{ name: string; kind: 'file' | 'text' | 'image'; previewText?: string }>;
+  tasksSummary?: string;
+  activeMeetingTitle?: string;
+  vaultDocsCount?: number;
+  workspaceConnected?: boolean;
 }
 
 export interface AutonomousAgentIteration {
@@ -421,6 +433,7 @@ export interface MorningBrief {
   audioBase64?: string | null;
   topics: string[];
   provider: string;
+  workspaceDigestIncluded?: boolean;
 }
 
 export interface MorningBriefConfig {
@@ -434,4 +447,61 @@ export interface MorningBriefConfig {
   lastRunDate?: string;
   lastAttemptAt?: number;
 }
+
+export type TaskPriority = 'low' | 'medium' | 'high';
+
+export interface ShadowTask {
+  id: string;
+  ownerId?: string;
+  title: string;
+  status: 'pending' | 'done';
+  priority: TaskPriority;
+  dueAt: string;
+  notes: string;
+  reminded: boolean;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface PendingWorkspaceAction {
+  id: string;
+  service: 'gmail' | 'calendar';
+  action: 'send' | 'create_event' | 'delete_event';
+  title: string;
+  payload: Record<string, unknown>;
+}
+
+export interface MeetingActionItem {
+  text: string;
+  assignee?: string;
+  dueHint?: string;
+}
+
+export interface MeetingNote {
+  id: string;
+  ownerId?: string;
+  title: string;
+  summary: string;
+  transcript: string;
+  keyDecisions: string[];
+  actionItems: MeetingActionItem[];
+  topics: string[];
+  durationSeconds: number;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface VaultDocumentMeta {
+  id: string;
+  ownerId?: string;
+  vaultId: string;
+  title: string;
+  sourceType: 'note' | 'file' | 'pdf' | 'repo' | 'meeting' | 'url';
+  summary: string;
+  chunkCount: number;
+  embedded: boolean;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
 

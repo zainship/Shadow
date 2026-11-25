@@ -12,6 +12,9 @@ import type {
   SetupConfig,
   ShadowPermissions,
   ShadowPlugin,
+  ShadowTask,
+  MeetingNote,
+  VaultDocumentMeta,
 } from '../types/assistant';
 
 const SETUP_STORAGE_KEY = 'shadow_setup_config_v1';
@@ -19,6 +22,9 @@ const LOCAL_MEMORIES_KEY = 'shadow_local_memories_v1';
 const LOCAL_FACE_AUTH_KEY = 'shadow_local_face_auth_v1';
 const LOCAL_PLUGINS_KEY = 'shadow_local_plugins_v1';
 const CONFIRM_LAPTOP_ACTIONS_KEY = 'shadow_confirm_laptop_actions_v1';
+const LOCAL_TASKS_KEY = 'shadow_local_tasks_v1';
+const LOCAL_MEETINGS_KEY = 'shadow_local_meetings_v1';
+const LOCAL_VAULT_META_KEY = 'shadow_local_vault_meta_v1';
 
 export const DEFAULT_PERMISSIONS: ShadowPermissions = {
   files: false,
@@ -293,4 +299,62 @@ export function createLocalPluginRecord(
     updatedAt: now,
   };
 }
+
+export function loadLocalTasks(): ShadowTask[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_TASKS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ShadowTask[];
+    return Array.isArray(parsed) ? parsed.slice(0, 120) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalTasks(tasks: ShadowTask[]): void {
+  try {
+    localStorage.setItem(LOCAL_TASKS_KEY, JSON.stringify(tasks.slice(0, 120)));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function loadLocalMeetings(): MeetingNote[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_MEETINGS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as MeetingNote[];
+    return Array.isArray(parsed) ? parsed.slice(0, 40) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalMeetings(meetings: MeetingNote[]): void {
+  try {
+    localStorage.setItem(LOCAL_MEETINGS_KEY, JSON.stringify(meetings.slice(0, 40)));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function loadLocalVaultMeta(): VaultDocumentMeta[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_VAULT_META_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as VaultDocumentMeta[];
+    return Array.isArray(parsed) ? parsed.slice(0, 100) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalVaultMeta(docs: VaultDocumentMeta[]): void {
+  try {
+    localStorage.setItem(LOCAL_VAULT_META_KEY, JSON.stringify(docs.slice(0, 100)));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 

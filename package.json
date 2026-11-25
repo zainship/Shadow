@@ -31,9 +31,11 @@
     "firebase": "^13.4.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "playwright-core": "^1.65.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "three": "^0.187.0",
+    "unpdf": "^2.2.2",
     "vite": "^8.3.0",
     "vite-plugin-pwa": "^2.0.0",
     "ws": "^8.23.0"

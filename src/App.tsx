@@ -11,7 +11,10 @@ import {
 } from 'firebase/auth';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
+  AudioLines,
   Blocks,
+  BookOpen,
+  CalendarCheck2,
   Compass,
   Cpu,
   Globe,
@@ -21,7 +24,10 @@ import {
   LogOut,
   Monitor,
   Play,
+  Radio,
+  ShieldAlert,
   Sunrise,
+  X,
 } from 'lucide-react';
 import {
   ArcReactorScene,
@@ -41,14 +47,18 @@ import {
   MacWindowFrame,
 } from './components/MacWindowShell';
 import { MorningBriefStage } from './components/MorningBriefStage';
+import { MeetingCompanionStage } from './components/MeetingCompanionStage';
 import { PluginsStage, type PluginActivityLog } from './components/PluginsStage';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { RemoteTriggersStage } from './components/RemoteTriggersStage';
 import { ResearchStage } from './components/ResearchStage';
 import { VisualsStage } from './components/VisualsStage';
 import {
   MacrosAndHistoryView,
   TauriDesktopView,
 } from './components/WorkflowsAndHistoryPanel';
+import { KnowledgeVaultStage } from './components/KnowledgeVaultStage';
+import { WorkspaceStage } from './components/WorkspaceStage';
 import { YouTubeMediaStage } from './components/YouTubeMediaStage';
 import { float32ToPcm16Base64, PcmAudioPlayer, speakWithBrowserSpeech } from './lib/audioEngine';
 import {
@@ -57,17 +67,30 @@ import {
   StandbyClapListener,
   type ClapListenerStatus,
 } from './lib/clapDetector';
-import { auth, googleProvider, testConnection } from './lib/firebase';
+import {
+  auth,
+  clearWorkspaceAccessToken,
+  connectWorkspaceScopesPopup,
+  getWorkspaceAccessToken,
+  googleProvider,
+  setWorkspaceAccessToken,
+  subscribeWorkspaceTokenChange,
+  testConnection,
+} from './lib/firebase';
 import {
   addMediaQueueItem,
   createExecutionLog,
   createMemory,
+  createTaskInFirestore,
   createWorkflow,
   deleteFaceAuthProfile,
   deleteMediaQueueItem,
+  deleteMeetingInFirestore,
   deleteMemory,
   deletePluginInFirestore,
   deleteResearchReport,
+  deleteTaskInFirestore,
+  deleteVaultDocMetaInFirestore,
   deleteWorkflow,
   ensureUserProfile,
   finalizeExecutionLog,
@@ -76,17 +99,23 @@ import {
   incrementWorkflowRunCount,
   installPluginInFirestore,
   saveFaceAuthProfile,
+  saveMeetingInFirestore,
   saveResearchReport,
   saveSetupConfigToFirestore,
+  saveVaultDocMetaInFirestore,
   subscribeExecutions,
   subscribeMediaQueue,
+  subscribeMeetings,
   subscribeMemories,
   subscribePlugins,
   subscribeResearchReports,
+  subscribeTasks,
+  subscribeVaultDocs,
   subscribeWorkflows,
   updateMediaQueueStatus,
   updateMemory,
   updatePluginInFirestore,
+  updateTaskInFirestore,
   updateUserPreferences,
 } from './lib/firestoreService';
 import {
@@ -94,16 +123,22 @@ import {
   createLocalPluginRecord,
   loadConfirmLaptopActions,
   loadLocalFaceAuth,
+  loadLocalMeetings,
   loadLocalMemories,
   loadLocalPlugins,
   loadLocalSetupConfig,
+  loadLocalTasks,
+  loadLocalVaultMeta,
   sanitizePermissions,
   sanitizePluginDraft,
   saveConfirmLaptopActions,
   saveLocalFaceAuth,
+  saveLocalMeetings,
   saveLocalMemories,
   saveLocalPlugins,
   saveLocalSetupConfig,
+  saveLocalTasks,
+  saveLocalVaultMeta,
 } from './lib/setupStorage';
 import {
   checkLaptopAgentHealth,
@@ -172,14 +207,19 @@ import type {
   GeneratedVisual,
   LaptopActionEvent,
   LaptopAgentHealth,
+  MeetingNote,
   MemoryCategory,
   MemoryImportance,
   PageInspectionResult,
+  PendingWorkspaceAction,
   PluginExecutionResult,
   ResearchReport,
   SetupConfig,
   ShadowPlugin,
+  ShadowTask,
   StepExecutionState,
+  TaskPriority,
+  VaultDocumentMeta,
   VisionSourceMode,
   VisualAspectRatio,
   VisualStyle,
@@ -197,6 +237,10 @@ type DrawerTab =
   | 'automation'
   | 'youtube'
   | 'visuals'
+  | 'workspace'
+  | 'meetings'
+  | 'vault'
+  | 'triggers'
   | 'macros'
   | 'plugins'
   | 'tauri'
@@ -495,6 +539,18 @@ function JarvisArcWorkspace() {
   const [executions, setExecutions] = useState<CommandExecution[]>([]);
   const [firestoreQueue, setFirestoreQueue] = useState<YouTubeTrack[]>([]);
   const [firestoreResearch, setFirestoreResearch] = useState<ResearchReport[]>([]);
+  const [workspaceConnected, setWorkspaceConnected] = useState<boolean>(() =>
+    Boolean(getWorkspaceAccessToken())
+  );
+  const [localTasks, setLocalTasks] = useState<ShadowTask[]>(() => loadLocalTasks());
+  const [firestoreTasks, setFirestoreTasks] = useState<ShadowTask[]>([]);
+  const [localMeetings, setLocalMeetings] = useState<MeetingNote[]>(() => loadLocalMeetings());
+  const [firestoreMeetings, setFirestoreMeetings] = useState<MeetingNote[]>([]);
+  const [localVaultDocs, setLocalVaultDocs] = useState<VaultDocumentMeta[]>(() => loadLocalVaultMeta());
+  const [firestoreVaultDocs, setFirestoreVaultDocs] = useState<VaultDocumentMeta[]>([]);
+  const [pendingWorkspaceAction, setPendingWorkspaceAction] =
+    useState<PendingWorkspaceAction | null>(null);
+  const [workspaceConfirmBusy, setWorkspaceConfirmBusy] = useState(false);
 
   // Audio & Socket Refs
   const wsRef = useRef<WebSocket | null>(null);
@@ -518,6 +574,7 @@ function JarvisArcWorkspace() {
   const mutedClapAnalyzerRef = useRef<DoubleClapAnalyzer>(new DoubleClapAnalyzer());
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const browserVoiceActiveRef = useRef<boolean>(false);
+  const handleSpeakTextRef = useRef<(text: string) => Promise<void>>(async () => {});
   const runSpokenActionRef = useRef<(commandText: string, explicitAttachment?: CommandAttachment) => Promise<void>>(
     async () => {}
   );
@@ -525,10 +582,30 @@ function JarvisArcWorkspace() {
   const clapWakeEnabledRef = useRef<boolean>(setupConfig.clapWakeEnabled);
   clapWakeEnabledRef.current = setupConfig.clapWakeEnabled;
 
+  useEffect(() => {
+    return subscribeWorkspaceTokenChange((connected) => {
+      setWorkspaceConnected(connected);
+      const token = getWorkspaceAccessToken();
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'workspace_token',
+            data: token || '',
+          })
+        );
+      }
+    });
+  }, []);
+
   const mediaQueue = user ? firestoreQueue : localQueue;
   const researchHistory = user ? firestoreResearch : localResearchHistory;
   const memories = user ? firestoreMemories : localMemories;
   const plugins = user ? firestorePlugins : localPlugins;
+  const tasks = user ? firestoreTasks : localTasks;
+  const meetings = user ? firestoreMeetings : localMeetings;
+  const vaultDocs = user ? firestoreVaultDocs : localVaultDocs;
+  const tasksRef = useRef<ShadowTask[]>(tasks);
+  tasksRef.current = tasks;
   const pluginsRef = useRef<ShadowPlugin[]>(plugins);
   pluginsRef.current = plugins;
   const assistantName = setupConfig.assistantName.trim() || 'Shadow';
@@ -717,6 +794,41 @@ function JarvisArcWorkspace() {
           label: name ? `Saving macro: ${name.slice(0, 40)}` : 'Saving voice macro',
         };
       }
+      if (toolName === 'manage_workspace') {
+        const svc = String(args.service || 'workspace');
+        const op = String(args.operation || 'action');
+        return {
+          kind: 'command',
+          label: `Workspace (${svc}): ${op}`,
+        };
+      }
+      if (toolName === 'manage_tasks_reminders') {
+        const op = String(args.action || 'tasks');
+        return {
+          kind: 'command',
+          label: `Tasks: ${op}`,
+        };
+      }
+      if (toolName === 'search_knowledge_vault') {
+        const q = String(args.query || '').trim();
+        return {
+          kind: 'memory',
+          label: q ? `Vault search: ${q.slice(0, 38)}` : 'Searching Knowledge Vault',
+        };
+      }
+      if (toolName === 'inspect_github_repo') {
+        const repo = String(args.repo || '').trim();
+        return {
+          kind: 'automation',
+          label: repo ? `GitHub: ${repo.slice(0, 40)}` : 'Inspecting GitHub repo',
+        };
+      }
+      if (toolName === 'trigger_bridge_message' || toolName === 'manage_schedules') {
+        return {
+          kind: 'command',
+          label: toolName === 'trigger_bridge_message' ? 'Sending bridge notification' : 'Updating automation schedule',
+        };
+      }
       const pluginMatch = pluginsRef.current.find((p) => p.toolName === toolName);
       if (pluginMatch) {
         return {
@@ -779,11 +891,23 @@ function JarvisArcWorkspace() {
     let unsubResearch: (() => void) | null = null;
     let unsubMemories: (() => void) | null = null;
     let unsubPlugins: (() => void) | null = null;
+    let unsubTasks: (() => void) | null = null;
+    let unsubMeetings: (() => void) | null = null;
+    let unsubVaultDocs: (() => void) | null = null;
 
-    void getRedirectResult(auth).catch((err) => {
-      const msg = err instanceof Error ? err.message : '';
-      if (msg) setAuthError(msg);
-    });
+    void getRedirectResult(auth)
+      .then((res) => {
+        if (res) {
+          const cred = GoogleAuthProvider.credentialFromResult(res);
+          if (cred?.accessToken) {
+            setWorkspaceAccessToken(cred.accessToken);
+          }
+        }
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg) setAuthError(msg);
+      });
 
     const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
       if (unsubWorkflows) unsubWorkflows();
@@ -792,12 +916,18 @@ function JarvisArcWorkspace() {
       if (unsubResearch) unsubResearch();
       if (unsubMemories) unsubMemories();
       if (unsubPlugins) unsubPlugins();
+      if (unsubTasks) unsubTasks();
+      if (unsubMeetings) unsubMeetings();
+      if (unsubVaultDocs) unsubVaultDocs();
       unsubWorkflows = null;
       unsubExecutions = null;
       unsubQueue = null;
       unsubResearch = null;
       unsubMemories = null;
       unsubPlugins = null;
+      unsubTasks = null;
+      unsubMeetings = null;
+      unsubVaultDocs = null;
 
       setUser(nextUser);
       setAuthReady(true);
@@ -891,6 +1021,9 @@ function JarvisArcWorkspace() {
           });
           unsubMemories = subscribeMemories(nextUser.uid, setFirestoreMemories);
           unsubPlugins = subscribePlugins(nextUser.uid, setFirestorePlugins);
+          unsubTasks = subscribeTasks(nextUser.uid, setFirestoreTasks);
+          unsubMeetings = subscribeMeetings(nextUser.uid, setFirestoreMeetings);
+          unsubVaultDocs = subscribeVaultDocs(nextUser.uid, setFirestoreVaultDocs);
         } catch (err) {
           setAuthError(err instanceof Error ? err.message : 'Failed to load profile');
         }
@@ -901,6 +1034,10 @@ function JarvisArcWorkspace() {
         setFirestoreResearch([]);
         setFirestoreMemories([]);
         setFirestorePlugins([]);
+        setFirestoreTasks([]);
+        setFirestoreMeetings([]);
+        setFirestoreVaultDocs([]);
+        clearWorkspaceAccessToken();
       }
     });
 
@@ -912,6 +1049,9 @@ function JarvisArcWorkspace() {
       if (unsubResearch) unsubResearch();
       if (unsubMemories) unsubMemories();
       if (unsubPlugins) unsubPlugins();
+      if (unsubTasks) unsubTasks();
+      if (unsubMeetings) unsubMeetings();
+      if (unsubVaultDocs) unsubVaultDocs();
     };
   }, []);
 
@@ -1211,6 +1351,238 @@ function JarvisArcWorkspace() {
     [user, runtimeInfo.runtime]
   );
 
+  const handleConnectWorkspace = useCallback(async () => {
+    setAuthError(null);
+    const token = await connectWorkspaceScopesPopup();
+    if (token) {
+      showTransientCaption(assistantNameRef.current, 'Google Workspace connected.', 3500);
+    }
+  }, [showTransientCaption]);
+
+  const handleCreateTask = useCallback(
+    async (input: { title: string; priority?: TaskPriority; dueAt?: string; notes?: string }) => {
+      const cleanTitle = input.title.trim().slice(0, 200);
+      if (!cleanTitle) return;
+      if (user) {
+        await createTaskInFirestore(user.uid, input);
+      } else {
+        const record: ShadowTask = {
+          id: `tsk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          title: cleanTitle,
+          status: 'pending',
+          priority: input.priority || 'medium',
+          dueAt: String(input.dueAt || '').trim(),
+          notes: String(input.notes || '').trim(),
+          reminded: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        setLocalTasks((prev) => {
+          const next = [record, ...prev].slice(0, 120);
+          saveLocalTasks(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleToggleTask = useCallback(
+    async (task: ShadowTask) => {
+      const nextStatus: ShadowTask['status'] = task.status === 'done' ? 'pending' : 'done';
+      if (user) {
+        await updateTaskInFirestore(task.id, { status: nextStatus });
+      } else {
+        setLocalTasks((prev) => {
+          const next = prev.map((t) =>
+            t.id === task.id ? { ...t, status: nextStatus, updatedAt: new Date().toISOString() } : t
+          );
+          saveLocalTasks(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleDeleteTask = useCallback(
+    async (taskId: string) => {
+      if (user) {
+        await deleteTaskInFirestore(taskId);
+      } else {
+        setLocalTasks((prev) => {
+          const next = prev.filter((t) => t.id !== taskId);
+          saveLocalTasks(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleSaveMeeting = useCallback(
+    async (note: Omit<MeetingNote, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>) => {
+      if (user) {
+        await saveMeetingInFirestore(user.uid, note);
+      } else {
+        const record: MeetingNote = {
+          ...note,
+          id: `mtg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        setLocalMeetings((prev) => {
+          const next = [record, ...prev].slice(0, 40);
+          saveLocalMeetings(next);
+          return next;
+        });
+      }
+      showTransientCaption(assistantNameRef.current, `Saved meeting: ${note.title}`, 3500);
+    },
+    [user, showTransientCaption]
+  );
+
+  const handleDeleteMeeting = useCallback(
+    async (meetingId: string) => {
+      if (user) {
+        await deleteMeetingInFirestore(meetingId);
+      } else {
+        setLocalMeetings((prev) => {
+          const next = prev.filter((m) => m.id !== meetingId);
+          saveLocalMeetings(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleSaveVaultDocMeta = useCallback(
+    async (meta: Omit<VaultDocumentMeta, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>) => {
+      if (user) {
+        await saveVaultDocMetaInFirestore(user.uid, meta);
+      } else {
+        const record: VaultDocumentMeta = {
+          ...meta,
+          id: meta.vaultId || `vlt-${Date.now()}`,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        setLocalVaultDocs((prev) => {
+          const next = [record, ...prev.filter((d) => d.vaultId !== record.vaultId)].slice(0, 100);
+          saveLocalVaultMeta(next);
+          return next;
+        });
+      }
+    },
+    [user]
+  );
+
+  const handleDeleteVaultDocMeta = useCallback(
+    async (vaultId: string) => {
+      if (user) {
+        const match = firestoreVaultDocs.find((d) => d.vaultId === vaultId || d.id === vaultId);
+        if (match) await deleteVaultDocMetaInFirestore(match.id);
+      } else {
+        setLocalVaultDocs((prev) => {
+          const next = prev.filter((d) => d.vaultId !== vaultId && d.id !== vaultId);
+          saveLocalVaultMeta(next);
+          return next;
+        });
+      }
+    },
+    [user, firestoreVaultDocs]
+  );
+
+  const handleIngestToVault = useCallback(
+    async (input: {
+      title: string;
+      contentText: string;
+      sourceType: VaultDocumentMeta['sourceType'];
+    }) => {
+      const res = await fetch(`${getApiOrigin()}/api/vault/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
+        body: JSON.stringify({
+          ownerKey: user?.uid || 'local',
+          title: input.title,
+          sourceType: input.sourceType,
+          contentText: input.contentText,
+        }),
+      });
+      const data = await parseJsonSafely<{
+        ok?: boolean;
+        doc?: {
+          id: string;
+          title: string;
+          sourceType: VaultDocumentMeta['sourceType'];
+          summary: string;
+          chunkCount: number;
+          embedded: boolean;
+        };
+        error?: string;
+      }>(res);
+      if (!res.ok || !data?.doc) {
+        throw new Error(data?.error || 'Failed to index document into Knowledge Vault');
+      }
+      await handleSaveVaultDocMeta({
+        vaultId: data.doc.id,
+        title: data.doc.title,
+        sourceType: data.doc.sourceType,
+        summary: data.doc.summary,
+        chunkCount: data.doc.chunkCount,
+        embedded: data.doc.embedded,
+      });
+      showTransientCaption(
+        assistantNameRef.current,
+        `Indexed "${data.doc.title}" into Knowledge Vault.`,
+        4000
+      );
+    },
+    [user, handleSaveVaultDocMeta, showTransientCaption]
+  );
+
+  // Poll pending task due dates every 20s and fire notifications + speech reminders
+  useEffect(() => {
+    const checkDueTasks = () => {
+      const now = Date.now();
+      const dueList = tasksRef.current.filter((t) => {
+        if (t.status !== 'pending' || t.reminded || !t.dueAt) return false;
+        const ts = Date.parse(t.dueAt);
+        return !Number.isNaN(ts) && ts <= now;
+      });
+      if (dueList.length === 0) return;
+
+      for (const task of dueList) {
+        if (user) {
+          void updateTaskInFirestore(task.id, { reminded: true }).catch(() => null);
+        } else {
+          setLocalTasks((prev) => {
+            const next = prev.map((item) =>
+              item.id === task.id ? { ...item, reminded: true } : item
+            );
+            saveLocalTasks(next);
+            return next;
+          });
+        }
+        const msg = `Reminder: ${task.title}`;
+        showTransientCaption(assistantNameRef.current, msg, 7500);
+        void handleSpeakTextRef.current(msg);
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try {
+            new Notification(`${assistantNameRef.current} · Task Due`, { body: task.title });
+          } catch {
+            // ignore notification blocks
+          }
+        }
+      }
+    };
+
+    checkDueTasks();
+    const timer = window.setInterval(checkDueTasks, 20_000);
+    return () => window.clearInterval(timer);
+  }, [user, showTransientCaption]);
+
   const buildSessionContextPayload = useCallback(() => {
     const sortedMemories = [...memories]
       .sort((a, b) => {
@@ -1244,6 +1616,14 @@ function JarvisArcWorkspace() {
         bodyTemplate: p.bodyTemplate,
         commandTemplate: p.commandTemplate,
       }));
+    const pendingTasks = tasks.filter((t) => t.status === 'pending');
+    const tasksSummary =
+      pendingTasks.length > 0
+        ? pendingTasks
+            .slice(0, 6)
+            .map((t) => `${t.title}${t.dueAt ? ` (due ${t.dueAt})` : ''}`)
+            .join('; ')
+        : undefined;
     const workspace: ActiveWorkspaceContext = {
       currentDateTime: new Date().toLocaleString([], {
         weekday: 'short',
@@ -1265,6 +1645,9 @@ function JarvisArcWorkspace() {
       activeTrackTitle: currentTrack?.title,
       visionMode: vision.visionMode,
       shelfItems: shelfWorkspaceItems.slice(0, 6),
+      tasksSummary,
+      vaultDocsCount: vaultDocs.length,
+      workspaceConnected,
     };
     return {
       assistantName,
@@ -1277,6 +1660,9 @@ function JarvisArcWorkspace() {
   }, [
     memories,
     plugins,
+    tasks,
+    vaultDocs.length,
+    workspaceConnected,
     assistantName,
     setupConfig,
     activeDrawer,
@@ -1324,6 +1710,9 @@ function JarvisArcWorkspace() {
           submissionResult?: AutomationSubmissionResult | null;
           totalDurationMs?: number;
           ok?: boolean;
+          engine?: 'playwright' | 'http-dom';
+          playwrightAvailable?: boolean;
+          screenshotBase64?: string | null;
         };
       }
     ) => {
@@ -1351,6 +1740,9 @@ function JarvisArcWorkspace() {
         id: runId,
         goal,
         targetUrl,
+        engine: options?.preExecuted?.engine,
+        playwrightAvailable: options?.preExecuted?.playwrightAvailable,
+        screenshotBase64: options?.preExecuted?.screenshotBase64 ?? null,
         status: 'running',
         steps: initialSteps,
         inspection,
@@ -1391,6 +1783,11 @@ function JarvisArcWorkspace() {
       let resolvedSubmission: AutomationSubmissionResult | null =
         options?.preExecuted?.submissionResult ?? null;
       let resolvedDuration: number | undefined = options?.preExecuted?.totalDurationMs;
+      let resolvedEngine: 'playwright' | 'http-dom' | undefined = options?.preExecuted?.engine;
+      let resolvedPlaywrightAvailable: boolean | undefined =
+        options?.preExecuted?.playwrightAvailable;
+      let resolvedScreenshotBase64: string | null | undefined =
+        options?.preExecuted?.screenshotBase64;
 
       if (!options?.skipClientInvocation && canReachLaptop && (runtimeInfo.isTauri || isDesktopLayout)) {
         try {
@@ -1428,6 +1825,9 @@ function JarvisArcWorkspace() {
           const data = await parseJsonSafely<{
             ok?: boolean;
             targetUrl?: string;
+            engine?: 'playwright' | 'http-dom';
+            playwrightAvailable?: boolean;
+            screenshotBase64?: string | null;
             steps?: StepExecutionState[];
             inspection?: PageInspectionResult | null;
             extractedItems?: AutomationExtractedItem[];
@@ -1442,6 +1842,9 @@ function JarvisArcWorkspace() {
             );
           }
           execOk = data.ok !== false;
+          resolvedEngine = data.engine;
+          resolvedPlaywrightAvailable = data.playwrightAvailable;
+          resolvedScreenshotBase64 = data.screenshotBase64 ?? null;
           if (Array.isArray(data.steps) && data.steps.length > 0) {
             resolvedSteps = data.steps;
           }
@@ -1497,6 +1900,9 @@ function JarvisArcWorkspace() {
               ...prev,
               status: finalStatus,
               targetUrl: resolvedInspection?.finalUrl || targetUrl,
+              engine: resolvedEngine ?? prev.engine,
+              playwrightAvailable: resolvedPlaywrightAvailable ?? prev.playwrightAvailable,
+              screenshotBase64: resolvedScreenshotBase64 ?? prev.screenshotBase64 ?? null,
               steps: resolvedSteps,
               inspection: resolvedInspection,
               extractedItems: resolvedExtracted,
@@ -1575,12 +1981,19 @@ function JarvisArcWorkspace() {
           setActiveDrawer('automation');
         }
       } else if (name === 'run_autonomous_web_agent') {
-        const agentRes = result as unknown as AutonomousWebAgentResult;
+        const agentRes = result as unknown as AutonomousWebAgentResult & {
+          engine?: 'playwright' | 'http-dom';
+          playwrightAvailable?: boolean;
+          screenshotBase64?: string | null;
+        };
         setIsAutomating(false);
         setAutomationRun({
           id: `agent-${Date.now()}`,
           goal: agentRes.goal || String(args.goal || 'Autonomous Web Task'),
           targetUrl: agentRes.finalUrl || agentRes.startUrl || String(args.startUrl || ''),
+          engine: agentRes.engine,
+          playwrightAvailable: agentRes.playwrightAvailable,
+          screenshotBase64: agentRes.screenshotBase64 ?? null,
           status: agentRes.ok ? 'completed' : 'failed',
           steps: Array.isArray(agentRes.steps) ? agentRes.steps : [],
           inspection: agentRes.inspection ?? null,
@@ -1611,6 +2024,14 @@ function JarvisArcWorkspace() {
           (result.submissionResult as AutomationSubmissionResult | null | undefined) ?? null;
         const totalDurationMs =
           typeof result.totalDurationMs === 'number' ? result.totalDurationMs : undefined;
+        const engine =
+          result.engine === 'playwright' || result.engine === 'http-dom'
+            ? result.engine
+            : undefined;
+        const playwrightAvailable =
+          typeof result.playwrightAvailable === 'boolean' ? result.playwrightAvailable : undefined;
+        const screenshotBase64 =
+          typeof result.screenshotBase64 === 'string' ? result.screenshotBase64 : undefined;
         await runAutomationSequence(goal, targetUrl, steps, inspection, transcript || goal, {
           skipClientInvocation: Boolean(result.clientExecuted),
           preExecuted: steps.some((s) => s.status && s.status !== 'pending')
@@ -1620,6 +2041,9 @@ function JarvisArcWorkspace() {
                 submissionResult,
                 totalDurationMs,
                 ok: result.ok !== false,
+                engine,
+                playwrightAvailable,
+                screenshotBase64,
               }
             : undefined,
         });
@@ -1829,6 +2253,56 @@ function JarvisArcWorkspace() {
         if (!ok) {
           setActiveDrawer('tauri');
         }
+      } else if (name === 'manage_workspace') {
+        if (result.needsReauth) {
+          clearWorkspaceAccessToken();
+          setActiveDrawer('workspace');
+          showTransientCaption(
+            assistantNameRef.current,
+            'Connect Google Workspace in the Workspace stage to continue.',
+            5000
+          );
+        } else if (result.requiresConfirmation && result.pendingAction) {
+          setPendingWorkspaceAction(result.pendingAction as PendingWorkspaceAction);
+        } else {
+          setActiveDrawer('workspace');
+        }
+      } else if (name === 'manage_tasks_reminders') {
+        const act = String(args.action || 'list').toLowerCase();
+        const titleInput = String(args.title || '').trim();
+        if (act === 'create' && titleInput) {
+          const prio = String(args.priority || 'medium') as TaskPriority;
+          await handleCreateTask({
+            title: titleInput,
+            priority: prio === 'low' || prio === 'high' ? prio : 'medium',
+            dueAt: typeof args.dueAt === 'string' ? args.dueAt : '',
+            notes: typeof args.notes === 'string' ? args.notes : '',
+          });
+        } else if (act === 'complete') {
+          const id = String(args.taskId || '').trim();
+          const match = tasksRef.current.find(
+            (t) =>
+              t.status === 'pending' &&
+              ((id && t.id === id) ||
+                (titleInput && t.title.toLowerCase().includes(titleInput.toLowerCase())))
+          );
+          if (match) await handleToggleTask(match);
+        } else if (act === 'delete') {
+          const id = String(args.taskId || '').trim();
+          const match = tasksRef.current.find(
+            (t) =>
+              (id && t.id === id) ||
+              (titleInput && t.title.toLowerCase().includes(titleInput.toLowerCase()))
+          );
+          if (match) await handleDeleteTask(match.id);
+        }
+        setActiveDrawer('workspace');
+      } else if (name === 'search_knowledge_vault') {
+        setActiveDrawer('vault');
+      } else if (name === 'inspect_github_repo') {
+        setActiveDrawer('vault');
+      } else if (name === 'trigger_bridge_message' || name === 'manage_schedules') {
+        setActiveDrawer('triggers');
       } else {
         const matchedPlugin = pluginsRef.current.find((p) => p.toolName === name);
         if (matchedPlugin) {
@@ -1901,6 +2375,10 @@ function JarvisArcWorkspace() {
       handleDeleteMemoryRecord,
       memories,
       recordPluginExecution,
+      handleCreateTask,
+      handleToggleTask,
+      handleDeleteTask,
+      showTransientCaption,
     ]
   );
 
@@ -2235,8 +2713,13 @@ function JarvisArcWorkspace() {
           isConnectedRef.current = true;
           setIsConnected(true);
           setIsConnecting(false);
-          // Announce BYOK provider (server falls back to its env keys when absent).
-          ws.send(JSON.stringify(aiSocketAuthMessage(aiSettingsRef.current)));
+          // Announce BYOK provider & memory-only Workspace token (server falls back to env keys when absent).
+          ws.send(
+            JSON.stringify({
+              ...aiSocketAuthMessage(aiSettingsRef.current),
+              workspaceToken: getWorkspaceAccessToken(),
+            })
+          );
           showTransientCaption(assistantNameRef.current, 'Voice core online. Listening.', 3500);
         };
 
@@ -2607,6 +3090,7 @@ function JarvisArcWorkspace() {
     },
     [voiceName, showTransientCaption]
   );
+  handleSpeakTextRef.current = handleSpeakText;
 
   // Triggered by Dynamic Island Spotlight, Browser Voice fallback, Shelf, stage demo buttons, or macro replay
   const runSpokenAction = useCallback(
@@ -2734,6 +3218,38 @@ function JarvisArcWorkspace() {
           void handleSpeakText(reply);
           return true;
         }
+        if (/\b(?:open|show)\s+(?:workspace|tasks?|gmail|calendar|drive)\b/i.test(lower)) {
+          setActiveDrawer('workspace');
+          const reply = 'Opened Workspace & Tasks stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('command', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:meeting|meetings|transcript)\b/i.test(lower)) {
+          setActiveDrawer('meetings');
+          const reply = 'Opened Meeting Companion stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('command', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:vault|knowledge|github|devops|repo)\b/i.test(lower)) {
+          setActiveDrawer('vault');
+          const reply = 'Opened Knowledge Vault & DevOps stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('memory', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
+        if (/\b(?:open|show)\s+(?:trigger|triggers|bridge|bridges|schedule|webhook)\b/i.test(lower)) {
+          setActiveDrawer('triggers');
+          const reply = 'Opened Remote & Triggers stage.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply });
+          finishCommandCue('command', reply, true);
+          void handleSpeakText(reply);
+          return true;
+        }
         if (/\b(?:close|hide)\s+(?:drawer|panel|stage)\b/i.test(lower)) {
           setActiveDrawer(null);
           const reply = 'Closed active stage.';
@@ -2793,9 +3309,14 @@ function JarvisArcWorkspace() {
       };
 
       try {
+        const wsToken = getWorkspaceAccessToken();
         const res = await fetch(`${apiOrigin}/api/assistant/command`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
+          headers: {
+            'Content-Type': 'application/json',
+            ...aiRequestHeaders(aiSettingsRef.current),
+            ...(wsToken ? { Authorization: `Bearer ${wsToken}` } : {}),
+          },
           body: JSON.stringify({
             command: displayPrompt,
             history: priorHistory,
@@ -3039,7 +3560,14 @@ function JarvisArcWorkspace() {
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
           body: JSON.stringify({ goal: cleanGoal, startUrl: cleanUrl, maxSteps: 4, deepThinking }),
         });
-        const data = await parseJsonSafely<AutonomousWebAgentResult & { error?: string }>(res);
+        const data = await parseJsonSafely<
+          AutonomousWebAgentResult & {
+            engine?: 'playwright' | 'http-dom';
+            playwrightAvailable?: boolean;
+            screenshotBase64?: string | null;
+            error?: string;
+          }
+        >(res);
         if (!res.ok || !data) {
           throw new Error(
             data?.error ||
@@ -3054,6 +3582,9 @@ function JarvisArcWorkspace() {
           id: runId,
           goal: data.goal || cleanGoal,
           targetUrl: data.finalUrl || cleanUrl,
+          engine: data.engine,
+          playwrightAvailable: data.playwrightAvailable,
+          screenshotBase64: data.screenshotBase64 ?? null,
           status: resolvedStatus,
           steps: Array.isArray(data.steps) ? data.steps : [],
           inspection: data.inspection ?? null,
@@ -3230,10 +3761,15 @@ function JarvisArcWorkspace() {
     setVoiceError(null);
     beginCommandCue('research', 'Compiling morning brief');
     try {
+      const wsToken = getWorkspaceAccessToken();
       const res = await fetch(`${getApiOrigin()}/api/brief/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(aiSettingsRef.current) },
-        body: JSON.stringify({ voiceName }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...aiRequestHeaders(aiSettingsRef.current),
+          ...(wsToken ? { Authorization: `Bearer ${wsToken}` } : {}),
+        },
+        body: JSON.stringify({ voiceName, tasks: tasksRef.current.slice(0, 30) }),
       });
       const data = await parseJsonSafely<{ brief?: MorningBrief; error?: string }>(res);
       if (!res.ok || !data) throw new Error(data?.error || 'Morning Brief requires a connected Shadow server.');
@@ -3274,6 +3810,77 @@ function JarvisArcWorkspace() {
       setVoiceError(err instanceof Error ? err.message : 'Could not save brief settings');
     }
   }, []);
+
+  const executeConfirmedWorkspaceAction = useCallback(async () => {
+    const action = pendingWorkspaceAction;
+    if (!action || workspaceConfirmBusy) return;
+    const token = getWorkspaceAccessToken();
+    if (!token) {
+      setVoiceError('Google Workspace session expired. Reconnect inside Workspace.');
+      setPendingWorkspaceAction(null);
+      setActiveDrawer('workspace');
+      return;
+    }
+
+    setWorkspaceConfirmBusy(true);
+    setVoiceError(null);
+    try {
+      const origin = getApiOrigin();
+      let res: Response;
+      if (action.service === 'gmail' && action.action === 'send') {
+        res = await fetch(`${origin}/api/workspace/gmail/send`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(action.payload),
+        });
+      } else if (action.service === 'calendar' && action.action === 'create_event') {
+        res = await fetch(`${origin}/api/workspace/calendar/events`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(action.payload),
+        });
+      } else if (action.service === 'calendar' && action.action === 'delete_event') {
+        const eventId = String(action.payload.eventId || '');
+        res = await fetch(`${origin}/api/workspace/calendar/events/${encodeURIComponent(eventId)}`, {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      } else {
+        throw new Error('Unsupported Workspace action.');
+      }
+
+      const data = await parseJsonSafely<{ ok?: boolean; needsReauth?: boolean; error?: string }>(res);
+      if (data?.needsReauth || res.status === 401) {
+        clearWorkspaceAccessToken();
+        throw new Error('Google Workspace authorization expired. Please reconnect Workspace.');
+      }
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || `Workspace action failed (${res.status})`);
+      }
+
+      setPendingWorkspaceAction(null);
+      const confirmationText =
+        action.action === 'send'
+          ? 'Email sent.'
+          : action.action === 'create_event'
+            ? 'Calendar event created.'
+            : 'Calendar event deleted.';
+      showTransientCaption(assistantNameRef.current, confirmationText, 4500);
+      void handleSpeakText(confirmationText);
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : 'Workspace action failed.');
+    } finally {
+      setWorkspaceConfirmBusy(false);
+    }
+  }, [pendingWorkspaceAction, workspaceConfirmBusy, showTransientCaption, handleSpeakText]);
 
   const handleRunResearch = useCallback(
     async (query: string, depth: 'quick' | 'deep', urls: string[]) => {
@@ -3479,6 +4086,9 @@ function JarvisArcWorkspace() {
                 pollData.accessToken ?? null
               );
               await signInWithCredential(auth, cred);
+              if (pollData.accessToken) {
+                setWorkspaceAccessToken(pollData.accessToken);
+              }
               showTransientCaption(assistantNameRef.current, 'Signed in with Google.', 3500);
             }
           } catch {
@@ -3493,7 +4103,11 @@ function JarvisArcWorkspace() {
     }
 
     try {
-      await signInWithPopup(auth, googleProvider);
+      const result = await signInWithPopup(auth, googleProvider);
+      const cred = GoogleAuthProvider.credentialFromResult(result);
+      if (cred?.accessToken) {
+        setWorkspaceAccessToken(cred.accessToken);
+      }
     } catch (err) {
       const code =
         typeof err === 'object' && err && 'code' in err ? String((err as { code?: string }).code) : '';
@@ -3943,31 +4557,47 @@ function JarvisArcWorkspace() {
                 activeDrawer === 'brief'
                   ? 'Morning Brief'
                   : activeDrawer === 'research'
-                  ? 'Research'
-                  : activeDrawer === 'visuals'
-                    ? 'Visuals'
-                    : activeDrawer === 'automation'
-                      ? 'Browser Automation'
-                      : activeDrawer === 'macros'
-                        ? 'Memory & Macros'
-                        : activeDrawer === 'plugins'
-                          ? 'Plugins'
-                          : 'Desktop App'
+                    ? 'Research'
+                    : activeDrawer === 'visuals'
+                      ? 'Visuals'
+                      : activeDrawer === 'automation'
+                        ? 'Browser Automation'
+                        : activeDrawer === 'workspace'
+                          ? 'Workspace & Tasks'
+                          : activeDrawer === 'meetings'
+                            ? 'Meeting Companion'
+                            : activeDrawer === 'vault'
+                              ? 'Knowledge Vault & GitHub'
+                              : activeDrawer === 'triggers'
+                                ? 'Remote & Proactive Triggers'
+                                : activeDrawer === 'macros'
+                                  ? 'Memory & Macros'
+                                  : activeDrawer === 'plugins'
+                                    ? 'Plugins'
+                                    : 'Desktop App'
               }
               subtitle={
                 activeDrawer === 'brief'
                   ? 'Your Daily Intelligence Digest'
                   : activeDrawer === 'research'
-                  ? 'Grounded Web Intelligence'
-                  : activeDrawer === 'visuals'
-                    ? 'Diagrams, Charts & Vector Studio'
-                    : activeDrawer === 'automation'
-                      ? 'DOM Inspector & Actions'
-                      : activeDrawer === 'macros'
-                        ? `${assistantName} Long-Term Context`
-                        : activeDrawer === 'plugins'
-                          ? 'Live API & CLI Extensions'
-                          : 'Laptop Agent & Terminal'
+                    ? 'Grounded Web Intelligence'
+                    : activeDrawer === 'visuals'
+                      ? 'Diagrams, Charts & Vector Studio'
+                      : activeDrawer === 'automation'
+                        ? 'Playwright & DOM Action Engine'
+                        : activeDrawer === 'workspace'
+                          ? 'Gmail · Calendar · Drive · Reminders'
+                          : activeDrawer === 'meetings'
+                            ? 'Live Transcription, Notes & Action Items'
+                            : activeDrawer === 'vault'
+                              ? 'Semantic RAG Vault & DevOps Cockpit'
+                              : activeDrawer === 'triggers'
+                                ? 'Cloud Run · Webhooks · Messaging Bridges'
+                                : activeDrawer === 'macros'
+                                  ? `${assistantName} Long-Term Context`
+                                  : activeDrawer === 'plugins'
+                                    ? 'Live API & CLI Extensions'
+                                    : 'Laptop Agent & Terminal'
               }
               icon={
                 activeDrawer === 'brief' ? (
@@ -3978,6 +4608,14 @@ function JarvisArcWorkspace() {
                   <ImageIcon className="w-3.5 h-3.5 text-purple-300" />
                 ) : activeDrawer === 'automation' ? (
                   <Globe className="w-3.5 h-3.5 text-sky-300" />
+                ) : activeDrawer === 'workspace' ? (
+                  <CalendarCheck2 className="w-3.5 h-3.5 text-cyan-300" />
+                ) : activeDrawer === 'meetings' ? (
+                  <AudioLines className="w-3.5 h-3.5 text-fuchsia-300" />
+                ) : activeDrawer === 'vault' ? (
+                  <BookOpen className="w-3.5 h-3.5 text-teal-300" />
+                ) : activeDrawer === 'triggers' ? (
+                  <Radio className="w-3.5 h-3.5 text-violet-300" />
                 ) : activeDrawer === 'macros' ? (
                   <Layers className="w-3.5 h-3.5 text-amber-300" />
                 ) : activeDrawer === 'plugins' ? (
@@ -4127,6 +4765,46 @@ function JarvisArcWorkspace() {
                 />
               )}
 
+              {activeDrawer === 'workspace' && (
+                <WorkspaceStage
+                  tasks={tasks}
+                  workspaceConnected={workspaceConnected}
+                  aiSettings={aiSettings}
+                  onConnectWorkspace={handleConnectWorkspace}
+                  onCreateTask={handleCreateTask}
+                  onToggleTask={handleToggleTask}
+                  onDeleteTask={handleDeleteTask}
+                  onRequestConfirmWorkspaceAction={(action) => setPendingWorkspaceAction(action)}
+                  onSaveToVault={handleIngestToVault}
+                  onSpeak={(text) => void handleSpeakText(text)}
+                />
+              )}
+
+              {activeDrawer === 'meetings' && (
+                <MeetingCompanionStage
+                  meetings={meetings}
+                  aiSettings={aiSettings}
+                  onSaveMeeting={handleSaveMeeting}
+                  onDeleteMeeting={handleDeleteMeeting}
+                  onAddTask={handleCreateTask}
+                  onSaveToVault={handleIngestToVault}
+                  onSpeak={(text) => void handleSpeakText(text)}
+                />
+              )}
+
+              {activeDrawer === 'vault' && (
+                <KnowledgeVaultStage
+                  ownerKey={user?.uid || 'local'}
+                  aiSettings={aiSettings}
+                  syncedMeta={vaultDocs}
+                  onSaveVaultDocMeta={handleSaveVaultDocMeta}
+                  onDeleteVaultDocMeta={handleDeleteVaultDocMeta}
+                  onSpeak={(text) => void handleSpeakText(text)}
+                />
+              )}
+
+              {activeDrawer === 'triggers' && <RemoteTriggersStage />}
+
               {activeDrawer === 'tauri' && (
                 <TauriDesktopView
                   runtimeInfo={runtimeInfo}
@@ -4223,6 +4901,8 @@ function JarvisArcWorkspace() {
         briefPending={briefPending}
         hasActiveTrack={Boolean(currentTrack)}
         hasActiveVisual={Boolean(currentVisual)}
+        hasPendingTasks={tasks.some((t) => t.status === 'pending')}
+        hasWorkspaceConnected={workspaceConnected}
         hasActivePlugins={plugins.some((p) => p.enabled)}
         agentConnected={(agentHealth.reachable && agentHealth.authenticated) || runtimeInfo.isTauri}
         voiceName={voiceName}
@@ -4381,6 +5061,149 @@ function JarvisArcWorkspace() {
           }}
         />
       )}
+
+      {/* Explicit Confirmation Modal for Workspace Mutating Actions (Gmail Send / Calendar Create & Delete) */}
+      <AnimatePresence>
+        {pendingWorkspaceAction && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md p-4"
+          >
+            <motion.div
+              initial={prefersReduced ? false : { opacity: 0, scale: 0.94, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={prefersReduced ? { opacity: 0 } : { opacity: 0, scale: 0.94, y: 12 }}
+              className="w-full max-w-md rounded-2xl bg-[#0B1222]/95 border border-white/15 shadow-[0_28px_80px_rgba(0,0,0,0.8)] overflow-hidden"
+            >
+              <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-amber-500/15 border border-amber-400/35 flex items-center justify-center text-amber-300">
+                    <ShieldAlert className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-100">
+                      Confirm Google Workspace Action
+                    </h3>
+                    <p className="text-[11px] text-slate-400">{pendingWorkspaceAction.title}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={workspaceConfirmBusy}
+                  onClick={() => setPendingWorkspaceAction(null)}
+                  className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-slate-100 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-3 text-xs text-slate-200">
+                {pendingWorkspaceAction.service === 'gmail' &&
+                  pendingWorkspaceAction.action === 'send' && (
+                    <div className="space-y-2 rounded-xl bg-black/45 border border-white/10 p-3.5">
+                      <div>
+                        <span className="text-slate-400">To: </span>
+                        <span className="font-mono text-sky-300">
+                          {String(pendingWorkspaceAction.payload.to || '')}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400">Subject: </span>
+                        <span className="font-medium text-slate-100">
+                          {String(pendingWorkspaceAction.payload.subject || '')}
+                        </span>
+                      </div>
+                      <pre className="pt-2 border-t border-white/10 whitespace-pre-wrap font-sans text-slate-300 max-h-48 overflow-y-auto leading-relaxed">
+                        {String(pendingWorkspaceAction.payload.body || '')}
+                      </pre>
+                    </div>
+                  )}
+
+                {pendingWorkspaceAction.service === 'calendar' &&
+                  pendingWorkspaceAction.action === 'create_event' && (
+                    <div className="space-y-2 rounded-xl bg-black/45 border border-white/10 p-3.5">
+                      <div>
+                        <span className="text-slate-400">Event: </span>
+                        <span className="font-medium text-slate-100">
+                          {String(pendingWorkspaceAction.payload.summary || '')}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400">Start: </span>
+                        <span className="font-mono text-sky-300">
+                          {String(pendingWorkspaceAction.payload.startIso || '')}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400">End: </span>
+                        <span className="font-mono text-sky-300">
+                          {String(pendingWorkspaceAction.payload.endIso || '')}
+                        </span>
+                      </div>
+                      {Boolean(pendingWorkspaceAction.payload.location) && (
+                        <div>
+                          <span className="text-slate-400">Location: </span>
+                          <span>{String(pendingWorkspaceAction.payload.location)}</span>
+                        </div>
+                      )}
+                      {Boolean(pendingWorkspaceAction.payload.description) && (
+                        <p className="pt-2 border-t border-white/10 text-slate-300">
+                          {String(pendingWorkspaceAction.payload.description)}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                {pendingWorkspaceAction.service === 'calendar' &&
+                  pendingWorkspaceAction.action === 'delete_event' && (
+                    <div className="space-y-1.5 rounded-xl bg-rose-500/10 border border-rose-400/30 p-3.5 text-rose-100">
+                      <p className="font-medium">
+                        Permanently remove this event from your Google Calendar?
+                      </p>
+                      <p className="text-xs text-rose-200/80">
+                        Event:{' '}
+                        {String(
+                          pendingWorkspaceAction.payload.summary ||
+                            pendingWorkspaceAction.payload.eventId ||
+                            'Selected event'
+                        )}
+                      </p>
+                    </div>
+                  )}
+
+                <p className="text-[11px] text-slate-400">
+                  Review the details above. Shadow never sends emails or changes calendar events without your explicit approval.
+                </p>
+              </div>
+
+              <div className="px-5 py-3.5 border-t border-white/10 bg-black/30 flex items-center justify-end gap-2.5">
+                <button
+                  type="button"
+                  disabled={workspaceConfirmBusy}
+                  onClick={() => setPendingWorkspaceAction(null)}
+                  className="px-3.5 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-xs font-medium text-slate-200 cursor-pointer disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={workspaceConfirmBusy}
+                  onClick={() => void executeConfirmedWorkspaceAction()}
+                  className={`px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer disabled:opacity-50 ${
+                    pendingWorkspaceAction.action === 'delete_event'
+                      ? 'bg-rose-500 hover:bg-rose-400 text-white'
+                      : 'bg-sky-500 hover:bg-sky-400 text-slate-950'
+                  }`}
+                >
+                  {workspaceConfirmBusy ? 'Executing...' : 'Confirm & Execute'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

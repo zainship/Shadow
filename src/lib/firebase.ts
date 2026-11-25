@@ -1,13 +1,80 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { GoogleAuthProvider, getAuth, signInWithPopup } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
+export const WORKSPACE_OAUTH_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.compose',
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/drive.readonly',
+] as const;
+
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const firestoreDatabaseId =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
+  'ai-studio-4a38c93f-cd64-44d7-a590-716b466bfd8f';
+export const db = getFirestore(app, firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+for (const scope of WORKSPACE_OAUTH_SCOPES) {
+  googleProvider.addScope(scope);
+}
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+// Google OAuth access tokens MUST reside strictly in JS memory — never persisted to Web Storage.
+let memoryWorkspaceAccessToken: string | null = null;
+const tokenListeners = new Set<(connected: boolean) => void>();
+
+function notifyWorkspaceTokenListeners(): void {
+  const connected = Boolean(memoryWorkspaceAccessToken);
+  for (const listener of tokenListeners) {
+    try {
+      listener(connected);
+    } catch {
+      // ignore listener errors
+    }
+  }
+}
+
+export function setWorkspaceAccessToken(token: string | null | undefined): void {
+  const cleaned = typeof token === 'string' && token.trim().length > 10 ? token.trim() : null;
+  memoryWorkspaceAccessToken = cleaned;
+  notifyWorkspaceTokenListeners();
+}
+
+export function getWorkspaceAccessToken(): string | null {
+  return memoryWorkspaceAccessToken;
+}
+
+export function clearWorkspaceAccessToken(): void {
+  memoryWorkspaceAccessToken = null;
+  notifyWorkspaceTokenListeners();
+}
+
+export function subscribeWorkspaceTokenChange(cb: (connected: boolean) => void): () => void {
+  tokenListeners.add(cb);
+  cb(Boolean(memoryWorkspaceAccessToken));
+  return () => {
+    tokenListeners.delete(cb);
+  };
+}
+
+export async function connectWorkspaceScopesPopup(): Promise<string | null> {
+  const workspaceProvider = new GoogleAuthProvider();
+  for (const scope of WORKSPACE_OAUTH_SCOPES) {
+    workspaceProvider.addScope(scope);
+  }
+  workspaceProvider.setCustomParameters({
+    prompt: 'consent',
+    include_granted_scopes: 'true',
+  });
+  const result = await signInWithPopup(auth, workspaceProvider);
+  const credential = GoogleAuthProvider.credentialFromResult(result);
+  const accessToken = credential?.accessToken ?? null;
+  setWorkspaceAccessToken(accessToken);
+  return accessToken;
+}
 
 export enum OperationType {
   CREATE = 'create',

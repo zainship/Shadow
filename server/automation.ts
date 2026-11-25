@@ -10,6 +10,7 @@ import {
 } from './gemini.ts';
 import { openRouterGenerate, type AiRuntime } from './ai-provider.ts';
 import type { PluginRuntimeDescriptor } from './plugins.ts';
+import { detectPlaywrightRuntime, runPlaywrightAutomation } from './browser-playwright.ts';
 
 export interface AutomationStep {
   action:
@@ -81,6 +82,9 @@ export interface BrowserExecutionResult {
   ok: boolean;
   goal: string;
   targetUrl: string;
+  engine?: 'playwright' | 'http-dom';
+  playwrightAvailable?: boolean;
+  screenshotBase64?: string | null;
   steps: ExecutedAutomationStep[];
   inspection: PageInspectionResult | null;
   extractedItems: AutomationExtractedItem[];
@@ -286,6 +290,7 @@ export async function executeBrowserPlan(input: {
   goal: string;
   targetUrl: string;
   steps: AutomationStep[];
+  engine?: 'auto' | 'playwright' | 'http-dom';
 }): Promise<BrowserExecutionResult> {
   const startedAll = Date.now();
   const goal = (input.goal || 'Browser Automation').trim();
@@ -301,6 +306,35 @@ export async function executeBrowserPlan(input: {
             description: `Open ${baseTarget}`,
           },
         ];
+
+  const pwRuntime = detectPlaywrightRuntime();
+  if (input.engine !== 'http-dom' && pwRuntime.available) {
+    try {
+      const pwOut = await runPlaywrightAutomation({
+        goal,
+        targetUrl: baseTarget,
+        steps: rawSteps,
+      });
+      if (pwOut.available && (pwOut.steps.length > 0 || pwOut.ok)) {
+        return {
+          ok: pwOut.ok,
+          goal,
+          targetUrl: pwOut.targetUrl || baseTarget,
+          engine: 'playwright',
+          playwrightAvailable: true,
+          screenshotBase64: pwOut.screenshotBase64 || null,
+          steps: pwOut.steps,
+          inspection: pwOut.inspection,
+          extractedItems: pwOut.extractedItems,
+          submissionResult: pwOut.submissionResult,
+          totalDurationMs: pwOut.totalDurationMs,
+          ...(pwOut.error ? { error: pwOut.error } : {}),
+        };
+      }
+    } catch {
+      // Fall back cleanly to HTTP/DOM engine
+    }
+  }
 
   const cookieJar = new Map<string, string>();
   const state: {
@@ -867,6 +901,9 @@ export async function executeBrowserPlan(input: {
     ok: overallOk,
     goal,
     targetUrl: state.inspection?.finalUrl || state.currentUrl,
+    engine: 'http-dom',
+    playwrightAvailable: pwRuntime.available,
+    screenshotBase64: null,
     steps: executedSteps,
     inspection: state.inspection,
     extractedItems,
@@ -1705,6 +1742,192 @@ export const jarvisToolDeclarations: FunctionDeclaration[] = [
       required: ['action'],
     },
   },
+  {
+    name: 'manage_workspace',
+    description:
+      'Reads or prepares actions across Google Workspace: Gmail (list/summarize/draft/send), Google Calendar (list/create_event/delete_event), and Google Drive (list/read). Sending email or creating/deleting events prepares an explicit confirmation prompt for the user.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        service: {
+          type: Type.STRING,
+          description: 'One of: gmail, calendar, drive',
+        },
+        action: {
+          type: Type.STRING,
+          description: 'One of: list, summarize, read, draft, send, create_event, delete_event',
+        },
+        query: {
+          type: Type.STRING,
+          description: 'Search query or filter text.',
+        },
+        id: {
+          type: Type.STRING,
+          description: 'Message ID, event ID, or Drive file ID.',
+        },
+        to: {
+          type: Type.STRING,
+          description: 'Recipient email address for gmail draft/send.',
+        },
+        subject: {
+          type: Type.STRING,
+          description: 'Email subject or Calendar event summary title.',
+        },
+        body: {
+          type: Type.STRING,
+          description: 'Email body text or Calendar event description.',
+        },
+        startIso: {
+          type: Type.STRING,
+          description: 'ISO 8601 start date-time for calendar create_event.',
+        },
+        endIso: {
+          type: Type.STRING,
+          description: 'ISO 8601 end date-time for calendar create_event.',
+        },
+        location: {
+          type: Type.STRING,
+          description: 'Optional calendar event location.',
+        },
+      },
+      required: ['service', 'action'],
+    },
+  },
+  {
+    name: 'manage_tasks_reminders',
+    description:
+      'Creates, completes, lists, or deletes persistent personal tasks and due-time reminders stored in Shadow.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description: 'One of: create, complete, list, delete',
+        },
+        title: {
+          type: Type.STRING,
+          description: 'Task or reminder description.',
+        },
+        dueAt: {
+          type: Type.STRING,
+          description: 'Optional ISO 8601 due timestamp or relative hint.',
+        },
+        priority: {
+          type: Type.STRING,
+          description: 'One of: low, medium, high',
+        },
+        taskId: {
+          type: Type.STRING,
+          description: 'Optional task ID for complete or delete.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'search_knowledge_vault',
+    description:
+      'Searches or answers questions grounded in the user Personal Knowledge Vault (uploaded documents, PDFs, notes, and saved meeting digests).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: {
+          type: Type.STRING,
+          description: 'Search query or question to answer from the Vault.',
+        },
+        mode: {
+          type: Type.STRING,
+          description: 'Either "ask" (cited answer) or "search" (raw snippets).',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'inspect_github_repo',
+    description:
+      'Inspects a GitHub repository live via REST API v3 (open PRs, issues, Actions workflow runs, recent commits) and optionally answers a DevOps question.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        repo: {
+          type: Type.STRING,
+          description: 'Repository in owner/repo format (e.g. "facebook/react").',
+        },
+        question: {
+          type: Type.STRING,
+          description: 'Optional specific question about CI failures, PRs, or release readiness.',
+        },
+      },
+      required: ['repo'],
+    },
+  },
+  {
+    name: 'trigger_bridge_message',
+    description:
+      'Sends a proactive status message or summary over configured external Messaging Bridges (Telegram, Discord, Slack, or all).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        channel: {
+          type: Type.STRING,
+          description: 'One of: telegram, discord, slack, all',
+        },
+        title: {
+          type: Type.STRING,
+          description: 'Short notification heading.',
+        },
+        message: {
+          type: Type.STRING,
+          description: 'Body text to dispatch.',
+        },
+      },
+      required: ['channel', 'message'],
+    },
+  },
+  {
+    name: 'manage_schedules',
+    description:
+      'Creates, lists, or manually runs proactive background scheduler jobs (morning_brief, url_watch, http_macro, reminder_ping).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description: 'One of: create, list, run',
+        },
+        name: {
+          type: Type.STRING,
+          description: 'Job display name.',
+        },
+        kind: {
+          type: Type.STRING,
+          description: 'One of: morning_brief, url_watch, http_macro, reminder_ping',
+        },
+        intervalMinutes: {
+          type: Type.NUMBER,
+          description: 'Run cadence in minutes (minimum 1).',
+        },
+        targetUrl: {
+          type: Type.STRING,
+          description: 'Public http/https URL for url_watch or http_macro.',
+        },
+        note: {
+          type: Type.STRING,
+          description: 'Reminder note or summary prompt.',
+        },
+        notifyBridge: {
+          type: Type.BOOLEAN,
+          description: 'Whether to forward job results to configured Telegram/Discord/Slack bridges.',
+        },
+        jobId: {
+          type: Type.STRING,
+          description: 'Job ID when action is "run".',
+        },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 export interface AssistantSessionContext {
@@ -1731,6 +1954,10 @@ export interface AssistantSessionContext {
     activeTrackTitle?: string;
     visionMode?: 'off' | 'camera' | 'screen';
     shelfItems?: Array<{ name: string; kind: string; previewText?: string }>;
+    tasksSummary?: string;
+    activeMeetingTitle?: string;
+    vaultDocsCount?: number;
+    workspaceConnected?: boolean;
   };
 }
 
@@ -1785,7 +2012,10 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
     );
   }
   capabilityLines.push(
-    '5. Visual Synthesis, Focus Timers & Multimodal Vision: calling generate_visual to draw diagrams/charts/wireframes, set_focus_timer to manage focus countdowns/reminders, and directly analyzing live camera/screen video frames or attached images.'
+    '5. Google Workspace, Tasks & Daily Assistant: manage_workspace (Gmail list/summarize/draft/send, Calendar events, Drive search/read; mutating actions require explicit user confirmation) and manage_tasks_reminders (create/complete/list/delete tasks & due alerts).'
+  );
+  capabilityLines.push(
+    '6. Personal Knowledge Vault, GitHub DevOps, Scheduler & Bridges: search_knowledge_vault (cited Q&A across uploaded documents & PDFs), inspect_github_repo (PRs, issues, CI runs, commits), manage_schedules (recurring watches/reminders), trigger_bridge_message (Telegram/Discord/Slack alerts), generate_visual, and set_focus_timer.'
   );
 
   const memoryItems = (ctx?.memories || [])
@@ -1805,6 +2035,10 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
   const nowStr = ws?.currentDateTime || new Date().toISOString();
   const wsLines: string[] = [`Current Date/Time: ${nowStr}${ws?.timeZone ? ` (${ws.timeZone})` : ''}`];
   if (ws?.activeDrawer) wsLines.push(`Active Stage Open: ${ws.activeDrawer}`);
+  if (ws?.workspaceConnected) wsLines.push('Google Workspace Connected: Yes (Gmail, Calendar, Drive)');
+  if (ws?.tasksSummary) wsLines.push(`Pending Tasks Summary: ${ws.tasksSummary.slice(0, 320)}`);
+  if (ws?.activeMeetingTitle) wsLines.push(`Active Meeting Companion Session: ${ws.activeMeetingTitle}`);
+  if (typeof ws?.vaultDocsCount === 'number') wsLines.push(`Knowledge Vault Indexed Documents: ${ws.vaultDocsCount}`);
   if (ws?.visionMode && ws.visionMode !== 'off') wsLines.push(`Live Vision Stream Active: ${ws.visionMode}`);
   if (ws?.activeAutomationUrl) {
     wsLines.push(
@@ -1827,7 +2061,7 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
   }
 
   return [
-    `You are ${assistantName}, a hyper-capable, calm, articulate AI Chief-of-Staff running as a multimodal Progressive Web App (PWA) specializing in autonomous browser automation, deep web research, vision analysis, and media control.`,
+    `You are ${assistantName}, a hyper-capable, calm, articulate AI Chief-of-Staff running as a multimodal Progressive Web App (PWA) specializing in autonomous browser automation, Google Workspace & tasks, deep research, personal knowledge retrieval, DevOps inspection, vision analysis, and media control.`,
     userName
       ? `Address the user naturally as "${userName}" when appropriate.`
       : 'Address the user politely and naturally.',
@@ -1838,7 +2072,7 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
     pluginLines.length > 0
       ? `INSTALLED ACTIVE PLUGINS (Invoke these plugin tools directly whenever relevant):\n${pluginLines.join('\n')}`
       : '',
-    'PLATFORM SCOPE: You run as a web PWA. You do NOT manage local laptop files, desktop applications, or terminal shells. If asked to modify local laptop software or files, explain concisely that Shadow runs as a web PWA focused on browser automation and online workflows.',
+    'WORKSPACE MUTATION GUARDRAIL: Whenever you send an email or create/delete a calendar event via manage_workspace, the backend returns a confirmation request — clearly inform the user that a confirmation dialog has been opened on screen for their approval.',
     memoryItems.length > 0
       ? `PERSISTENT LONG-TERM MEMORY (Remember and apply these facts automatically):\n${memoryItems.join('\n')}`
       : 'PERSISTENT LONG-TERM MEMORY: No stored memories yet. Whenever the user shares something important about themselves or their preferences, call save_memory right away.',

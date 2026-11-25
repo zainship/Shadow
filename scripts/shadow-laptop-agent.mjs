@@ -787,11 +787,27 @@ async function handleBrowserAutomation(body) {
           { timeout: 30000 }
         );
         await fsp.unlink(planFile).catch(() => {});
+        let parsedSidecar = null;
+        try {
+          parsedSidecar = JSON.parse(stdout.trim());
+        } catch {
+          parsedSidecar = null;
+        }
         browserResult = {
-          ok: true,
+          ok: parsedSidecar?.ok !== false,
           mode: 'playwright-headful',
+          engine: 'playwright',
           stdout: stdout.trim(),
           stderr: stderr.trim(),
+          ...(parsedSidecar
+            ? {
+                finalUrl: parsedSidecar.finalUrl,
+                finalTitle: parsedSidecar.finalTitle,
+                screenshotBase64: parsedSidecar.screenshotBase64 || null,
+                extractedItems: parsedSidecar.extractedItems || [],
+                results: parsedSidecar.results || [],
+              }
+            : {}),
         };
       } catch {
         await fsp.unlink(planFile).catch(() => {});
@@ -837,6 +853,27 @@ async function handleBrowserAutomation(body) {
     };
   }
   return browserResult || { ok: true, mode: 'system-browser', targetUrl };
+}
+
+async function handleGitInspect(body) {
+  const repoPath = body.path ? resolveHomePath(String(body.path)) : process.cwd();
+  const [branchRes, statusRes, logRes, diffRes] = await Promise.allSettled([
+    execAsync('git rev-parse --abbrev-ref HEAD', { cwd: repoPath, timeout: 8000 }),
+    execAsync('git status --short', { cwd: repoPath, timeout: 8000 }),
+    execAsync('git log -n 8 --oneline', { cwd: repoPath, timeout: 8000 }),
+    execAsync('git diff --stat', { cwd: repoPath, timeout: 8000 }),
+  ]);
+  if (branchRes.status === 'rejected') {
+    throw new Error(`Not a git repository or git unavailable at ${repoPath}`);
+  }
+  return {
+    ok: true,
+    path: repoPath,
+    branch: branchRes.value.stdout.trim(),
+    statusShort: statusRes.status === 'fulfilled' ? statusRes.value.stdout.trim() : '',
+    recentLog: logRes.status === 'fulfilled' ? logRes.value.stdout.trim() : '',
+    diffStat: diffRes.status === 'fulfilled' ? diffRes.value.stdout.trim() : '',
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -915,6 +952,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && reqUrl.pathname === '/browser') {
       return sendJson(res, 200, await handleBrowserAutomation(body));
+    }
+
+    if (req.method === 'POST' && reqUrl.pathname === '/git-inspect') {
+      return sendJson(res, 200, await handleGitInspect(body));
     }
 
     return sendJson(res, 404, { ok: false, error: 'Unknown agent endpoint' });

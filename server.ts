@@ -60,15 +60,64 @@ import {
   PLUGIN_CATALOG,
   renderLaptopCommand,
 } from './server/plugins.ts';
+import { detectPlaywrightRuntime } from './server/browser-playwright.ts';
+import {
+  createCalendarEvent,
+  createGmailDraft,
+  deleteCalendarEvent,
+  extractWorkspaceBearerToken,
+  getGmailMessageDetail,
+  listCalendarEvents,
+  listDriveFiles,
+  listGmailMessages,
+  readDriveFileContent,
+  sendGmailMessage,
+  summarizeGmailInbox,
+  WorkspaceApiError,
+} from './server/workspace.ts';
+import {
+  askMeetingTranscript,
+  summarizeMeetingTranscript,
+  transcribeAudioChunk,
+} from './server/meetings.ts';
+import {
+  askVault,
+  deleteVaultDocument,
+  ingestVaultDocument,
+  listVaultDocuments,
+  searchVault,
+} from './server/vault.ts';
+import { fetchGithubRepoOverview, summarizeDevopsState } from './server/devops.ts';
+import {
+  dispatchBridgeMessage,
+  getBridgeDeliveryHistory,
+  getMaskedBridgesStatus,
+  sendTelegramDirectReply,
+  updateBridgesConfig,
+  type BridgeChannel,
+} from './server/bridges.ts';
+import {
+  createInboundWebhook,
+  createScheduledJob,
+  deleteInboundWebhook,
+  deleteScheduledJob,
+  listSchedulerState,
+  processInboundWebhook,
+  runScheduledJobNow,
+  startProactiveScheduler,
+  toggleScheduledJob,
+  type ScheduleJobKind,
+} from './server/scheduler.ts';
+import { timingSafeEqualStr } from './server/security.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000) || 3000;
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '12mb' }));
 
   // Allow packaged Tauri shell, local dev servers, Firebase Hosting PWA domains,
   // and any explicit CORS_ALLOWED_ORIGINS entries to reach this server.
@@ -94,9 +143,9 @@ async function startServer() {
       res.setHeader('Vary', 'Origin');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Accept, x-shadow-provider, x-shadow-key, x-shadow-model, x-shadow-gemini-key'
+        'Content-Type, Accept, Authorization, x-shadow-provider, x-shadow-key, x-shadow-model, x-shadow-gemini-key, x-github-token, x-webhook-secret'
       );
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
       if (req.headers['access-control-request-private-network'] === 'true') {
         res.setHeader('Access-Control-Allow-Private-Network', 'true');
       }
@@ -110,7 +159,11 @@ async function startServer() {
 
   // Health endpoint
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'shadow-desktop-server' });
+    res.json({
+      ok: true,
+      service: 'shadow-desktop-server',
+      playwrightRuntime: detectPlaywrightRuntime(),
+    });
   });
 
   // Short-lived loopback OAuth handoff for the packaged Tauri desktop shell
@@ -307,16 +360,20 @@ async function startServer() {
     }
   });
 
-  // Real multi-step HTTP/DOM browser automation executor
+  // Real multi-step Playwright (with HTTP/DOM fallback) browser automation executor
   app.post('/api/automation/execute', async (req, res) => {
     try {
       const goal = String(req.body?.goal || 'Browser Automation').trim();
       const targetUrl = String(req.body?.targetUrl || '').trim();
       const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
+      const engine =
+        req.body?.engine === 'playwright' || req.body?.engine === 'http-dom'
+          ? req.body.engine
+          : 'auto';
       if (!targetUrl && steps.length === 0) {
         return res.status(400).json({ ok: false, error: 'Missing targetUrl or steps' });
       }
-      const execution = await executeBrowserPlan({ goal, targetUrl, steps });
+      const execution = await executeBrowserPlan({ goal, targetUrl, steps, engine });
       return res.json(execution);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Browser automation failed';
@@ -424,9 +481,16 @@ async function startServer() {
   app.post('/api/brief/run', async (req, res) => {
     try {
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const authHeader = String(req.headers.authorization || '').trim();
+      const workspaceToken = authHeader.toLowerCase().startsWith('bearer ')
+        ? authHeader.slice(7).trim()
+        : undefined;
+      const tasks = Array.isArray(req.body?.tasks) ? req.body.tasks : undefined;
       const brief = await runMorningBrief({
         runtime,
         voiceName: String(req.body?.voiceName || '').trim() || undefined,
+        workspaceToken,
+        tasks,
       });
       return res.json({ brief });
     } catch (err) {
@@ -540,6 +604,661 @@ async function startServer() {
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Feature 1: Google Workspace Integration (Gmail, Calendar, Drive)
+  // Token comes strictly from Authorization: Bearer <token> held in client memory.
+  // ---------------------------------------------------------------------------
+  const sendWorkspaceErr = (res: express.Response, err: unknown) => {
+    if (err instanceof WorkspaceApiError) {
+      return res.status(err.status).json({
+        ok: false,
+        needsReauth: err.needsReauth,
+        error: err.message,
+      });
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Google Workspace error',
+    });
+  };
+
+  app.get('/api/workspace/gmail/messages', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const queryText = String(req.query.q || '').trim() || undefined;
+      const unreadOnly = String(req.query.unreadOnly || '').toLowerCase() === 'true';
+      const maxResults = Number(req.query.maxResults || 12);
+      const messages = await listGmailMessages(token, { query: queryText, unreadOnly, maxResults });
+      return res.json({ ok: true, messages });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.get('/api/workspace/gmail/message/:id', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const message = await getGmailMessageDetail(token, String(req.params.id || ''));
+      return res.json({ ok: true, message });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.post('/api/workspace/gmail/summarize', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const summary = await summarizeGmailInbox(token, {
+        query: String(req.body?.q || '').trim() || undefined,
+        maxResults: Number(req.body?.maxResults || 10),
+        runtime,
+      });
+      return res.json({ ok: true, ...summary });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.post('/api/workspace/gmail/draft', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const draft = await createGmailDraft(token, {
+        to: String(req.body?.to || ''),
+        subject: String(req.body?.subject || ''),
+        body: String(req.body?.body || ''),
+        threadId: req.body?.threadId ? String(req.body.threadId) : undefined,
+      });
+      return res.json({ ok: true, draft });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.post('/api/workspace/gmail/send', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const sent = await sendGmailMessage(token, {
+        to: String(req.body?.to || ''),
+        subject: String(req.body?.subject || ''),
+        body: String(req.body?.body || ''),
+        threadId: req.body?.threadId ? String(req.body.threadId) : undefined,
+      });
+      return res.json({ ok: true, sent });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.get('/api/workspace/calendar/events', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const events = await listCalendarEvents(token, {
+        timeMin: String(req.query.timeMin || '').trim() || undefined,
+        timeMax: String(req.query.timeMax || '').trim() || undefined,
+        maxResults: Number(req.query.maxResults || 15),
+      });
+      return res.json({ ok: true, events });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.post('/api/workspace/calendar/events', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const event = await createCalendarEvent(token, {
+        summary: String(req.body?.summary || ''),
+        startIso: String(req.body?.startIso || ''),
+        endIso: String(req.body?.endIso || ''),
+        description: req.body?.description ? String(req.body.description) : undefined,
+        location: req.body?.location ? String(req.body.location) : undefined,
+        attendees: Array.isArray(req.body?.attendees) ? req.body.attendees.map(String) : undefined,
+      });
+      return res.json({ ok: true, event });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.delete('/api/workspace/calendar/events/:id', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      await deleteCalendarEvent(token, String(req.params.id || ''));
+      return res.json({ ok: true, deletedId: String(req.params.id || '') });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.get('/api/workspace/drive/files', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const files = await listDriveFiles(token, {
+        query: String(req.query.q || '').trim() || undefined,
+        pageSize: Number(req.query.maxResults || 15),
+      });
+      return res.json({ ok: true, files });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  app.get('/api/workspace/drive/files/:id/read', async (req, res) => {
+    try {
+      const token = extractWorkspaceBearerToken(req);
+      const runtime = resolveAiRuntime({ headers: req.headers });
+      const data = await readDriveFileContent(token, String(req.params.id || ''), runtime);
+      return res.json({ ok: true, ...data });
+    } catch (err) {
+      return sendWorkspaceErr(res, err);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feature 3: Meeting & Audio Companion Mode
+  // ---------------------------------------------------------------------------
+  app.post('/api/meetings/transcribe', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await transcribeAudioChunk({
+        audioBase64: String(req.body?.audioBase64 || ''),
+        mimeType: String(req.body?.mimeType || 'audio/webm'),
+        promptHint: req.body?.promptHint ? String(req.body.promptHint) : undefined,
+        runtime,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'Audio transcription failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  app.post('/api/meetings/summarize', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await summarizeMeetingTranscript({
+        title: req.body?.title ? String(req.body.title) : undefined,
+        transcript: String(req.body?.transcript || ''),
+        durationSeconds: req.body?.durationSeconds ? Number(req.body.durationSeconds) : undefined,
+        runtime,
+      });
+      return res.json({ ok: true, summary: result });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'Meeting summarization failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  app.post('/api/meetings/ask', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await askMeetingTranscript({
+        transcript: String(req.body?.transcript || ''),
+        question: String(req.body?.question || ''),
+        summary: req.body?.summary ? String(req.body.summary) : undefined,
+        runtime,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'Meeting Q&A failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feature 4A: Personal Knowledge Base (RAG Vault)
+  // ---------------------------------------------------------------------------
+  app.get('/api/vault/docs', (req, res) => {
+    const ownerKey = String(req.query.ownerKey || 'local');
+    return res.json({ ok: true, docs: listVaultDocuments(ownerKey) });
+  });
+
+  app.post('/api/vault/ingest', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await ingestVaultDocument({
+        ownerKey: req.body?.ownerKey ? String(req.body.ownerKey) : 'local',
+        title: String(req.body?.title || req.body?.fileName || 'Untitled Note'),
+        contentText: req.body?.contentText ? String(req.body.contentText) : undefined,
+        fileBase64: req.body?.fileBase64 ? String(req.body.fileBase64) : undefined,
+        mimeType: req.body?.mimeType ? String(req.body.mimeType) : undefined,
+        sourceType: req.body?.sourceType,
+        sourceRef: req.body?.sourceRef ? String(req.body.sourceRef) : undefined,
+        tags: Array.isArray(req.body?.tags) ? req.body.tags.map(String) : undefined,
+        runtime,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Vault document ingestion failed',
+      });
+    }
+  });
+
+  app.delete('/api/vault/docs/:id', (req, res) => {
+    const ownerKey = String(req.query.ownerKey || req.body?.ownerKey || 'local');
+    const deleted = deleteVaultDocument(String(req.params.id || ''), ownerKey);
+    if (!deleted) {
+      return res.status(404).json({ ok: false, error: 'Document not found' });
+    }
+    return res.json({ ok: true, deletedId: String(req.params.id || '') });
+  });
+
+  app.post('/api/vault/search', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const hits = await searchVault({
+        query: String(req.body?.query || ''),
+        ownerKey: req.body?.ownerKey ? String(req.body.ownerKey) : 'local',
+        topK: Number(req.body?.topK || 6),
+        runtime,
+      });
+      return res.json({ ok: true, hits });
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Vault search failed',
+      });
+    }
+  });
+
+  app.post('/api/vault/ask', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const result = await askVault({
+        query: String(req.body?.question || req.body?.query || ''),
+        ownerKey: req.body?.ownerKey ? String(req.body.ownerKey) : 'local',
+        topK: Number(req.body?.topK || 6),
+        runtime,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'Vault Q&A failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feature 4B: GitHub & DevOps Cockpit
+  // ---------------------------------------------------------------------------
+  app.get('/api/devops/github/repo', async (req, res) => {
+    try {
+      const repo = String(req.query.repo || '').trim();
+      const ghToken = String(req.headers['x-github-token'] || '').trim() || undefined;
+      if (!repo) {
+        return res.status(400).json({ ok: false, error: 'Missing repo query parameter (owner/repo).' });
+      }
+      const overview = await fetchGithubRepoOverview(repo, ghToken);
+      return res.json({ ok: true, overview });
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'GitHub lookup failed',
+      });
+    }
+  });
+
+  app.post('/api/devops/analyze', async (req, res) => {
+    try {
+      const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const repo = String(req.body?.repo || '').trim();
+      const ghToken = String(req.headers['x-github-token'] || '').trim() || undefined;
+      const overview = repo ? await fetchGithubRepoOverview(repo, ghToken) : null;
+      const analysis = await summarizeDevopsState({
+        overview,
+        localGitText: req.body?.localGitSummary ? String(req.body.localGitSummary) : undefined,
+        question: req.body?.question ? String(req.body.question) : undefined,
+        runtime,
+      });
+      return res.json({ ok: true, overview, analysis });
+    } catch (err) {
+      const { status, message } = parseGeminiHttpError(err, 'DevOps analysis failed');
+      return res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feature 5: Messaging Bridges & Proactive Scheduler / Webhooks
+  // ---------------------------------------------------------------------------
+  app.get('/api/bridges/status', (_req, res) => {
+    return res.json({
+      ok: true,
+      status: getMaskedBridgesStatus(),
+      deliveries: getBridgeDeliveryHistory(),
+    });
+  });
+
+  app.post('/api/bridges/config', (req, res) => {
+    try {
+      const status = updateBridgesConfig({
+        telegramBotToken: req.body?.telegramBotToken,
+        telegramChatId: req.body?.telegramChatId,
+        discordWebhookUrl: req.body?.discordWebhookUrl,
+        slackWebhookUrl: req.body?.slackWebhookUrl,
+      });
+      return res.json({ ok: true, status });
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Invalid bridge configuration',
+      });
+    }
+  });
+
+  app.post('/api/bridges/send', async (req, res) => {
+    try {
+      const ch = String(req.body?.channel || 'all') as BridgeChannel | 'all';
+      const valid = ch === 'telegram' || ch === 'discord' || ch === 'slack' || ch === 'all';
+      if (!valid) {
+        return res.status(400).json({ ok: false, error: 'Channel must be telegram, discord, slack, or all.' });
+      }
+      const outcome = await dispatchBridgeMessage({
+        channel: ch,
+        title: req.body?.title ? String(req.body.title) : 'Shadow Dispatch',
+        message: String(req.body?.message || ''),
+      });
+      return res.json({ ok: outcome.ok, results: outcome.results, deliveries: getBridgeDeliveryHistory() });
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Bridge send failed',
+      });
+    }
+  });
+
+  app.post('/api/bridges/telegram/webhook', async (req, res) => {
+    try {
+      const expectedSecret = (process.env.WEBHOOK_SIGNING_SECRET || '').trim();
+      const gotSecret = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+      if (expectedSecret && !timingSafeEqualStr(gotSecret, expectedSecret)) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized Telegram webhook secret.' });
+      }
+      const msg = req.body?.message || req.body?.edited_message;
+      const chatId = msg?.chat?.id;
+      const text = String(msg?.text || '').trim();
+      if (chatId && text) {
+        const runtime = resolveAiRuntime({});
+        const ai = getGeminiClient(runtime?.apiKey);
+        const reply = await withGeminiRetry(
+          () =>
+            ai.models.generateContent({
+              model: getModelConfig().fastText,
+              contents: `Reply concisely (2-3 crisp sentences) to this Telegram message sent to Shadow Assistant:\n${text.slice(0, 1000)}`,
+            }),
+          0
+        ).catch(() => ({ text: 'Shadow received your message.' }));
+        await sendTelegramDirectReply(chatId, (reply.text || 'Shadow received your message.').trim()).catch(() => {});
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err instanceof Error ? err.message : 'Telegram hook failed' });
+    }
+  });
+
+  app.get('/api/scheduler/state', (_req, res) => {
+    return res.json({ ok: true, ...listSchedulerState() });
+  });
+
+  app.post('/api/scheduler/jobs', (req, res) => {
+    try {
+      const job = createScheduledJob({
+        name: String(req.body?.name || 'Scheduled Trigger'),
+        kind: String(req.body?.kind || 'reminder_ping') as ScheduleJobKind,
+        intervalMinutes: Number(req.body?.intervalMinutes || 60),
+        targetUrl: req.body?.targetUrl ? String(req.body.targetUrl) : undefined,
+        promptOrNote: req.body?.promptOrNote ? String(req.body.promptOrNote) : undefined,
+        notifyBridge: Boolean(req.body?.notifyBridge),
+      });
+      return res.json({ ok: true, job });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Invalid job' });
+    }
+  });
+
+  app.patch('/api/scheduler/jobs/:id', (req, res) => {
+    const updated = toggleScheduledJob(String(req.params.id || ''), Boolean(req.body?.enabled));
+    if (!updated) return res.status(404).json({ ok: false, error: 'Job not found' });
+    return res.json({ ok: true, job: updated });
+  });
+
+  app.delete('/api/scheduler/jobs/:id', (req, res) => {
+    const ok = deleteScheduledJob(String(req.params.id || ''));
+    if (!ok) return res.status(404).json({ ok: false, error: 'Job not found' });
+    return res.json({ ok: true });
+  });
+
+  app.post('/api/scheduler/jobs/:id/run', async (req, res) => {
+    try {
+      const log = await runScheduledJobNow(String(req.params.id || ''));
+      return res.json({ ok: true, log });
+    } catch (err) {
+      return res.status(404).json({ ok: false, error: err instanceof Error ? err.message : 'Job failed' });
+    }
+  });
+
+  app.post('/api/scheduler/webhooks', (req, res) => {
+    const created = createInboundWebhook({
+      name: String(req.body?.name || 'External Event'),
+      notifyBridge: req.body?.notifyBridge !== false,
+    });
+    return res.json({ ok: true, ...created });
+  });
+
+  app.delete('/api/scheduler/webhooks/:id', (req, res) => {
+    const ok = deleteInboundWebhook(String(req.params.id || ''));
+    if (!ok) return res.status(404).json({ ok: false, error: 'Webhook not found' });
+    return res.json({ ok: true });
+  });
+
+  app.post('/api/hooks/:hookId', async (req, res) => {
+    try {
+      const rawAuth = String(req.headers.authorization || '').trim();
+      const providedSecret =
+        String(req.headers['x-webhook-secret'] || '').trim() ||
+        (rawAuth.toLowerCase().startsWith('bearer ') ? rawAuth.slice(7).trim() : '');
+      const result = await processInboundWebhook({
+        hookId: String(req.params.hookId || ''),
+        providedSecret,
+        payload: (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>,
+      });
+      return res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Webhook failed';
+      const status = msg.toLowerCase().includes('unauthorized')
+        ? 401
+        : msg.toLowerCase().includes('not found')
+          ? 404
+          : 400;
+      return res.status(status).json({ ok: false, error: msg });
+    }
+  });
+
+  // Shared domain tool executor for Features 1-5 used by both REST /api/assistant/command and WS /ws/live
+  const executeExtendedDomainToolCall = async (input: {
+    name: string;
+    args: Record<string, unknown>;
+    runtime?: ReturnType<typeof resolveAiRuntime>;
+    workspaceToken?: string | null;
+    ownerKey?: string;
+  }): Promise<{ handled: boolean; result: Record<string, unknown>; summary: string }> => {
+    const { name, args, runtime, workspaceToken, ownerKey } = input;
+
+    if (name === 'manage_workspace') {
+      const service = String(args.service || 'gmail').toLowerCase();
+      const action = String(args.action || 'list').toLowerCase();
+
+      // Mutating Workspace actions NEVER execute blindly — always emit pending confirmation action
+      if (
+        (service === 'gmail' && action === 'send') ||
+        (service === 'calendar' && (action === 'create_event' || action === 'delete_event'))
+      ) {
+        return {
+          handled: true,
+          summary: `Prepared confirmation dialog for ${service}.${action}`,
+          result: {
+            ok: true,
+            requiresConfirmation: true,
+            pendingAction: {
+              id: `wsact-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              service,
+              action,
+              title:
+                service === 'gmail'
+                  ? `Send Email to ${String(args.to || '')}`
+                  : action === 'create_event'
+                    ? `Schedule "${String(args.subject || 'Meeting')}"`
+                    : `Delete Calendar Event ${String(args.id || '')}`,
+              payload: args,
+            },
+          },
+        };
+      }
+
+      if (!workspaceToken) {
+        return {
+          handled: true,
+          summary: 'Workspace sign-in required',
+          result: {
+            ok: false,
+            needsReauth: true,
+            error: 'Google Workspace is not connected yet. Open the Workspace tab and click Connect Google Workspace.',
+          },
+        };
+      }
+
+      if (service === 'gmail') {
+        if (action === 'summarize') {
+          const sum = await summarizeGmailInbox(workspaceToken, {
+            query: args.query ? String(args.query) : undefined,
+            runtime: runtime ?? null,
+          });
+          return {
+            handled: true,
+            summary: `Summarized ${sum.messages.length} emails`,
+            result: { ok: true, ...sum },
+          };
+        }
+        if (action === 'draft') {
+          const draft = await createGmailDraft(workspaceToken, {
+            to: String(args.to || ''),
+            subject: String(args.subject || ''),
+            body: String(args.body || ''),
+          });
+          return { handled: true, summary: `Created draft for ${args.to}`, result: { ok: true, draft } };
+        }
+        if (action === 'read' && args.id) {
+          const msg = await getGmailMessageDetail(workspaceToken, String(args.id));
+          return { handled: true, summary: `Read email "${msg.subject}"`, result: { ok: true, message: msg } };
+        }
+        const msgs = await listGmailMessages(workspaceToken, {
+          query: args.query ? String(args.query) : undefined,
+          maxResults: 8,
+        });
+        return { handled: true, summary: `Fetched ${msgs.length} emails`, result: { ok: true, messages: msgs } };
+      }
+
+      if (service === 'calendar') {
+        const events = await listCalendarEvents(workspaceToken, { maxResults: 10 });
+        return { handled: true, summary: `Listed ${events.length} calendar events`, result: { ok: true, events } };
+      }
+
+      if (service === 'drive') {
+        if (action === 'read' && args.id) {
+          const docData = await readDriveFileContent(workspaceToken, String(args.id), runtime ?? null);
+          return { handled: true, summary: `Read Drive file "${docData.file.name}"`, result: { ok: true, ...docData } };
+        }
+        const files = await listDriveFiles(workspaceToken, {
+          query: args.query ? String(args.query) : undefined,
+          pageSize: 10,
+        });
+        return { handled: true, summary: `Found ${files.length} Drive files`, result: { ok: true, files } };
+      }
+    }
+
+    if (name === 'manage_tasks_reminders') {
+      return {
+        handled: true,
+        summary: `Task action: ${String(args.action || 'list')}`,
+        result: {
+          ok: true,
+          taskAction: String(args.action || 'create'),
+          title: args.title ? String(args.title).slice(0, 200) : '',
+          dueAt: args.dueAt ? String(args.dueAt).slice(0, 64) : '',
+          priority:
+            args.priority === 'low' || args.priority === 'high' ? args.priority : 'medium',
+          taskId: args.taskId ? String(args.taskId) : '',
+        },
+      };
+    }
+
+    if (name === 'search_knowledge_vault') {
+      const query = String(args.query || '');
+      const mode = String(args.mode || 'ask');
+      if (mode === 'search') {
+        const hits = await searchVault({ query, ownerKey: ownerKey || 'local', runtime: runtime ?? null });
+        return { handled: true, summary: `Found ${hits.length} Vault matches`, result: { ok: true, hits } };
+      }
+      const qa = await askVault({ query, ownerKey: ownerKey || 'local', runtime: runtime ?? null });
+      return {
+        handled: true,
+        summary: `Vault answer with ${qa.citations.length} citations`,
+        result: { ok: true, ...qa },
+      };
+    }
+
+    if (name === 'inspect_github_repo') {
+      const repo = String(args.repo || '');
+      const overview = await fetchGithubRepoOverview(repo);
+      const analysis = args.question
+        ? await summarizeDevopsState({ overview, question: String(args.question), runtime: runtime ?? null })
+        : undefined;
+      return {
+        handled: true,
+        summary: `Inspected ${overview.repo.fullName}`,
+        result: { ok: true, overview, ...(analysis ? { analysis } : {}) },
+      };
+    }
+
+    if (name === 'trigger_bridge_message') {
+      const ch = (String(args.channel || 'all') as BridgeChannel | 'all');
+      const outcome = await dispatchBridgeMessage({
+        channel: ch,
+        title: args.title ? String(args.title) : 'Shadow Update',
+        message: String(args.message || ''),
+      });
+      return {
+        handled: true,
+        summary: outcome.ok ? `Sent message to ${ch}` : `Bridge ${ch} delivery notice`,
+        result: { ok: outcome.ok, results: outcome.results },
+      };
+    }
+
+    if (name === 'manage_schedules') {
+      const action = String(args.action || 'list').toLowerCase();
+      if (action === 'create') {
+        const job = createScheduledJob({
+          name: String(args.name || 'Scheduled Job'),
+          kind: String(args.kind || 'reminder_ping') as ScheduleJobKind,
+          intervalMinutes: Number(args.intervalMinutes || 60),
+          targetUrl: args.targetUrl ? String(args.targetUrl) : undefined,
+          promptOrNote: args.note ? String(args.note) : undefined,
+          notifyBridge: Boolean(args.notifyBridge),
+        });
+        return { handled: true, summary: `Scheduled "${job.name}"`, result: { ok: true, job } };
+      }
+      if (action === 'run' && args.jobId) {
+        const log = await runScheduledJobNow(String(args.jobId));
+        return { handled: true, summary: `Ran job ${log.name}`, result: { ok: true, log } };
+      }
+      const state = listSchedulerState();
+      return { handled: true, summary: `${state.jobs.length} scheduled job(s)`, result: { ok: true, ...state } };
+    }
+
+    return { handled: false, result: { ok: true }, summary: name };
+  };
+
   // Session context cache so Gemini Live WS receives custom assistant name, user name, permissions, memories & plugins
   const sessionContexts = new Map<string, { context: AssistantSessionContext; expiresAt: number }>();
 
@@ -622,6 +1341,10 @@ async function startServer() {
       };
       const systemInstruction = buildShadowSystemInstruction(normalizedContext);
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
+      const authHdr = String(req.headers.authorization || '').trim();
+      const requestWorkspaceToken = authHdr.toLowerCase().startsWith('bearer ')
+        ? authHdr.slice(7).trim()
+        : null;
 
       // Build sanitized multi-turn conversation history + multimodal current user turn
       const historyContents: Content[] = [];
@@ -754,6 +1477,9 @@ async function startServer() {
                 ok: execution.ok,
                 goal: execution.goal,
                 targetUrl: execution.targetUrl,
+                engine: execution.engine,
+                playwrightAvailable: execution.playwrightAvailable,
+                screenshotBase64: execution.screenshotBase64 || null,
                 steps: execution.steps,
                 inspection: execution.inspection,
                 extractedItems: execution.extractedItems,
@@ -825,35 +1551,46 @@ async function startServer() {
               args,
             };
             traceSummary = `Client tool ${call.name}`;
-          } else if (call.name && pluginMap.has(call.name)) {
-            const plugin = pluginMap.get(call.name)!;
-            if (plugin.kind === 'laptop_command') {
-              if (context?.permissions?.terminal === false) {
-                result = {
-                  ok: false,
-                  permissionDenied: true,
-                  pluginId: plugin.id,
-                  pluginName: plugin.name,
-                  toolName: plugin.toolName,
-                  error: 'Terminal permission is required to run laptop command plugins.',
-                };
+          } else {
+            const ext = await executeExtendedDomainToolCall({
+              name: call.name || '',
+              args,
+              runtime,
+              workspaceToken: requestWorkspaceToken,
+            });
+            if (ext.handled) {
+              result = ext.result;
+              traceSummary = ext.summary;
+            } else if (call.name && pluginMap.has(call.name)) {
+              const plugin = pluginMap.get(call.name)!;
+              if (plugin.kind === 'laptop_command') {
+                if (context?.permissions?.terminal === false) {
+                  result = {
+                    ok: false,
+                    permissionDenied: true,
+                    pluginId: plugin.id,
+                    pluginName: plugin.name,
+                    toolName: plugin.toolName,
+                    error: 'Terminal permission is required to run laptop command plugins.',
+                  };
+                } else {
+                  const renderedCommand = renderLaptopCommand(plugin, args);
+                  result = {
+                    ok: true,
+                    requiresClientExecution: true,
+                    pluginId: plugin.id,
+                    pluginName: plugin.name,
+                    toolName: plugin.toolName,
+                    kind: plugin.kind,
+                    renderedCommand,
+                  };
+                }
+                traceSummary = `Plugin ${plugin.name}`;
               } else {
-                const renderedCommand = renderLaptopCommand(plugin, args);
-                result = {
-                  ok: true,
-                  requiresClientExecution: true,
-                  pluginId: plugin.id,
-                  pluginName: plugin.name,
-                  toolName: plugin.toolName,
-                  kind: plugin.kind,
-                  renderedCommand,
-                };
+                const pluginExec = await executeHttpPlugin(plugin, args);
+                result = pluginExec as unknown as Record<string, unknown>;
+                traceSummary = `${plugin.name} (${pluginExec.ok ? 'OK' : 'Failed'})`;
               }
-              traceSummary = `Plugin ${plugin.name}`;
-            } else {
-              const pluginExec = await executeHttpPlugin(plugin, args);
-              result = pluginExec as unknown as Record<string, unknown>;
-              traceSummary = `${plugin.name} (${pluginExec.ok ? 'OK' : 'Failed'})`;
             }
           }
 
@@ -1130,6 +1867,8 @@ async function startServer() {
     const preAuthQueue: string[] = [];
     let authTimer: ReturnType<typeof setTimeout> | null = null;
     let authResolved = false;
+    // Transient Workspace OAuth access token scoped ONLY to this active WebSocket memory lifetime
+    let wsWorkspaceToken: string | null = null;
 
     clientWs.on('message', (raw) => {
       const text = raw.toString();
@@ -1140,9 +1879,13 @@ async function startServer() {
             provider?: string;
             apiKey?: string;
             model?: string;
+            workspaceToken?: string;
           };
           if (authMsg?.type === 'ai_auth') {
             authResolved = true;
+            if (typeof authMsg.workspaceToken === 'string' && authMsg.workspaceToken.trim()) {
+              wsWorkspaceToken = authMsg.workspaceToken.trim();
+            }
             if (authTimer) {
               clearTimeout(authTimer);
               authTimer = null;
@@ -1320,6 +2063,9 @@ async function startServer() {
                         ok: execution.ok,
                         goal: execution.goal,
                         targetUrl: execution.targetUrl,
+                        engine: execution.engine,
+                        playwrightAvailable: execution.playwrightAvailable,
+                        screenshotBase64: execution.screenshotBase64 || null,
                         steps: execution.steps,
                         inspection: execution.inspection,
                         extractedItems: execution.extractedItems,
@@ -1393,37 +2139,49 @@ async function startServer() {
                     call.name === 'execute_terminal_command'
                   ) {
                     result = await requestClientToolExecution(call.name, args);
-                  } else if (call.name && pluginMap.has(call.name)) {
-                    const plugin = pluginMap.get(call.name)!;
-                    if (plugin.kind === 'laptop_command') {
-                      if (sessionContext?.permissions?.terminal === false) {
-                        result = {
-                          ok: false,
-                          permissionDenied: true,
-                          pluginId: plugin.id,
-                          pluginName: plugin.name,
-                          toolName: plugin.toolName,
-                          kind: plugin.kind,
-                          error: 'Terminal permission is disabled in Laptop Setup.',
-                        };
+                  } else {
+                    const ext = await executeExtendedDomainToolCall({
+                      name: call.name || '',
+                      args,
+                      runtime: liveGeminiKey
+                        ? { provider: 'gemini', apiKey: liveGeminiKey, model: '', byok: true }
+                        : null,
+                      workspaceToken: wsWorkspaceToken,
+                    });
+                    if (ext.handled) {
+                      result = ext.result;
+                    } else if (call.name && pluginMap.has(call.name)) {
+                      const plugin = pluginMap.get(call.name)!;
+                      if (plugin.kind === 'laptop_command') {
+                        if (sessionContext?.permissions?.terminal === false) {
+                          result = {
+                            ok: false,
+                            permissionDenied: true,
+                            pluginId: plugin.id,
+                            pluginName: plugin.name,
+                            toolName: plugin.toolName,
+                            kind: plugin.kind,
+                            error: 'Terminal permission is disabled in Laptop Setup.',
+                          };
+                        } else {
+                          const renderedCommand = renderLaptopCommand(plugin, args);
+                          const laptopRes = await requestClientToolExecution('execute_terminal_command', {
+                            command: renderedCommand,
+                            background: false,
+                          });
+                          result = {
+                            ...laptopRes,
+                            pluginId: plugin.id,
+                            pluginName: plugin.name,
+                            toolName: plugin.toolName,
+                            kind: plugin.kind,
+                            renderedCommand,
+                          };
+                        }
                       } else {
-                        const renderedCommand = renderLaptopCommand(plugin, args);
-                        const laptopRes = await requestClientToolExecution('execute_terminal_command', {
-                          command: renderedCommand,
-                          background: false,
-                        });
-                        result = {
-                          ...laptopRes,
-                          pluginId: plugin.id,
-                          pluginName: plugin.name,
-                          toolName: plugin.toolName,
-                          kind: plugin.kind,
-                          renderedCommand,
-                        };
+                        const pluginExec = await executeHttpPlugin(plugin, args);
+                        result = pluginExec as unknown as Record<string, unknown>;
                       }
-                    } else {
-                      const pluginExec = await executeHttpPlugin(plugin, args);
-                      result = pluginExec as unknown as Record<string, unknown>;
                     }
                   }
                 } catch (toolErr) {
@@ -1496,7 +2254,9 @@ async function startServer() {
           callId?: string;
           result?: Record<string, unknown>;
         };
-        if (msg.type === 'audio' && msg.data) {
+        if (msg.type === 'workspace_token') {
+          wsWorkspaceToken = typeof msg.data === 'string' && msg.data.trim() ? msg.data.trim() : null;
+        } else if (msg.type === 'audio' && msg.data) {
           session.sendRealtimeInput({
             audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
           });
@@ -1529,6 +2289,7 @@ async function startServer() {
 
     clientWs.on('close', () => {
       isClosed = true;
+      wsWorkspaceToken = null;
       if (authTimer) {
         clearTimeout(authTimer);
         authTimer = null;
@@ -1549,6 +2310,7 @@ async function startServer() {
   });
 
   startBriefScheduler();
+  startProactiveScheduler();
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Shadow Desktop server listening on http://localhost:${PORT}`);

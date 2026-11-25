@@ -12,6 +12,8 @@ import {
   ExternalLink,
   Globe,
   Loader2,
+  Maximize2,
+  Minimize2,
   MousePointerClick,
   Play,
   RefreshCw,
@@ -167,6 +169,7 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
   const [taskPrompt, setTaskPrompt] = useState('');
   const [launchMode, setLaunchMode] = useState<'agent' | 'command'>('agent');
   const [copiedBlock, setCopiedBlock] = useState<'extract' | 'submit' | null>(null);
+  const [screenshotExpanded, setScreenshotExpanded] = useState(false);
   const prefersReduced = useReducedMotion();
 
   const activeUrl = run?.inspection?.finalUrl || run?.targetUrl || '';
@@ -435,7 +438,16 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
           <div className="xl:col-span-5 p-5 overflow-y-auto space-y-4">
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
-                <span>{run.agentIterations ? 'Autonomous AI Agent' : 'Headless HTTP/DOM Engine'}</span>
+                <span>
+                  {run.agentIterations
+                    ? 'Autonomous AI Agent'
+                    : run.engine === 'playwright'
+                      ? 'Playwright JS Engine'
+                      : 'Headless HTTP/DOM Engine'}
+                  {run.playwrightAvailable === false && run.engine !== 'playwright'
+                    ? ' · Chromium unavailable (HTTP/DOM fallback)'
+                    : ''}
+                </span>
                 <span className="font-mono tabular-nums text-sky-300">
                   {run.steps.filter((s) => s.status === 'completed').length}/{run.steps.length} steps
                   {typeof run.totalDurationMs === 'number' ? ` · ${run.totalDurationMs}ms` : ''}
@@ -563,6 +575,43 @@ export const BrowserAutomationStage: React.FC<BrowserAutomationStageProps> = ({
 
           {/* Right: Live Target DOM, Extracted Data & Form Submission Output */}
           <div className={`xl:col-span-7 p-5 overflow-y-auto space-y-5 ${MAC_GLASS_SIDEBAR}`}>
+            {/* Headless Chromium Rendered Screenshot */}
+            {run.screenshotBase64 && (
+              <div className="p-3.5 rounded-xl bg-white/[0.03] border border-white/10 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-sky-300">
+                    Rendered Viewport Snapshot
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setScreenshotExpanded((v) => !v)}
+                    className="px-2 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-[11px] text-slate-200 inline-flex items-center gap-1 cursor-pointer shrink-0"
+                  >
+                    {screenshotExpanded ? (
+                      <>
+                        <Minimize2 className="w-3 h-3" />
+                        <span>Compact</span>
+                      </>
+                    ) : (
+                      <>
+                        <Maximize2 className="w-3 h-3" />
+                        <span>Expand</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <div className="overflow-hidden rounded-xl border border-white/10 bg-black/50">
+                  <img
+                    src={`data:image/jpeg;base64,${run.screenshotBase64}`}
+                    alt="Rendered page viewport"
+                    className={`w-full object-contain transition-all ${
+                      screenshotExpanded ? 'max-h-[680px]' : 'max-h-72 object-top'
+                    }`}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* HTTP Form Submission Result */}
             {run.submissionResult && (
               <div className="p-4 rounded-xl bg-emerald-500/[0.07] border border-emerald-400/30 space-y-2.5">

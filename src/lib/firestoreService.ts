@@ -30,6 +30,9 @@ import type {
   SetupConfig,
   ShadowPermissions,
   ShadowPlugin,
+  ShadowTask,
+  MeetingNote,
+  VaultDocumentMeta,
   UserProfile,
   VoiceName,
   WakeMode,
@@ -814,4 +817,229 @@ export async function deletePluginInFirestore(pluginId: string): Promise<void> {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
+
+export function subscribeTasks(
+  uid: string,
+  onData: (tasks: ShadowTask[]) => void
+): Unsubscribe {
+  const path = 'tasks';
+  const q = query(
+    collection(db, path),
+    where('ownerId', '==', uid),
+    orderBy('updatedAt', 'desc'),
+    limit(80)
+  );
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items: ShadowTask[] = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<ShadowTask, 'id'>),
+      }));
+      onData(items);
+    },
+    (error) => {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+export async function createTaskInFirestore(
+  uid: string,
+  input: {
+    title: string;
+    priority?: ShadowTask['priority'];
+    dueAt?: string;
+    notes?: string;
+  }
+): Promise<string> {
+  const path = 'tasks';
+  const cleanTitle = input.title.trim().slice(0, 200);
+  if (!cleanTitle) throw new Error('Task title is required.');
+  try {
+    const ref = doc(collection(db, path));
+    await setDoc(ref, {
+      ownerId: uid,
+      title: cleanTitle,
+      status: 'pending',
+      priority: input.priority === 'low' || input.priority === 'high' ? input.priority : 'medium',
+      dueAt: String(input.dueAt || '').trim().slice(0, 64),
+      notes: String(input.notes || '').trim().slice(0, 600),
+      reminded: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return ref.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function updateTaskInFirestore(
+  taskId: string,
+  updates: Partial<{
+    title: string;
+    status: ShadowTask['status'];
+    priority: ShadowTask['priority'];
+    dueAt: string;
+    notes: string;
+    reminded: boolean;
+  }>
+): Promise<void> {
+  const path = `tasks/${taskId}`;
+  const payload: Record<string, unknown> = { updatedAt: serverTimestamp() };
+  if (updates.title !== undefined) payload.title = updates.title.trim().slice(0, 200) || 'Task';
+  if (updates.status !== undefined) payload.status = updates.status === 'done' ? 'done' : 'pending';
+  if (updates.priority !== undefined) payload.priority = updates.priority;
+  if (updates.dueAt !== undefined) payload.dueAt = String(updates.dueAt).trim().slice(0, 64);
+  if (updates.notes !== undefined) payload.notes = String(updates.notes).trim().slice(0, 600);
+  if (updates.reminded !== undefined) payload.reminded = Boolean(updates.reminded);
+  try {
+    await updateDoc(doc(db, 'tasks', taskId), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function deleteTaskInFirestore(taskId: string): Promise<void> {
+  const path = `tasks/${taskId}`;
+  try {
+    await deleteDoc(doc(db, 'tasks', taskId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export function subscribeMeetings(
+  uid: string,
+  onData: (meetings: MeetingNote[]) => void
+): Unsubscribe {
+  const path = 'meetings';
+  const q = query(
+    collection(db, path),
+    where('ownerId', '==', uid),
+    orderBy('createdAt', 'desc'),
+    limit(25)
+  );
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items: MeetingNote[] = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<MeetingNote, 'id'>),
+      }));
+      onData(items);
+    },
+    (error) => {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+export async function saveMeetingInFirestore(
+  uid: string,
+  input: Omit<MeetingNote, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>
+): Promise<string> {
+  const path = 'meetings';
+  try {
+    const ref = doc(collection(db, path));
+    await setDoc(ref, {
+      ownerId: uid,
+      title: (input.title.trim() || 'Meeting Notes').slice(0, 140),
+      summary: (input.summary.trim() || 'Meeting recorded.').slice(0, 1500),
+      transcript: (input.transcript.trim() || 'Transcript unavailable.').slice(0, 16000),
+      keyDecisions: (input.keyDecisions || [])
+        .map((d) => String(d).trim().slice(0, 260))
+        .filter(Boolean)
+        .slice(0, 10),
+      actionItems: (input.actionItems || [])
+        .map((a) => ({
+          text: String(a.text || '').trim().slice(0, 240),
+          assignee: String(a.assignee || '').trim().slice(0, 80),
+          dueHint: String(a.dueHint || '').trim().slice(0, 80),
+        }))
+        .filter((a) => a.text)
+        .slice(0, 10),
+      topics: (input.topics || [])
+        .map((t) => String(t).trim().slice(0, 60))
+        .filter(Boolean)
+        .slice(0, 8),
+      durationSeconds: Math.max(0, Math.min(86400, Math.trunc(input.durationSeconds || 0))),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return ref.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function deleteMeetingInFirestore(meetingId: string): Promise<void> {
+  const path = `meetings/${meetingId}`;
+  try {
+    await deleteDoc(doc(db, 'meetings', meetingId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export function subscribeVaultDocs(
+  uid: string,
+  onData: (docs: VaultDocumentMeta[]) => void
+): Unsubscribe {
+  const path = 'vaultDocs';
+  const q = query(
+    collection(db, path),
+    where('ownerId', '==', uid),
+    orderBy('updatedAt', 'desc'),
+    limit(60)
+  );
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items: VaultDocumentMeta[] = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Omit<VaultDocumentMeta, 'id'>),
+      }));
+      onData(items);
+    },
+    (error) => {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+export async function saveVaultDocMetaInFirestore(
+  uid: string,
+  meta: Omit<VaultDocumentMeta, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>
+): Promise<string> {
+  const path = 'vaultDocs';
+  try {
+    const ref = doc(collection(db, path));
+    await setDoc(ref, {
+      ownerId: uid,
+      vaultId: String(meta.vaultId || ref.id).slice(0, 64),
+      title: (meta.title.trim() || 'Knowledge Document').slice(0, 140),
+      sourceType: meta.sourceType || 'note',
+      summary: String(meta.summary || '').slice(0, 400),
+      chunkCount: Math.max(0, Math.min(500, Math.trunc(meta.chunkCount || 1))),
+      embedded: Boolean(meta.embedded),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return ref.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function deleteVaultDocMetaInFirestore(docId: string): Promise<void> {
+  const path = `vaultDocs/${docId}`;
+  try {
+    await deleteDoc(doc(db, 'vaultDocs', docId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 

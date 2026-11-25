@@ -213,7 +213,7 @@
         },
         "intent": {
           "type": "string",
-          "enum": ["browser_automation", "youtube_play", "youtube_control", "workflow_run", "research", "plugin_run", "visual_generate", "conversation"]
+          "enum": ["browser_automation", "youtube_play", "youtube_control", "workflow_run", "research", "plugin_run", "visual_generate", "workspace", "meeting", "vault", "schedule", "devops", "conversation"]
         },
         "targetUrl": {
           "type": "string",
@@ -497,6 +497,58 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "TaskItem": {
+      "title": "TaskItem",
+      "description": "User-owned personal task or due-time reminder.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "enum": ["pending", "done"] },
+        "priority": { "type": "string", "enum": ["low", "medium", "high"] },
+        "dueAt": { "type": "string", "maxLength": 64 },
+        "notes": { "type": "string", "maxLength": 600 },
+        "reminded": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "title", "status", "priority", "dueAt", "notes", "reminded", "createdAt", "updatedAt"]
+    },
+    "MeetingNoteItem": {
+      "title": "MeetingNoteItem",
+      "description": "Recorded meeting transcript, decisions, and action items.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "maxLength": 140 },
+        "summary": { "type": "string", "maxLength": 1500 },
+        "transcript": { "type": "string", "maxLength": 16000 },
+        "keyDecisions": { "type": "array" },
+        "actionItems": { "type": "array" },
+        "topics": { "type": "array" },
+        "durationSeconds": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "title", "summary", "transcript", "keyDecisions", "actionItems", "topics", "durationSeconds", "createdAt", "updatedAt"]
+    },
+    "VaultDocItem": {
+      "title": "VaultDocItem",
+      "description": "Metadata for indexed Personal Knowledge Vault documents (chunks stored in vector store).",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "vaultId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "maxLength": 140 },
+        "sourceType": { "type": "string", "enum": ["note", "file", "pdf", "repo", "meeting", "url"] },
+        "summary": { "type": "string", "maxLength": 400 },
+        "chunkCount": { "type": "integer" },
+        "embedded": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "vaultId", "title", "sourceType", "summary", "chunkCount", "embedded", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -535,6 +587,18 @@
     "/plugins/{pluginId}": {
       "schema": { "$ref": "#/entities/PluginItem" },
       "description": "User-owned installed and custom voice/desktop plugins."
+    },
+    "/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/TaskItem" },
+      "description": "User-owned personal tasks and due reminders."
+    },
+    "/meetings/{meetingId}": {
+      "schema": { "$ref": "#/entities/MeetingNoteItem" },
+      "description": "User-owned meeting companion transcripts and action items."
+    },
+    "/vaultDocs/{docId}": {
+      "schema": { "$ref": "#/entities/VaultDocItem" },
+      "description": "User-owned Personal Knowledge Vault metadata records."
     }
   }
 }

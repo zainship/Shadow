@@ -12,10 +12,14 @@ async function main() {
   try {
     playwright = await import('playwright');
   } catch {
-    console.error(
-      'Playwright is not installed globally/locally. Run: npm install -D playwright && npx playwright install chromium'
-    );
-    process.exit(2);
+    try {
+      playwright = await import('playwright-core');
+    } catch {
+      console.error(
+        'Playwright is not installed globally/locally. Run: npm install -D playwright && npx playwright install chromium'
+      );
+      process.exit(2);
+    }
   }
 
   const isDesktopLayoutOnly =
@@ -42,15 +46,17 @@ async function main() {
   }
 
   const browser = await playwright.chromium.launch({
-    headless: false,
+    headless: Boolean(plan.headless),
     args: ['--start-maximized'],
   });
-  const context = await browser.newContext({ viewport: null });
+  const context = await browser.newContext({ viewport: plan.headless ? { width: 1280, height: 800 } : null });
   const page = await context.newPage();
 
   const results = [];
+  const extractedItems = [];
   if (plan.targetUrl) {
-    await page.goto(plan.targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.goto(plan.targetUrl, { waitUntil: 'domcontentloaded', timeout: 22000 });
+    await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
     results.push({ action: 'navigate', target: plan.targetUrl, status: 'completed' });
   }
 
@@ -60,7 +66,8 @@ async function main() {
     const value = step.value || '';
     try {
       if (action === 'navigate' && value) {
-        await page.goto(value, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(value, { waitUntil: 'domcontentloaded', timeout: 22000 });
+        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
       } else if (action === 'fill' && selector) {
         const loc = page.locator(selector).first();
         await loc.waitFor({ state: 'visible', timeout: 7000 });
@@ -69,19 +76,25 @@ async function main() {
         const loc = page.locator(selector).first();
         await loc.waitFor({ state: 'visible', timeout: 7000 });
         await loc.click();
+        await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => {});
       } else if (action === 'select' && selector) {
         await page.locator(selector).first().selectOption(value);
       } else if (action === 'submit') {
         const submitBtn = page.locator(selector || 'button[type="submit"], input[type="submit"]').first();
         await submitBtn.click();
+        await page.waitForLoadState('networkidle', { timeout: 3500 }).catch(() => {});
       } else if (action === 'scroll') {
         await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.75));
       } else if (action === 'wait') {
         const ms = Number(value) || 1200;
         await page.waitForTimeout(Math.min(ms, 8000));
       } else if (action === 'extract') {
-        const text = await page.locator(selector || 'body').first().innerText();
-        results.push({ action, selector, status: 'completed', extracted: text.slice(0, 600) });
+        const rows = await page.locator(selector || 'h1, h2, h3, a[href], li').allInnerTexts();
+        const cleaned = rows.map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 15);
+        for (const text of cleaned) {
+          extractedItems.push({ label: text.slice(0, 140) });
+        }
+        results.push({ action, selector, status: 'completed', extracted: cleaned.join(' | ').slice(0, 600) });
         continue;
       } else if (action === 'arrange_windows') {
         const cdp = await context.newCDPSession(page).catch(() => null);
@@ -116,10 +129,13 @@ async function main() {
 
   const finalTitle = await page.title().catch(() => '');
   const finalUrl = page.url();
-  console.log(JSON.stringify({ ok: true, finalUrl, finalTitle, results }));
+  const screenshotBuf = await page.screenshot({ type: 'jpeg', quality: 65 }).catch(() => null);
+  const screenshotBase64 = screenshotBuf ? screenshotBuf.toString('base64') : null;
+  console.log(JSON.stringify({ ok: true, engine: 'playwright', finalUrl, finalTitle, results, extractedItems, screenshotBase64 }));
 
-  // Keep Chromium open briefly for visual verification on the laptop
-  await page.waitForTimeout(4000);
+  if (!plan.headless) {
+    await page.waitForTimeout(3500);
+  }
   await browser.close();
 }
 
