@@ -25,11 +25,12 @@ import {
   UserCheck,
   X,
 } from 'lucide-react';
-import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
+import { checkShadowBackendHealth, getApiOrigin, parseJsonSafely } from '../lib/apiBase';
 import {
   aiRequestHeaders,
   DEFAULT_AI_SETTINGS,
   OPENROUTER_MODEL_SUGGESTIONS,
+  verifyByokSettingsDirectly,
   type AiProviderChoice,
   type AiSettings,
 } from '../lib/aiSettings';
@@ -398,8 +399,24 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     setTestingKey(true);
     setKeyTestResult(null);
     const clean = normalizedAiDraft();
+    const origin = getApiOrigin();
     try {
-      const res = await fetch(`${getApiOrigin()}/api/ai/test`, {
+      const healthy = await checkShadowBackendHealth(origin);
+      if (!healthy) {
+        if (clean.provider === 'openrouter' || clean.provider === 'gemini') {
+          const direct = await verifyByokSettingsDirectly(clean);
+          setKeyTestResult(direct);
+          return;
+        }
+        setKeyTestResult({
+          ok: false,
+          text: origin
+            ? `Cannot reach Shadow server at ${origin}.`
+            : 'Static PWA mode: select OpenRouter (BYOK) / Gemini (BYOK) or configure a Shadow Server URL in AI Keys.',
+        });
+        return;
+      }
+      const res = await fetch(`${origin}/api/ai/test`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -416,11 +433,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
       if (!res.ok || !data?.ok) {
         setKeyTestResult({
           ok: false,
-          text:
-            data?.error ||
-            (data
-              ? 'Verification failed'
-              : 'Static PWA mode: enter a Shadow Server URL in AI Keys to test server keys.'),
+          text: data?.error || 'Verification failed',
         });
       } else {
         setKeyTestResult({
@@ -431,7 +444,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     } catch (err) {
       setKeyTestResult({
         ok: false,
-        text: err instanceof Error ? err.message : 'Unable to reach Shadow server',
+        text: err instanceof Error ? err.message : 'Unable to verify API key',
       });
     } finally {
       setTestingKey(false);

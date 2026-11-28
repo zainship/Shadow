@@ -24,6 +24,7 @@ import {
 import {
   aiRequestHeaders,
   OPENROUTER_MODEL_SUGGESTIONS,
+  verifyByokSettingsDirectly,
   type AiProviderChoice,
   type AiSettings,
 } from '../lib/aiSettings';
@@ -147,11 +148,16 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     try {
       const healthy = await refreshBackendProbe(activeOrigin);
       if (!healthy) {
+        if (clean.provider === 'openrouter' || clean.provider === 'gemini') {
+          const direct = await verifyByokSettingsDirectly(clean);
+          setTestResult(direct);
+          return;
+        }
         setTestResult({
           ok: false,
           text: activeOrigin
             ? `Cannot reach Shadow server at ${activeOrigin}. Ensure "npm start" is running.`
-            : 'Static PWA mode: no Shadow backend at this origin. Enter a Shadow Server URL below (e.g. http://127.0.0.1:3000) or use OpenRouter BYOK.',
+            : 'Static PWA mode: no Shadow backend at this origin. Enter a Shadow Server URL above (e.g. http://127.0.0.1:3000) or select OpenRouter (BYOK) / Gemini (BYOK).',
         });
         return;
       }
@@ -180,7 +186,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     } catch (err) {
       setTestResult({
         ok: false,
-        text: err instanceof Error ? err.message : 'Unable to reach Shadow server',
+        text: err instanceof Error ? err.message : 'Unable to verify API key',
       });
     } finally {
       setTesting(false);
@@ -224,12 +230,12 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
             </div>
 
             <p className="text-xs text-slate-400 leading-relaxed mb-4">
-              Add your OpenRouter or Gemini key right here in the GUI — no <code className="text-slate-300">.env</code> editing required. Keys stay in local storage on this device and are sent only to your Shadow backend per request.
+              Add your OpenRouter or Gemini key right here in the GUI — no <code className="text-slate-300">.env</code> editing required. Keys stay in local storage on this device and run directly for BYOK in standalone mode or via your Shadow server.
             </p>
 
             {backendReachable === false && (
               <div className="mb-3 rounded-lg border border-sky-500/35 bg-sky-950/35 px-3 py-2 text-[11px] text-sky-200 leading-relaxed">
-                <strong>Standalone PWA Mode:</strong> Static hosting has no built-in Shadow server. Browser Voice &amp; local tools run automatically; optionally connect a running Shadow Server URL below for Gemini Live audio, web automation &amp; YouTube search.
+                <strong>Standalone PWA Mode:</strong> Static hosting has no built-in Shadow server. OpenRouter (BYOK), Gemini (BYOK), Browser Voice &amp; local tools run directly here; optionally enter a Shadow Server URL below for Gemini Live audio, web automation &amp; YouTube search.
               </div>
             )}
 

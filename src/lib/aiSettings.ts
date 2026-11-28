@@ -115,3 +115,122 @@ export function aiSocketAuthMessage(settings: AiSettings): {
   }
   return geminiKey ? { type: 'ai_auth', geminiKey } : { type: 'ai_auth' };
 }
+
+/**
+ * Verifies BYOK API keys directly from the browser (no Shadow backend required).
+ * Used automatically in Static PWA / Standalone mode (e.g. Firebase Hosting).
+ */
+export async function verifyByokSettingsDirectly(
+  settings: AiSettings
+): Promise<{ ok: boolean; text: string }> {
+  const geminiKey = settings.geminiKey.trim();
+  const openrouterKey = settings.openrouterKey.trim();
+  const model = settings.openrouterModel.trim() || 'openai/gpt-4o-mini';
+
+  const verifyGeminiDirect = async (key: string): Promise<{ ok: boolean; detail: string }> => {
+    const genRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+          generationConfig: { maxOutputTokens: 12 },
+        }),
+      }
+    );
+    const genBody = await genRes.json().catch(() => null) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      error?: { message?: string; status?: string };
+    } | null;
+    if (genRes.ok && genBody?.candidates?.length) {
+      return { ok: true, detail: 'gemini-2.5-flash' };
+    }
+    if (genRes.status === 404) {
+      const listRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=${encodeURIComponent(key)}`
+      );
+      if (listRes.ok) {
+        return { ok: true, detail: 'Google AI Studio key verified' };
+      }
+      const listErr = await listRes.json().catch(() => null) as { error?: { message?: string } } | null;
+      return {
+        ok: false,
+        detail: listErr?.error?.message || `Gemini HTTP ${listRes.status}`,
+      };
+    }
+    return {
+      ok: false,
+      detail: genBody?.error?.message || `Gemini HTTP ${genRes.status}`,
+    };
+  };
+
+  if (settings.provider === 'openrouter') {
+    if (!openrouterKey) {
+      return { ok: false, text: 'Enter your OpenRouter API key first.' };
+    }
+    const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openrouterKey}`,
+        'HTTP-Referer': typeof window !== 'undefined' ? window.location.origin : 'https://shadow-solodev.web.app',
+        'X-Title': 'Shadow',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'Reply with OK.' }],
+        max_tokens: 12,
+      }),
+    });
+    const orData = await orRes.json().catch(() => null) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      model?: string;
+      error?: { message?: string };
+    } | null;
+    if (!orRes.ok) {
+      return {
+        ok: false,
+        text: orData?.error?.message || `OpenRouter verification failed (HTTP ${orRes.status})`,
+      };
+    }
+    const resolvedModel = orData?.model || model;
+    if (geminiKey) {
+      const gemCheck = await verifyGeminiDirect(geminiKey);
+      if (!gemCheck.ok) {
+        return {
+          ok: false,
+          text: `OpenRouter key connected (${resolvedModel}), but optional Gemini key failed: ${gemCheck.detail}`,
+        };
+      }
+      return {
+        ok: true,
+        text: `Connected directly via OpenRouter (${resolvedModel}) + Gemini key verified`,
+      };
+    }
+    return {
+      ok: true,
+      text: `Connected directly via OpenRouter (${resolvedModel})`,
+    };
+  }
+
+  if (settings.provider === 'gemini') {
+    if (!geminiKey) {
+      return { ok: false, text: 'Enter your Gemini API key first.' };
+    }
+    const gemCheck = await verifyGeminiDirect(geminiKey);
+    if (!gemCheck.ok) {
+      return { ok: false, text: `Gemini key verification failed: ${gemCheck.detail}` };
+    }
+    return {
+      ok: true,
+      text: `Connected directly via Gemini (${gemCheck.detail})`,
+    };
+  }
+
+  return {
+    ok: false,
+    text: 'Static PWA mode: no Shadow backend at this origin. Enter a Shadow Server URL above (e.g. http://127.0.0.1:3000) or select OpenRouter (BYOK) / Gemini (BYOK).',
+  };
+}
+

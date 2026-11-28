@@ -408,6 +408,7 @@ function JarvisArcWorkspace() {
   const [aiSettingsOpen, setAiSettingsOpen] = useState<boolean>(false);
   const aiSettingsRef = useRef<AiSettings>(aiSettings);
   const serverHasGeminiKeyRef = useRef<boolean>(false);
+  const backendReachableRef = useRef<boolean | null>(null);
 
   useEffect(() => {
     aiSettingsRef.current = aiSettings;
@@ -417,6 +418,7 @@ function JarvisArcWorkspace() {
   useEffect(() => {
     const origin = getApiOrigin();
     void checkShadowBackendHealth(origin).then((healthy) => {
+      backendReachableRef.current = healthy;
       if (!healthy) {
         serverHasGeminiKeyRef.current = false;
         return;
@@ -3413,8 +3415,52 @@ function JarvisArcWorkspace() {
           return true;
         }
 
+        // 5) Gemini BYOK direct browser execution (supports CORS directly)
+        if (settings.provider === 'gemini' && settings.geminiKey.trim()) {
+          const gemModel = 'gemini-2.5-flash';
+          const gemRes = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${gemModel}:generateContent?key=${encodeURIComponent(settings.geminiKey.trim())}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                systemInstruction: {
+                  parts: [
+                    {
+                      text: `You are ${assistantNameRef.current}, a concise voice-first AI assistant running in standalone PWA mode. Keep answers sharp and speakable.`,
+                    },
+                  ],
+                },
+                contents: [
+                  ...priorHistory.map((h) => ({
+                    role: h.speaker === 'user' ? 'user' : 'model',
+                    parts: [{ text: h.text }],
+                  })),
+                  { role: 'user', parts: [{ text: displayPrompt }] },
+                ],
+              }),
+            }
+          );
+          const gemData = await parseJsonSafely<{
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+            error?: { message?: string };
+          }>(gemRes);
+          if (!gemRes.ok) {
+            throw new Error(gemData?.error?.message || `Gemini HTTP ${gemRes.status}`);
+          }
+          const reply =
+            gemData?.candidates?.[0]?.content?.parts
+              ?.map((p) => p.text || '')
+              .join('')
+              .trim() || 'Done.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply, modelUsed: gemModel });
+          finishCommandCue('command', 'Command completed', true);
+          void handleSpeakText(reply);
+          return true;
+        }
+
         const standaloneHint =
-          'Running in standalone PWA mode. Timer, Memory, and Stage controls work offline; add an OpenRouter key or Shadow Server URL in AI Keys for full AI & web automation.';
+          'Running in standalone PWA mode. Timer, Memory, and Stage controls work offline; add an OpenRouter key, Gemini key, or Shadow Server URL in AI Keys for full AI & web automation.';
         appendDialogueEntry({ speaker: 'shadow', text: standaloneHint });
         finishCommandCue('command', 'Standalone PWA mode', true);
         void handleSpeakText(standaloneHint);
@@ -3422,6 +3468,14 @@ function JarvisArcWorkspace() {
       };
 
       try {
+        if (backendReachableRef.current === false) {
+          const recovered = await checkShadowBackendHealth(apiOrigin);
+          backendReachableRef.current = recovered;
+          if (!recovered) {
+            await executeStandaloneFallback();
+            return;
+          }
+        }
         const wsToken = getWorkspaceAccessToken();
         const res = await fetch(`${apiOrigin}/api/assistant/command`, {
           method: 'POST',
