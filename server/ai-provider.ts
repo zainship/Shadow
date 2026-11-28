@@ -113,6 +113,28 @@ export function resolveCompanionGeminiKey(input: {
   return companion || undefined;
 }
 
+/**
+ * Resolve optional ElevenLabs API key + Voice ID for ultra-fast TTS synthesis
+ * (BYOK header/body takes priority over ELEVENLABS_API_KEY env).
+ */
+export function resolveElevenLabsConfig(input: {
+  headers?: HeaderBag;
+  body?: { elevenlabsKey?: unknown; elevenlabsVoiceId?: unknown };
+}): { apiKey: string; voiceId?: string } | null {
+  const apiKey = firstString(
+    headerValue(input.headers, 'x-shadow-elevenlabs-key'),
+    input.body?.elevenlabsKey,
+    process.env.ELEVENLABS_API_KEY
+  );
+  if (!apiKey) return null;
+  const voiceId = firstString(
+    headerValue(input.headers, 'x-shadow-elevenlabs-voice-id'),
+    input.body?.elevenlabsVoiceId,
+    process.env.ELEVENLABS_VOICE_ID
+  );
+  return { apiKey, ...(voiceId ? { voiceId } : {}) };
+}
+
 export function describeAiRuntime(runtime: AiRuntime | null): string {
   if (!runtime) return 'none';
   if (runtime.provider === 'openrouter') {

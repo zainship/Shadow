@@ -29,6 +29,7 @@ import { checkShadowBackendHealth, getApiOrigin, parseJsonSafely } from '../lib/
 import {
   aiRequestHeaders,
   DEFAULT_AI_SETTINGS,
+  ELEVENLABS_VOICE_SUGGESTIONS,
   OPENROUTER_MODEL_SUGGESTIONS,
   verifyByokSettingsDirectly,
   type AiProviderChoice,
@@ -153,11 +154,13 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
   const [aiDraft, setAiDraft] = useState<AiSettings>(initialAiSettings || DEFAULT_AI_SETTINGS);
   const [showOrKey, setShowOrKey] = useState(false);
   const [showGeminiKey, setShowGeminiKey] = useState(false);
+  const [showElevenLabsKey, setShowElevenLabsKey] = useState(false);
   const [testingKey, setTestingKey] = useState(false);
   const [keyTestResult, setKeyTestResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [serverAiStatus, setServerAiStatus] = useState<{
     hasServerGeminiKey?: boolean;
     hasServerOpenRouterKey?: boolean;
+    hasServerElevenLabsKey?: boolean;
   } | null>(null);
 
   // Memory seeding state
@@ -392,6 +395,8 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     geminiKey: aiDraft.geminiKey.trim(),
     openrouterKey: aiDraft.openrouterKey.trim(),
     openrouterModel: aiDraft.openrouterModel.trim(),
+    elevenlabsKey: String(aiDraft.elevenlabsKey || '').trim(),
+    elevenlabsVoiceId: String(aiDraft.elevenlabsVoiceId || '').trim(),
   });
 
   const handleTestAiKey = async () => {
@@ -403,7 +408,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
     try {
       const healthy = await checkShadowBackendHealth(origin);
       if (!healthy) {
-        if (clean.provider === 'openrouter' || clean.provider === 'gemini') {
+        if (clean.provider === 'openrouter' || clean.provider === 'gemini' || clean.elevenlabsKey) {
           const direct = await verifyByokSettingsDirectly(clean);
           setKeyTestResult(direct);
           return;
@@ -428,6 +433,7 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
         ok?: boolean;
         provider?: string;
         model?: string;
+        elevenlabsVerified?: boolean;
         error?: string;
       }>(res);
       if (!res.ok || !data?.ok) {
@@ -438,7 +444,9 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
       } else {
         setKeyTestResult({
           ok: true,
-          text: `Connected (${data.provider}${data.model ? ` · ${data.model}` : ''})`,
+          text: `Connected (${data.provider}${data.model ? ` · ${data.model}` : ''}${
+            data.elevenlabsVerified && data.provider !== 'elevenlabs' ? ' + ElevenLabs TTS' : ''
+          })`,
         });
       }
     } catch (err) {
@@ -831,13 +839,57 @@ export const FirstLaunchSetupModal: React.FC<FirstLaunchSetupModalProps> = ({
                   </div>
                 )}
 
+                <div className="p-3 rounded-xl bg-[#070A10]/70 border border-slate-800 space-y-2.5">
+                  <label className="block text-xs font-medium text-slate-300">
+                    ElevenLabs API Key (Fast Voice TTS · Optional)
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div className="relative">
+                      <input
+                        type={showElevenLabsKey ? 'text' : 'password'}
+                        value={aiDraft.elevenlabsKey || ''}
+                        onChange={(e) => setAiDraft((p) => ({ ...p, elevenlabsKey: e.target.value }))}
+                        placeholder="sk_... (ultra-fast eleven_flash_v2_5 TTS)"
+                        spellCheck={false}
+                        autoComplete="off"
+                        className="w-full px-3.5 py-2 pr-10 rounded-xl bg-[#070A10] border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-400 font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowElevenLabsKey((v) => !v)}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-100"
+                        aria-label="Toggle ElevenLabs key visibility"
+                      >
+                        {showElevenLabsKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    <div>
+                      <input
+                        type="text"
+                        value={aiDraft.elevenlabsVoiceId || ''}
+                        onChange={(e) => setAiDraft((p) => ({ ...p, elevenlabsVoiceId: e.target.value }))}
+                        placeholder="Voice ID (blank = Shadow voice)"
+                        spellCheck={false}
+                        autoComplete="off"
+                        list="setup-elevenlabs-voices"
+                        className="w-full px-3.5 py-2 rounded-xl bg-[#070A10] border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-400 font-mono"
+                      />
+                      <datalist id="setup-elevenlabs-voices">
+                        {ELEVENLABS_VOICE_SUGGESTIONS.map((v) => (
+                          <option key={v.id} value={v.id} label={v.label} />
+                        ))}
+                      </datalist>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                   <button
                     type="button"
                     disabled={
                       testingKey ||
-                      (aiDraft.provider === 'openrouter' && !aiDraft.openrouterKey.trim()) ||
-                      (aiDraft.provider === 'gemini' && !aiDraft.geminiKey.trim())
+                      (aiDraft.provider === 'openrouter' && !aiDraft.openrouterKey.trim() && !String(aiDraft.elevenlabsKey || '').trim()) ||
+                      (aiDraft.provider === 'gemini' && !aiDraft.geminiKey.trim() && !String(aiDraft.elevenlabsKey || '').trim())
                     }
                     onClick={() => void handleTestAiKey()}
                     className="px-3.5 py-2 rounded-xl border border-slate-700 bg-[#070A10] text-xs font-medium text-slate-200 hover:border-sky-500/50 disabled:opacity-40 inline-flex items-center gap-1.5 whitespace-nowrap"

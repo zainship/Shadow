@@ -2089,6 +2089,67 @@ export function buildShadowSystemInstruction(ctx?: AssistantSessionContext): str
 
 export const JARVIS_SYSTEM_INSTRUCTION = buildShadowSystemInstruction();
 
+const SHADOW_TO_ELEVENLABS_VOICE: Record<string, string> = {
+  Charon: 'JBFqnCBsd6RMkjVDRZzb',
+  Fenrir: 'pNInz6obpgDQGcFmaJgB',
+  Kore: '21m00Tcm4TlvDq8ikWAM',
+  Zephyr: '9BWtsMINqrJLrRacOk9x',
+  Puck: 'ErXwobaYiN019PkySvjV',
+};
+
+export async function synthesizeElevenLabsSpeech(
+  text: string,
+  apiKey: string,
+  voiceIdOrShadowVoice = 'Charon',
+  throwOnError = false
+): Promise<{ audioBase64: string; mimeType: string } | null> {
+  const clean = text.trim();
+  if (!clean || !apiKey.trim()) return null;
+  const trimmedVoice = String(voiceIdOrShadowVoice || '').trim();
+  const voiceId = SHADOW_TO_ELEVENLABS_VOICE[trimmedVoice] || trimmedVoice || 'JBFqnCBsd6RMkjVDRZzb';
+
+  try {
+    const res = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+      {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey.trim(),
+          'Content-Type': 'application/json',
+          Accept: 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text: clean.slice(0, 1000),
+          model_id: 'eleven_flash_v2_5',
+          voice_settings: {
+            stability: 0.45,
+            similarity_boost: 0.78,
+          },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      }
+    );
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => null)) as {
+        detail?: { message?: string } | string;
+      } | null;
+      const detailMsg =
+        typeof errBody?.detail === 'string'
+          ? errBody.detail
+          : errBody?.detail?.message || `ElevenLabs HTTP ${res.status}`;
+      if (throwOnError) throw new Error(detailMsg);
+      console.warn('ElevenLabs TTS error:', detailMsg);
+      return null;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { audioBase64: buf.toString('base64'), mimeType: 'audio/mpeg' };
+  } catch (err) {
+    if (throwOnError) throw err;
+    console.warn('ElevenLabs TTS exception:', err);
+    return null;
+  }
+}
+
 export async function synthesizeJarvisSpeech(
   text: string,
   voiceName = 'Charon',
@@ -2133,4 +2194,35 @@ export async function synthesizeJarvisSpeech(
     console.warn('TTS synthesis error:', err);
     return null;
   }
+}
+
+export async function synthesizeFastSpeech(
+  text: string,
+  options: {
+    voiceName?: string;
+    geminiKey?: string;
+    elevenlabsKey?: string;
+    elevenlabsVoiceId?: string;
+  } = {}
+): Promise<{ audioBase64: string; mimeType: string; provider: 'elevenlabs' | 'gemini' } | null> {
+  if (!text.trim()) return null;
+  if (options.elevenlabsKey?.trim()) {
+    const elAudio = await synthesizeElevenLabsSpeech(
+      text,
+      options.elevenlabsKey,
+      options.elevenlabsVoiceId || options.voiceName || 'Charon'
+    );
+    if (elAudio) {
+      return { ...elAudio, provider: 'elevenlabs' };
+    }
+  }
+  const gemAudio = await synthesizeJarvisSpeech(
+    text,
+    options.voiceName || 'Charon',
+    options.geminiKey
+  );
+  if (gemAudio) {
+    return { audioBase64: gemAudio, mimeType: 'audio/wav', provider: 'gemini' };
+  }
+  return null;
 }

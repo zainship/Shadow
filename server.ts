@@ -28,6 +28,7 @@ import {
   openRouterGenerate,
   resolveAiRuntime,
   resolveCompanionGeminiKey,
+  resolveElevenLabsConfig,
 } from './server/ai-provider.ts';
 import type { Content, FunctionCall } from '@google/genai';
 import { searchYouTube } from './server/youtube.ts';
@@ -52,6 +53,8 @@ import {
   getActiveToolDeclarations,
   inspectWebPage,
   runAutonomousWebAgent,
+  synthesizeElevenLabsSpeech,
+  synthesizeFastSpeech,
   synthesizeJarvisSpeech,
   type AssistantSessionContext,
 } from './server/automation.ts';
@@ -296,40 +299,61 @@ async function startServer() {
     res.json({
       hasServerGeminiKey: Boolean(resolveServerGeminiKey()),
       hasServerOpenRouterKey: Boolean((process.env.OPENROUTER_API_KEY || '').trim()),
+      hasServerElevenLabsKey: Boolean((process.env.ELEVENLABS_API_KEY || '').trim()),
       defaultOpenRouterModel:
         (process.env.OPENROUTER_MODEL || '').trim() || DEFAULT_OPENROUTER_MODEL,
     });
   });
 
-  // Verify a GUI-supplied OpenRouter or Gemini key live
+  // Verify a GUI-supplied OpenRouter, Gemini, or ElevenLabs key live
   app.post('/api/ai/test', async (req, res) => {
     try {
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
-      if (!runtime) {
+      const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
+      if (!runtime && !elevenlabs) {
         return sendError(
           res,
           400,
           'AI Configuration',
-          'No API key provided. Enter an OpenRouter or Gemini key in Settings/Setup.',
+          'No API key provided. Enter an OpenRouter, Gemini, or ElevenLabs key in Settings/Setup.',
           'No API key provided',
           req.originalUrl
         );
       }
-      if (runtime.provider === 'openrouter') {
+
+      if (!runtime && elevenlabs) {
+        await synthesizeElevenLabsSpeech('Ready.', elevenlabs.apiKey, elevenlabs.voiceId || 'Charon', true);
+        return res.json({
+          ok: true,
+          provider: 'elevenlabs',
+          model: 'eleven_flash_v2_5',
+          reply: 'OK',
+          elevenlabsVerified: true,
+        });
+      }
+
+      if (runtime!.provider === 'openrouter') {
         const turn = await openRouterGenerate({
-          apiKey: runtime.apiKey,
-          model: runtime.model,
+          apiKey: runtime!.apiKey,
+          model: runtime!.model,
           contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
           maxTokens: 12,
         });
+        let elevenlabsVerified = false;
+        if (elevenlabs) {
+          await synthesizeElevenLabsSpeech('Ready.', elevenlabs.apiKey, elevenlabs.voiceId || 'Charon', true);
+          elevenlabsVerified = true;
+        }
         return res.json({
           ok: true,
           provider: 'openrouter',
-          model: runtime.model,
+          model: runtime!.model,
           reply: turn.text.slice(0, 60) || 'OK',
+          elevenlabsVerified,
         });
       }
-      const ai = getGeminiClient(runtime.apiKey);
+
+      const ai = getGeminiClient(runtime!.apiKey);
       const models = getModelConfig();
       let modelUsed = models.fastText;
       let response;
@@ -354,11 +378,17 @@ async function startServer() {
           0
         );
       }
+      let elevenlabsVerified = false;
+      if (elevenlabs) {
+        await synthesizeElevenLabsSpeech('Ready.', elevenlabs.apiKey, elevenlabs.voiceId || 'Charon', true);
+        elevenlabsVerified = true;
+      }
       return res.json({
         ok: true,
         provider: 'gemini',
         model: modelUsed,
         reply: (response.text || 'OK').trim().slice(0, 60),
+        elevenlabsVerified,
       });
     } catch (err) {
       return sendGeminiError(res, err, 'API key verification failed', 'AI Key Verification', req.originalUrl);
@@ -469,21 +499,31 @@ async function startServer() {
     }
   });
 
-  // Text-to-speech endpoint (Gemini Flash Lite TTS -> WAV)
+  // Text-to-speech endpoint (ElevenLabs Flash v2.5 -> MP3 or Gemini Flash Lite TTS -> WAV)
   app.post('/api/assistant/tts', async (req, res) => {
     try {
       const text = String(req.body?.text || '').trim();
       const voiceName = String(req.body?.voiceName || 'Charon');
       if (!text) return sendError(res, 400, 'Speech Synthesis', 'Missing text', 'Missing text', req.originalUrl);
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
-      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
-      if (!geminiTtsKey && !resolveServerGeminiKey()) {
+      const geminiTtsKey =
+        resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime }) ||
+        resolveServerGeminiKey() ||
+        undefined;
+      const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
+      if (!elevenlabs && !geminiTtsKey) {
         return res.json({ audioBase64: null, mimeType: null, fallback: 'browser-speech' });
       }
-      const audioBase64 = await synthesizeJarvisSpeech(text, voiceName, geminiTtsKey);
+      const speech = await synthesizeFastSpeech(text, {
+        voiceName,
+        geminiKey: geminiTtsKey,
+        elevenlabsKey: elevenlabs?.apiKey,
+        elevenlabsVoiceId: elevenlabs?.voiceId,
+      });
       return res.json({
-        audioBase64,
-        mimeType: audioBase64 ? 'audio/wav' : null,
+        audioBase64: speech?.audioBase64 ?? null,
+        mimeType: speech?.mimeType ?? null,
+        provider: speech?.provider ?? null,
       });
     } catch (err) {
       return sendGeminiError(res, err, 'TTS failed', 'Speech Synthesis', req.originalUrl);
@@ -506,15 +546,24 @@ async function startServer() {
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
-      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
+      const geminiTtsKey =
+        resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime }) ||
+        resolveServerGeminiKey() ||
+        undefined;
+      const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
       const report = await runJarvisResearch({ query, depth, urls, runtime });
-      const audioBase64 = speak
-        ? await synthesizeJarvisSpeech(report.spokenSummary, voiceName, geminiTtsKey)
+      const speech = speak
+        ? await synthesizeFastSpeech(report.spokenSummary, {
+            voiceName,
+            geminiKey: geminiTtsKey,
+            elevenlabsKey: elevenlabs?.apiKey,
+            elevenlabsVoiceId: elevenlabs?.voiceId,
+          })
         : null;
       return res.json({
         report,
-        audioBase64,
-        audioMimeType: audioBase64 ? 'audio/wav' : null,
+        audioBase64: speech?.audioBase64 ?? null,
+        audioMimeType: speech?.mimeType ?? null,
       });
     } catch (err) {
       console.error('Research error:', err);
@@ -582,10 +631,14 @@ async function startServer() {
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
-      const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
+      const geminiTtsKey =
+        resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime }) ||
+        resolveServerGeminiKey() ||
+        undefined;
+      const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
 
       // Visuals run on either provider: Gemini native schema or OpenAI-compatible
-      // json_schema (BYOK OpenRouter). Speech narration stays Gemini-only.
+      // json_schema (BYOK OpenRouter). Speech narration uses ElevenLabs or Gemini TTS.
       const visualOptions: Parameters<typeof generateVisualAsset>[0] = {
         prompt,
         style,
@@ -599,14 +652,19 @@ async function startServer() {
       }
 
       const visual = await generateVisualAsset(visualOptions);
-      const audioBase64 = speak
-        ? await synthesizeJarvisSpeech(visual.summary, voiceName, geminiTtsKey)
+      const speech = speak
+        ? await synthesizeFastSpeech(visual.summary, {
+            voiceName,
+            geminiKey: geminiTtsKey,
+            elevenlabsKey: elevenlabs?.apiKey,
+            elevenlabsVoiceId: elevenlabs?.voiceId,
+          })
         : null;
       return res.json({
         ok: true,
         visual,
-        audioBase64,
-        audioMimeType: audioBase64 ? 'audio/wav' : null,
+        audioBase64: speech?.audioBase64 ?? null,
+        audioMimeType: speech?.mimeType ?? null,
       });
     } catch (err) {
       console.error('Visual generation error:', err);
@@ -1682,21 +1740,30 @@ async function startServer() {
           spokenText = actions.length > 0 ? 'Command executed.' : 'Ready.';
         }
 
-        const companionGeminiKey = resolveCompanionGeminiKey({
-          headers: req.headers,
-          body: req.body,
-          runtime,
-        });
-        const audioBase64 = speak
-          ? await synthesizeJarvisSpeech(spokenText, voiceName, companionGeminiKey)
+        const companionGeminiKey =
+          resolveCompanionGeminiKey({
+            headers: req.headers,
+            body: req.body,
+            runtime,
+          }) ||
+          resolveServerGeminiKey() ||
+          undefined;
+        const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
+        const speech = speak
+          ? await synthesizeFastSpeech(spokenText, {
+              voiceName,
+              geminiKey: companionGeminiKey,
+              elevenlabsKey: elevenlabs?.apiKey,
+              elevenlabsVoiceId: elevenlabs?.voiceId,
+            })
           : null;
         return res.json({
           spokenText,
           actions,
           toolTraces,
           modelUsed: runtime.model,
-          audioBase64,
-          audioMimeType: audioBase64 ? 'audio/wav' : null,
+          audioBase64: speech?.audioBase64 ?? null,
+          audioMimeType: speech?.mimeType ?? null,
           provider: 'openrouter',
         });
       }
@@ -1793,16 +1860,22 @@ async function startServer() {
         spokenText = actions.length > 0 ? 'Command executed.' : 'Ready.';
       }
 
-      const audioBase64 = speak
-        ? await synthesizeJarvisSpeech(spokenText, voiceName, runtime?.apiKey)
+      const elevenlabs = resolveElevenLabsConfig({ headers: req.headers, body: req.body });
+      const speech = speak
+        ? await synthesizeFastSpeech(spokenText, {
+            voiceName,
+            geminiKey: runtime?.apiKey || resolveServerGeminiKey() || undefined,
+            elevenlabsKey: elevenlabs?.apiKey,
+            elevenlabsVoiceId: elevenlabs?.voiceId,
+          })
         : null;
       return res.json({
         spokenText,
         actions,
         toolTraces,
         modelUsed: activeModelLabel,
-        audioBase64,
-        audioMimeType: audioBase64 ? 'audio/wav' : null,
+        audioBase64: speech?.audioBase64 ?? null,
+        audioMimeType: speech?.mimeType ?? null,
         provider: 'gemini',
       });
     } catch (err) {

@@ -74,10 +74,14 @@ export class PcmAudioPlayer {
   }
 
   public async playWavBase64(base64Wav: string): Promise<void> {
+    return this.playAudioBase64(base64Wav, 'audio/wav');
+  }
+
+  public async playAudioBase64(base64Audio: string, mimeType = 'audio/wav'): Promise<void> {
     this.clear();
     try {
       const ctx = this.ensureContext();
-      const binary = atob(base64Wav);
+      const binary = atob(base64Audio);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
@@ -92,9 +96,23 @@ export class PcmAudioPlayer {
       };
       source.start(0);
     } catch {
-      const audio = new Audio(`data:audio/wav;base64,${base64Wav}`);
+      const audio = new Audio(`data:${mimeType};base64,${base64Audio}`);
       this.currentAudioEl = audio;
-      await audio.play().catch(() => undefined);
+      audio.onended = () => {
+        if (this.currentAudioEl === audio) {
+          this.currentAudioEl = null;
+        }
+      };
+      audio.onerror = () => {
+        if (this.currentAudioEl === audio) {
+          this.currentAudioEl = null;
+        }
+      };
+      await audio.play().catch(() => {
+        if (this.currentAudioEl === audio) {
+          this.currentAudioEl = null;
+        }
+      });
     }
   }
 
@@ -140,6 +158,24 @@ export class PcmAudioPlayer {
   }
 }
 
+let browserSpeechActive = false;
+
+export function isBrowserSpeechSpeaking(): boolean {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
+  return Boolean(browserSpeechActive || window.speechSynthesis.speaking);
+}
+
+export function stopBrowserSpeech(): void {
+  browserSpeechActive = false;
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export function speakWithBrowserSpeech(text: string): boolean {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
   const clean = text.trim();
@@ -149,9 +185,20 @@ export function speakWithBrowserSpeech(text: string): boolean {
     const utterance = new SpeechSynthesisUtterance(clean.slice(0, 600));
     utterance.rate = 1.05;
     utterance.pitch = 0.96;
+    browserSpeechActive = true;
+    utterance.onstart = () => {
+      browserSpeechActive = true;
+    };
+    utterance.onend = () => {
+      browserSpeechActive = false;
+    };
+    utterance.onerror = () => {
+      browserSpeechActive = false;
+    };
     window.speechSynthesis.speak(utterance);
     return true;
   } catch {
+    browserSpeechActive = false;
     return false;
   }
 }

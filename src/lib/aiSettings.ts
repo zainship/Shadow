@@ -12,6 +12,8 @@ export interface AiSettings {
   geminiKey: string;
   openrouterKey: string;
   openrouterModel: string;
+  elevenlabsKey?: string;
+  elevenlabsVoiceId?: string;
 }
 
 const AI_SETTINGS_KEY = 'shadow_ai_settings_v1';
@@ -21,6 +23,8 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   geminiKey: '',
   openrouterKey: '',
   openrouterModel: '',
+  elevenlabsKey: '',
+  elevenlabsVoiceId: '',
 };
 
 /** Popular OpenRouter model ids as quick suggestions; any model id works. */
@@ -35,6 +39,32 @@ export const OPENROUTER_MODEL_SUGGESTIONS = [
   'qwen/qwen-2.5-72b-instruct',
 ];
 
+export const ELEVENLABS_VOICE_SUGGESTIONS: Array<{ id: string; label: string }> = [
+  { id: 'JBFqnCBsd6RMkjVDRZzb', label: 'George — Warm British' },
+  { id: '21m00Tcm4TlvDq8ikWAM', label: 'Rachel — Calm Clear' },
+  { id: 'pNInz6obpgDQGcFmaJgB', label: 'Adam — Deep Crisp' },
+  { id: '9BWtsMINqrJLrRacOk9x', label: 'Aria — Expressive' },
+  { id: 'EXAVITQu4vr4xnSDxMaL', label: 'Bella — Soft Conversational' },
+  { id: 'ErXwobaYiN019PkySvjV', label: 'Antoni — Balanced' },
+];
+
+const SHADOW_TO_ELEVENLABS_VOICE: Record<string, string> = {
+  Charon: 'JBFqnCBsd6RMkjVDRZzb', // George
+  Fenrir: 'pNInz6obpgDQGcFmaJgB', // Adam
+  Kore: '21m00Tcm4TlvDq8ikWAM',   // Rachel
+  Zephyr: '9BWtsMINqrJLrRacOk9x', // Aria
+  Puck: 'ErXwobaYiN019PkySvjV',   // Antoni
+};
+
+export function resolveElevenLabsVoiceId(voiceIdOrShadowVoice?: string): string {
+  const trimmed = String(voiceIdOrShadowVoice || '').trim();
+  if (!trimmed) return 'JBFqnCBsd6RMkjVDRZzb';
+  if (SHADOW_TO_ELEVENLABS_VOICE[trimmed]) {
+    return SHADOW_TO_ELEVENLABS_VOICE[trimmed];
+  }
+  return trimmed;
+}
+
 export function loadAiSettings(): AiSettings {
   try {
     const raw = localStorage.getItem(AI_SETTINGS_KEY);
@@ -47,6 +77,8 @@ export function loadAiSettings(): AiSettings {
       geminiKey: String(parsed.geminiKey || '').trim().slice(0, 200),
       openrouterKey: String(parsed.openrouterKey || '').trim().slice(0, 300),
       openrouterModel: String(parsed.openrouterModel || '').trim().slice(0, 120),
+      elevenlabsKey: String(parsed.elevenlabsKey || '').trim().slice(0, 240),
+      elevenlabsVoiceId: String(parsed.elevenlabsVoiceId || '').trim().slice(0, 100),
     };
   } catch {
     return { ...DEFAULT_AI_SETTINGS };
@@ -62,6 +94,8 @@ export function saveAiSettings(settings: AiSettings): void {
         geminiKey: settings.geminiKey.trim().slice(0, 200),
         openrouterKey: settings.openrouterKey.trim().slice(0, 300),
         openrouterModel: settings.openrouterModel.trim().slice(0, 120),
+        elevenlabsKey: String(settings.elevenlabsKey || '').trim().slice(0, 240),
+        elevenlabsVoiceId: String(settings.elevenlabsVoiceId || '').trim().slice(0, 100),
       } satisfies AiSettings)
     );
   } catch {
@@ -71,26 +105,32 @@ export function saveAiSettings(settings: AiSettings): void {
 
 /** Headers to attach to LLM-backed REST calls (command / research / tts / visuals). */
 export function aiRequestHeaders(settings: AiSettings): Record<string, string> {
+  const headers: Record<string, string> = {};
   if (settings.provider === 'gemini' && settings.geminiKey.trim()) {
-    return { 'x-shadow-provider': 'gemini', 'x-shadow-key': settings.geminiKey.trim() };
-  }
-  if (settings.provider === 'openrouter' && settings.openrouterKey.trim()) {
-    const headers: Record<string, string> = {
-      'x-shadow-provider': 'openrouter',
-      'x-shadow-key': settings.openrouterKey.trim(),
-    };
+    headers['x-shadow-provider'] = 'gemini';
+    headers['x-shadow-key'] = settings.geminiKey.trim();
+  } else if (settings.provider === 'openrouter' && settings.openrouterKey.trim()) {
+    headers['x-shadow-provider'] = 'openrouter';
+    headers['x-shadow-key'] = settings.openrouterKey.trim();
     if (settings.openrouterModel.trim()) {
       headers['x-shadow-model'] = settings.openrouterModel.trim();
     }
     if (settings.geminiKey.trim()) {
       headers['x-shadow-gemini-key'] = settings.geminiKey.trim();
     }
-    return headers;
+  } else if (settings.geminiKey.trim()) {
+    headers['x-shadow-gemini-key'] = settings.geminiKey.trim();
   }
-  if (settings.geminiKey.trim()) {
-    return { 'x-shadow-gemini-key': settings.geminiKey.trim() };
+
+  const elevenKey = String(settings.elevenlabsKey || '').trim();
+  if (elevenKey) {
+    headers['x-shadow-elevenlabs-key'] = elevenKey;
+    const elevenVoice = String(settings.elevenlabsVoiceId || '').trim();
+    if (elevenVoice) {
+      headers['x-shadow-elevenlabs-voice-id'] = elevenVoice;
+    }
   }
-  return {};
+  return headers;
 }
 
 /** First message to send over /ws/live to announce the provider (voice = Gemini only). */
@@ -178,6 +218,55 @@ export async function generateGeminiDirect(
 }
 
 /**
+ * Ultra-fast direct ElevenLabs TTS synthesis in browser (eleven_flash_v2_5).
+ */
+export async function synthesizeElevenLabsDirect(
+  text: string,
+  apiKey: string,
+  voiceIdOrShadowVoice?: string
+): Promise<{ audioBase64: string; mimeType: string }> {
+  const cleanText = text.trim().slice(0, 1000);
+  const voiceId = resolveElevenLabsVoiceId(voiceIdOrShadowVoice);
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey.trim(),
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text: cleanText,
+        model_id: 'eleven_flash_v2_5',
+        voice_settings: {
+          stability: 0.45,
+          similarity_boost: 0.78,
+        },
+      }),
+    }
+  );
+  if (!res.ok) {
+    const errBody = (await res.json().catch(() => null)) as {
+      detail?: { message?: string } | string;
+    } | null;
+    const detailMsg =
+      typeof errBody?.detail === 'string'
+        ? errBody.detail
+        : errBody?.detail?.message || `ElevenLabs HTTP ${res.status}`;
+    throw new Error(detailMsg);
+  }
+  const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return { audioBase64: btoa(binary), mimeType: 'audio/mpeg' };
+}
+
+/**
  * Verifies BYOK API keys directly from the browser (no Shadow backend required).
  * Used automatically in Static PWA / Standalone mode (e.g. Firebase Hosting).
  */
@@ -186,7 +275,19 @@ export async function verifyByokSettingsDirectly(
 ): Promise<{ ok: boolean; text: string }> {
   const geminiKey = settings.geminiKey.trim();
   const openrouterKey = settings.openrouterKey.trim();
+  const elevenlabsKey = String(settings.elevenlabsKey || '').trim();
+  const elevenlabsVoiceId = String(settings.elevenlabsVoiceId || '').trim();
   const model = settings.openrouterModel.trim() || 'openai/gpt-4o-mini';
+
+  const verifyElevenLabsDirect = async (key: string): Promise<{ ok: boolean; detail: string }> => {
+    try {
+      await synthesizeElevenLabsDirect('Ready.', key, elevenlabsVoiceId || 'Charon');
+      return { ok: true, detail: 'eleven_flash_v2_5' };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'ElevenLabs verification failed';
+      return { ok: false, detail: msg };
+    }
+  };
 
   const verifyGeminiDirect = async (key: string): Promise<{ ok: boolean; detail: string }> => {
     try {
@@ -208,6 +309,34 @@ export async function verifyByokSettingsDirectly(
       }
       return { ok: false, detail: msg };
     }
+  };
+
+  const verifyOptionalVoiceKeys = async (primarySummary: string): Promise<{ ok: boolean; text: string }> => {
+    const extras: string[] = [];
+    if (settings.provider === 'openrouter' && geminiKey) {
+      const gemCheck = await verifyGeminiDirect(geminiKey);
+      if (!gemCheck.ok) {
+        return {
+          ok: false,
+          text: `${primarySummary}, but optional Gemini key failed: ${gemCheck.detail}`,
+        };
+      }
+      extras.push('Gemini key verified');
+    }
+    if (elevenlabsKey) {
+      const elCheck = await verifyElevenLabsDirect(elevenlabsKey);
+      if (!elCheck.ok) {
+        return {
+          ok: false,
+          text: `${primarySummary}, but ElevenLabs TTS key failed: ${elCheck.detail}`,
+        };
+      }
+      extras.push(`ElevenLabs (${elCheck.detail})`);
+    }
+    return {
+      ok: true,
+      text: extras.length > 0 ? `${primarySummary} + ${extras.join(' + ')}` : primarySummary,
+    };
   };
 
   if (settings.provider === 'openrouter') {
@@ -240,23 +369,7 @@ export async function verifyByokSettingsDirectly(
       };
     }
     const resolvedModel = orData?.model || model;
-    if (geminiKey) {
-      const gemCheck = await verifyGeminiDirect(geminiKey);
-      if (!gemCheck.ok) {
-        return {
-          ok: false,
-          text: `OpenRouter key connected (${resolvedModel}), but optional Gemini key failed: ${gemCheck.detail}`,
-        };
-      }
-      return {
-        ok: true,
-        text: `Connected directly via OpenRouter (${resolvedModel}) + Gemini key verified`,
-      };
-    }
-    return {
-      ok: true,
-      text: `Connected directly via OpenRouter (${resolvedModel})`,
-    };
+    return verifyOptionalVoiceKeys(`Connected directly via OpenRouter (${resolvedModel})`);
   }
 
   if (settings.provider === 'gemini') {
@@ -267,9 +380,17 @@ export async function verifyByokSettingsDirectly(
     if (!gemCheck.ok) {
       return { ok: false, text: `Gemini key verification failed: ${gemCheck.detail}` };
     }
+    return verifyOptionalVoiceKeys(`Connected directly via Gemini (${gemCheck.detail})`);
+  }
+
+  if (elevenlabsKey) {
+    const elCheck = await verifyElevenLabsDirect(elevenlabsKey);
+    if (!elCheck.ok) {
+      return { ok: false, text: `ElevenLabs key verification failed: ${elCheck.detail}` };
+    }
     return {
       ok: true,
-      text: `Connected directly via Gemini (${gemCheck.detail})`,
+      text: `ElevenLabs TTS connected directly (${elCheck.detail})`,
     };
   }
 

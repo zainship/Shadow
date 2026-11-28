@@ -23,6 +23,7 @@ import {
 } from '../lib/apiBase';
 import {
   aiRequestHeaders,
+  ELEVENLABS_VOICE_SUGGESTIONS,
   OPENROUTER_MODEL_SUGGESTIONS,
   verifyByokSettingsDirectly,
   type AiProviderChoice,
@@ -66,6 +67,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
   const [draft, setDraft] = useState<AiSettings>(settings);
   const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [showOrKey, setShowOrKey] = useState(false);
+  const [showElevenLabsKey, setShowElevenLabsKey] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -74,6 +76,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
   const [serverStatus, setServerStatus] = useState<{
     hasServerGeminiKey?: boolean;
     hasServerOpenRouterKey?: boolean;
+    hasServerElevenLabsKey?: boolean;
   } | null>(null);
 
   const refreshBackendProbe = async (candidateUrl?: string) => {
@@ -90,6 +93,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
       const data = await parseJsonSafely<{
         hasServerGeminiKey?: boolean;
         hasServerOpenRouterKey?: boolean;
+        hasServerElevenLabsKey?: boolean;
       }>(res);
       if (res.ok && data) setServerStatus(data);
     } catch {
@@ -126,6 +130,8 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     geminiKey: draft.geminiKey.trim(),
     openrouterKey: draft.openrouterKey.trim(),
     openrouterModel: draft.openrouterModel.trim(),
+    elevenlabsKey: String(draft.elevenlabsKey || '').trim(),
+    elevenlabsVoiceId: String(draft.elevenlabsVoiceId || '').trim(),
   });
 
   const handleSave = () => {
@@ -148,7 +154,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
     try {
       const healthy = await refreshBackendProbe(activeOrigin);
       if (!healthy) {
-        if (clean.provider === 'openrouter' || clean.provider === 'gemini') {
+        if (clean.provider === 'openrouter' || clean.provider === 'gemini' || clean.elevenlabsKey) {
           const direct = await verifyByokSettingsDirectly(clean);
           setTestResult(direct);
           return;
@@ -173,6 +179,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
         ok?: boolean;
         provider?: string;
         model?: string;
+        elevenlabsVerified?: boolean;
         error?: string;
       }>(res);
       if (!res.ok || !data?.ok) {
@@ -180,7 +187,9 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
       } else {
         setTestResult({
           ok: true,
-          text: `Connected (${data.provider}${data.model ? ` · ${data.model}` : ''})`,
+          text: `Connected (${data.provider}${data.model ? ` · ${data.model}` : ''}${
+            data.elevenlabsVerified && data.provider !== 'elevenlabs' ? ' + ElevenLabs TTS' : ''
+          })`,
         });
       }
     } catch (err) {
@@ -425,6 +434,57 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
               </div>
             )}
 
+            <div className="mb-4 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-3 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs font-medium text-slate-200 flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                  <span>ElevenLabs API Key (Fast Voice TTS · Optional)</span>
+                </label>
+                {serverStatus?.hasServerElevenLabsKey && !String(draft.elevenlabsKey || '').trim() && (
+                  <span className="text-[10px] font-medium text-emerald-400">Server key active</span>
+                )}
+              </div>
+              <div className="relative">
+                <input
+                  type={showElevenLabsKey ? 'text' : 'password'}
+                  value={draft.elevenlabsKey || ''}
+                  onChange={(e) => setDraft((p) => ({ ...p, elevenlabsKey: e.target.value }))}
+                  placeholder="sk_... (enables ultra-fast eleven_flash_v2_5 spoken replies)"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 pr-10 text-xs text-slate-100 placeholder-slate-500 focus:border-amber-400/60 focus:outline-none font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowElevenLabsKey((v) => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                  aria-label="Toggle ElevenLabs key visibility"
+                >
+                  {showElevenLabsKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                  ElevenLabs Voice ID (optional — blank maps your Shadow voice automatically)
+                </label>
+                <input
+                  type="text"
+                  value={draft.elevenlabsVoiceId || ''}
+                  onChange={(e) => setDraft((p) => ({ ...p, elevenlabsVoiceId: e.target.value }))}
+                  placeholder="e.g. JBFqnCBsd6RMkjVDRZzb (George)"
+                  spellCheck={false}
+                  autoComplete="off"
+                  list="elevenlabs-voice-suggestions"
+                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:border-amber-400/60 focus:outline-none font-mono"
+                />
+                <datalist id="elevenlabs-voice-suggestions">
+                  {ELEVENLABS_VOICE_SUGGESTIONS.map((v) => (
+                    <option key={v.id} value={v.id} label={v.label} />
+                  ))}
+                </datalist>
+              </div>
+            </div>
+
             {testResult && (
               <div
                 className={`mb-4 rounded-lg border px-3 py-2 text-xs ${
@@ -440,7 +500,7 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
             <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 mb-4 flex gap-2">
               <Info className="w-3.5 h-3.5 text-sky-400 shrink-0 mt-0.5" />
               <p className="text-[11px] text-slate-400 leading-relaxed">
-                Commands, web research, visual generation, morning briefs, and media lookups route directly to your chosen provider. When OpenRouter is selected without a Gemini key, spoken replies automatically use built-in browser speech.
+                Commands, web research, visual generation, morning briefs, and media lookups route directly to your chosen provider. Adding an ElevenLabs key prioritizes ultra-low-latency <code className="text-slate-300">eleven_flash_v2_5</code> voice synthesis automatically; otherwise Shadow falls back to Gemini neural TTS or browser speech.
                 {draft.provider === 'openrouter' && !draft.geminiKey.trim() && (
                   <span className="flex items-center gap-1 mt-1 text-slate-300">
                     <Mic className="w-3 h-3" /> Real-time Live Audio sessions use Gemini (add a Gemini key above to enable both).
@@ -455,7 +515,15 @@ export function AiSettingsModal({ open, settings, onSave, onClose }: AiSettingsM
                 onClick={() => {
                   setServerUrlDraft('');
                   saveServerUrl('');
-                  onSave({ ...draft, provider: 'server', geminiKey: '', openrouterKey: '', openrouterModel: '' });
+                  onSave({
+                    ...draft,
+                    provider: 'server',
+                    geminiKey: '',
+                    openrouterKey: '',
+                    openrouterModel: '',
+                    elevenlabsKey: '',
+                    elevenlabsVoiceId: '',
+                  });
                   setSavedFlash(true);
                   setTestResult(null);
                   void refreshBackendProbe('');

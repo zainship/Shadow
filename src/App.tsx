@@ -69,7 +69,13 @@ import {
 import { KnowledgeVaultStage } from './components/KnowledgeVaultStage';
 import { WorkspaceStage } from './components/WorkspaceStage';
 import { YouTubeMediaStage } from './components/YouTubeMediaStage';
-import { float32ToPcm16Base64, PcmAudioPlayer, speakWithBrowserSpeech } from './lib/audioEngine';
+import {
+  float32ToPcm16Base64,
+  isBrowserSpeechSpeaking,
+  PcmAudioPlayer,
+  speakWithBrowserSpeech,
+  stopBrowserSpeech,
+} from './lib/audioEngine';
 import {
   DoubleClapAnalyzer,
   playWakeChime,
@@ -184,6 +190,7 @@ interface BrowserSpeechRecognition {
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
+  abort?: () => void;
 }
 import {
   aiRequestHeaders,
@@ -191,6 +198,7 @@ import {
   generateGeminiDirect,
   loadAiSettings,
   saveAiSettings,
+  synthesizeElevenLabsDirect,
   type AiSettings,
 } from './lib/aiSettings';
 import { AiSettingsModal } from './components/AiSettingsModal';
@@ -409,6 +417,7 @@ function JarvisArcWorkspace() {
   const [aiSettingsOpen, setAiSettingsOpen] = useState<boolean>(false);
   const aiSettingsRef = useRef<AiSettings>(aiSettings);
   const serverHasGeminiKeyRef = useRef<boolean>(false);
+  const serverHasElevenLabsKeyRef = useRef<boolean>(false);
   const backendReachableRef = useRef<boolean | null>(null);
 
   useEffect(() => {
@@ -422,13 +431,24 @@ function JarvisArcWorkspace() {
       backendReachableRef.current = healthy;
       if (!healthy) {
         serverHasGeminiKeyRef.current = false;
+        serverHasElevenLabsKeyRef.current = false;
         return;
       }
       void fetch(`${origin}/api/ai/status`)
-        .then((r) => (r.ok ? parseJsonSafely<{ hasServerGeminiKey?: boolean }>(r) : null))
+        .then((r) =>
+          r.ok
+            ? parseJsonSafely<{
+                hasServerGeminiKey?: boolean;
+                hasServerElevenLabsKey?: boolean;
+              }>(r)
+            : null
+        )
         .then((data) => {
           if (data && typeof data.hasServerGeminiKey === 'boolean') {
             serverHasGeminiKeyRef.current = data.hasServerGeminiKey;
+          }
+          if (data && typeof data.hasServerElevenLabsKey === 'boolean') {
+            serverHasElevenLabsKeyRef.current = data.hasServerElevenLabsKey;
           }
         })
         .catch(() => null);
@@ -576,6 +596,9 @@ function JarvisArcWorkspace() {
   const inputLevelRef = useRef<number>(0);
   const outputLevelRef = useRef<number>(0);
   const isMicMutedRef = useRef<boolean>(false);
+  const manualMicMutedRef = useRef<boolean>(false);
+  const autoMutedForSpeechRef = useRef<boolean>(false);
+  const speechUnmuteTimerRef = useRef<number | null>(null);
   const isConnectedRef = useRef<boolean>(false);
   const isConnectingRef = useRef<boolean>(false);
   const userTranscriptBufRef = useRef<string>('');
@@ -894,13 +917,74 @@ function JarvisArcWorkspace() {
         inputLevelRef.current = 0;
       }
       outputLevelRef.current = playerRef.current.getOutputLevel();
-      const speakingNow = playerRef.current.isPlaying();
+      const speakingNow = playerRef.current.isPlaying() || isBrowserSpeechSpeaking();
       setIsAssistantSpeaking((prev) => (prev !== speakingNow ? speakingNow : prev));
       rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
   }, []);
+
+  // Auto-mute microphone whenever Shadow is speaking, and restore user's mic state once completed
+  useEffect(() => {
+    if (!isConnected) {
+      if (speechUnmuteTimerRef.current) {
+        window.clearTimeout(speechUnmuteTimerRef.current);
+        speechUnmuteTimerRef.current = null;
+      }
+      autoMutedForSpeechRef.current = false;
+      return;
+    }
+
+    if (isAssistantSpeaking) {
+      if (speechUnmuteTimerRef.current) {
+        window.clearTimeout(speechUnmuteTimerRef.current);
+        speechUnmuteTimerRef.current = null;
+      }
+      autoMutedForSpeechRef.current = true;
+      isMicMutedRef.current = true;
+      setIsMicMuted(true);
+      micStreamRef.current?.getAudioTracks().forEach((t) => {
+        t.enabled = false;
+      });
+      if (browserVoiceActiveRef.current && speechRecognitionRef.current) {
+        try {
+          if (typeof speechRecognitionRef.current.abort === 'function') {
+            speechRecognitionRef.current.abort();
+          } else {
+            speechRecognitionRef.current.stop();
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    if (autoMutedForSpeechRef.current) {
+      if (speechUnmuteTimerRef.current) {
+        window.clearTimeout(speechUnmuteTimerRef.current);
+      }
+      speechUnmuteTimerRef.current = window.setTimeout(() => {
+        speechUnmuteTimerRef.current = null;
+        autoMutedForSpeechRef.current = false;
+        if (!isConnectedRef.current) return;
+        const targetMuted = manualMicMutedRef.current;
+        isMicMutedRef.current = targetMuted;
+        setIsMicMuted(targetMuted);
+        micStreamRef.current?.getAudioTracks().forEach((t) => {
+          t.enabled = !targetMuted || clapWakeEnabledRef.current;
+        });
+        if (browserVoiceActiveRef.current && !targetMuted && speechRecognitionRef.current) {
+          try {
+            speechRecognitionRef.current.start();
+          } catch {
+            // ignore already-started race
+          }
+        }
+      }, 220);
+    }
+  }, [isAssistantSpeaking, isConnected]);
 
   // Firebase Auth + Real-Time Firestore Listeners
   useEffect(() => {
@@ -2511,6 +2595,14 @@ function JarvisArcWorkspace() {
     isConnectedRef.current = false;
     isConnectingRef.current = false;
     browserVoiceActiveRef.current = false;
+    if (speechUnmuteTimerRef.current) {
+      window.clearTimeout(speechUnmuteTimerRef.current);
+      speechUnmuteTimerRef.current = null;
+    }
+    autoMutedForSpeechRef.current = false;
+    manualMicMutedRef.current = false;
+    isMicMutedRef.current = false;
+    setIsMicMuted(false);
     setIsConnected(false);
     setIsConnecting(false);
 
@@ -2550,6 +2642,7 @@ function JarvisArcWorkspace() {
       wsRef.current = null;
     }
     playerRef.current.clear();
+    stopBrowserSpeech();
   }, []);
 
   const startVoiceSession = useCallback(
@@ -2606,8 +2699,17 @@ function JarvisArcWorkspace() {
         processor.connect(silentGain);
         silentGain.connect(inputCtx.destination);
 
+        if (speechUnmuteTimerRef.current) {
+          window.clearTimeout(speechUnmuteTimerRef.current);
+          speechUnmuteTimerRef.current = null;
+        }
+        autoMutedForSpeechRef.current = false;
+        manualMicMutedRef.current = startMuted;
         isMicMutedRef.current = startMuted;
         setIsMicMuted(startMuted);
+        stream.getAudioTracks().forEach((t) => {
+          t.enabled = !startMuted || clapWakeEnabledRef.current;
+        });
 
         // Standalone Static PWA Fallback (e.g. Firebase Hosting without a backend server):
         // Use browser-native SpeechRecognition + local/BYOK command handling instead of failing WS.
@@ -2691,7 +2793,8 @@ function JarvisArcWorkspace() {
             if (
               isConnectedRef.current &&
               browserVoiceActiveRef.current &&
-              speechRecognitionRef.current === recognition
+              speechRecognitionRef.current === recognition &&
+              !autoMutedForSpeechRef.current
             ) {
               try {
                 recognition.start();
@@ -2709,12 +2812,17 @@ function JarvisArcWorkspace() {
             const samples = e.inputBuffer.getChannelData(0);
             if (
               isMicMutedRef.current &&
+              !autoMutedForSpeechRef.current &&
               clapWakeEnabledRef.current &&
               mutedClapAnalyzerRef.current.processSamples(samples, 16000)
             ) {
               playWakeChime();
+              manualMicMutedRef.current = false;
               isMicMutedRef.current = false;
               setIsMicMuted(false);
+              micStreamRef.current?.getAudioTracks().forEach((t) => {
+                t.enabled = true;
+              });
               showTransientCaption(
                 assistantNameRef.current,
                 'Double-clap detected. Mic live.',
@@ -2992,12 +3100,17 @@ function JarvisArcWorkspace() {
           const samples = e.inputBuffer.getChannelData(0);
           if (isMicMutedRef.current) {
             if (
+              !autoMutedForSpeechRef.current &&
               clapWakeEnabledRef.current &&
               mutedClapAnalyzerRef.current.processSamples(samples, 16000)
             ) {
               playWakeChime();
+              manualMicMutedRef.current = false;
               isMicMutedRef.current = false;
               setIsMicMuted(false);
+              micStreamRef.current?.getAudioTracks().forEach((t) => {
+                t.enabled = true;
+              });
               showTransientCaption(
                 assistantNameRef.current,
                 'Double-clap detected. Mic live.',
@@ -3149,8 +3262,24 @@ function JarvisArcWorkspace() {
       if (!isConnectedRef.current) {
         void startVoiceSession(false);
       } else {
+        if (speechUnmuteTimerRef.current) {
+          window.clearTimeout(speechUnmuteTimerRef.current);
+          speechUnmuteTimerRef.current = null;
+        }
+        autoMutedForSpeechRef.current = false;
+        manualMicMutedRef.current = false;
         isMicMutedRef.current = false;
         setIsMicMuted(false);
+        micStreamRef.current?.getAudioTracks().forEach((t) => {
+          t.enabled = true;
+        });
+        if (browserVoiceActiveRef.current && speechRecognitionRef.current) {
+          try {
+            speechRecognitionRef.current.start();
+          } catch {
+            // ignore
+          }
+        }
       }
     };
 
@@ -3158,6 +3287,12 @@ function JarvisArcWorkspace() {
       if (e.code !== 'Space' || !spaceHoldActiveRef.current) return;
       spaceHoldActiveRef.current = false;
       if (wakeMode === 'push-to-talk' && isConnectedRef.current) {
+        if (speechUnmuteTimerRef.current) {
+          window.clearTimeout(speechUnmuteTimerRef.current);
+          speechUnmuteTimerRef.current = null;
+        }
+        autoMutedForSpeechRef.current = false;
+        manualMicMutedRef.current = true;
         isMicMutedRef.current = true;
         setIsMicMuted(true);
       }
@@ -3178,7 +3313,24 @@ function JarvisArcWorkspace() {
       showTransientCaption(assistantNameRef.current, clean, 7000);
       const settings = aiSettingsRef.current;
       const apiOrigin = getApiOrigin();
+      const elevenKey = String(settings.elevenlabsKey || '').trim();
+      const elevenVoice = String(settings.elevenlabsVoiceId || '').trim() || voiceName;
+
+      // Fastest direct path in Standalone PWA mode when user provided an ElevenLabs key
+      if (elevenKey && backendReachableRef.current === false) {
+        try {
+          const direct = await synthesizeElevenLabsDirect(clean, elevenKey, elevenVoice);
+          await playerRef.current.playAudioBase64(direct.audioBase64, direct.mimeType);
+          return;
+        } catch {
+          speakWithBrowserSpeech(clean);
+          return;
+        }
+      }
+
       const canUseNeuralTts =
+        Boolean(elevenKey) ||
+        serverHasElevenLabsKeyRef.current ||
         Boolean(settings.geminiKey.trim()) ||
         (settings.provider !== 'openrouter' && serverHasGeminiKeyRef.current);
 
@@ -3193,14 +3345,32 @@ function JarvisArcWorkspace() {
           headers: { 'Content-Type': 'application/json', ...aiRequestHeaders(settings) },
           body: JSON.stringify({ text: clean, voiceName }),
         });
-        const data = await parseJsonSafely<{ audioBase64?: string | null; error?: string }>(res);
+        const data = await parseJsonSafely<{
+          audioBase64?: string | null;
+          mimeType?: string | null;
+          error?: string;
+        }>(res);
+        if (!data && elevenKey) {
+          const direct = await synthesizeElevenLabsDirect(clean, elevenKey, elevenVoice);
+          await playerRef.current.playAudioBase64(direct.audioBase64, direct.mimeType);
+          return;
+        }
         if (!res.ok || !data) throw new Error(data?.error || 'TTS failed');
         if (data.audioBase64) {
-          await playerRef.current.playWavBase64(data.audioBase64);
+          await playerRef.current.playAudioBase64(data.audioBase64, data.mimeType || 'audio/wav');
         } else {
           speakWithBrowserSpeech(clean);
         }
       } catch {
+        if (elevenKey) {
+          try {
+            const direct = await synthesizeElevenLabsDirect(clean, elevenKey, elevenVoice);
+            await playerRef.current.playAudioBase64(direct.audioBase64, direct.mimeType);
+            return;
+          } catch {
+            // fallback to browser speech
+          }
+        }
         speakWithBrowserSpeech(clean);
       }
     },
@@ -3488,6 +3658,7 @@ function JarvisArcWorkspace() {
           toolTraces?: AgentToolTrace[];
           modelUsed?: string;
           audioBase64?: string | null;
+          audioMimeType?: string | null;
           error?: string;
         }>(res);
 
@@ -3518,7 +3689,10 @@ function JarvisArcWorkspace() {
           });
           showTransientCaption(assistantNameRef.current, data.spokenText, 6000);
           if (data.audioBase64) {
-            void playerRef.current.playWavBase64(data.audioBase64);
+            void playerRef.current.playAudioBase64(
+              data.audioBase64,
+              data.audioMimeType || 'audio/wav'
+            );
           } else {
             void handleSpeakText(data.spokenText);
           }
@@ -4113,6 +4287,7 @@ function JarvisArcWorkspace() {
         const data = await parseJsonSafely<{
           report?: ResearchReport;
           audioBase64?: string | null;
+          audioMimeType?: string | null;
           error?: string;
         }>(res);
         if (!res.ok || !data?.report) {
@@ -4133,7 +4308,10 @@ function JarvisArcWorkspace() {
         if (data.report.spokenSummary) {
           showTransientCaption(assistantNameRef.current, data.report.spokenSummary, 7000);
           if (data.audioBase64) {
-            void playerRef.current.playWavBase64(data.audioBase64);
+            void playerRef.current.playAudioBase64(
+              data.audioBase64,
+              data.audioMimeType || 'audio/wav'
+            );
           } else {
             void handleSpeakText(data.report.spokenSummary);
           }
@@ -4190,6 +4368,7 @@ function JarvisArcWorkspace() {
           ok?: boolean;
           visual?: GeneratedVisual;
           audioBase64?: string | null;
+          audioMimeType?: string | null;
           error?: string;
         }>(res);
         if (!res.ok || !data?.visual) {
@@ -4210,7 +4389,10 @@ function JarvisArcWorkspace() {
         if (data.visual.summary) {
           showTransientCaption(assistantNameRef.current, data.visual.summary, 6500);
           if (data.audioBase64) {
-            void playerRef.current.playWavBase64(data.audioBase64);
+            void playerRef.current.playAudioBase64(
+              data.audioBase64,
+              data.audioMimeType || 'audio/wav'
+            );
           } else {
             void handleSpeakText(data.visual.summary);
           }
@@ -4682,10 +4864,29 @@ function JarvisArcWorkspace() {
         }}
         onToggleMute={() => {
           const next = !isMicMutedRef.current;
+          if (speechUnmuteTimerRef.current) {
+            window.clearTimeout(speechUnmuteTimerRef.current);
+            speechUnmuteTimerRef.current = null;
+          }
+          autoMutedForSpeechRef.current = false;
+          manualMicMutedRef.current = next;
           isMicMutedRef.current = next;
           setIsMicMuted(next);
+          micStreamRef.current?.getAudioTracks().forEach((t) => {
+            t.enabled = !next || clapWakeEnabledRef.current;
+          });
+          if (!next && browserVoiceActiveRef.current && speechRecognitionRef.current) {
+            try {
+              speechRecognitionRef.current.start();
+            } catch {
+              // ignore
+            }
+          }
         }}
-        onInterruptSpeech={() => playerRef.current.clear()}
+        onInterruptSpeech={() => {
+          playerRef.current.clear();
+          stopBrowserSpeech();
+        }}
         onVoiceChange={(next) => void handleVoiceChange(next)}
         onChangeVisionMode={handleChangeVisionMode}
         onToggleDeepThinking={setDeepThinking}
@@ -5149,10 +5350,29 @@ function JarvisArcWorkspace() {
         }}
         onToggleMute={() => {
           const next = !isMicMutedRef.current;
+          if (speechUnmuteTimerRef.current) {
+            window.clearTimeout(speechUnmuteTimerRef.current);
+            speechUnmuteTimerRef.current = null;
+          }
+          autoMutedForSpeechRef.current = false;
+          manualMicMutedRef.current = next;
           isMicMutedRef.current = next;
           setIsMicMuted(next);
+          micStreamRef.current?.getAudioTracks().forEach((t) => {
+            t.enabled = !next || clapWakeEnabledRef.current;
+          });
+          if (!next && browserVoiceActiveRef.current && speechRecognitionRef.current) {
+            try {
+              speechRecognitionRef.current.start();
+            } catch {
+              // ignore
+            }
+          }
         }}
-        onInterruptSpeech={() => playerRef.current.clear()}
+        onInterruptSpeech={() => {
+          playerRef.current.clear();
+          stopBrowserSpeech();
+        }}
         onVoiceChange={(next) => void handleVoiceChange(next)}
         onWakeModeChange={(mode) => void handleWakeModeChange(mode)}
         onToggleClapWake={(enabled) => void handleToggleClapWake(enabled)}
@@ -5288,7 +5508,10 @@ function JarvisArcWorkspace() {
               window.setTimeout(() => {
                 showTransientCaption(assistantName, freshBrief.headline, 6000);
                 if (briefConfig?.speakOnUnlock && freshBrief.audioBase64) {
-                  void playerRef.current.playWavBase64(freshBrief.audioBase64 as string);
+                  void playerRef.current.playAudioBase64(
+                    freshBrief.audioBase64 as string,
+                    'audio/wav'
+                  );
                 }
               }, 1200);
               markBriefSeen(freshBrief.date);

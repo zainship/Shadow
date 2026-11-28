@@ -35,6 +35,7 @@ export function redactSecrets(input: string): string {
   return String(input || '')
     .replace(/AIza[0-9A-Za-z_\-]{16,}/g, 'AIza[REDACTED]')
     .replace(/sk-(?:or-v1-)?[0-9A-Za-z_\-]{12,}/g, 'sk-[REDACTED]')
+    .replace(/sk_[0-9A-Za-z_\-]{16,}/g, 'sk_[REDACTED]')
     .replace(/ya29\.[0-9A-Za-z_.\-]{16,}/g, 'ya29.[REDACTED]')
     .replace(/Bearer\s+[0-9A-Za-z_.\-~+/=]{12,}/gi, 'Bearer [REDACTED]')
     .replace(/xox[baprs]-[0-9A-Za-z\-]{10,}/gi, 'xox-[REDACTED]')
