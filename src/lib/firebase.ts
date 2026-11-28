@@ -2,6 +2,7 @@ import { initializeApp } from 'firebase/app';
 import { GoogleAuthProvider, getAuth, signInWithPopup } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import { extractErrorRawDetail, reportShadowError } from './errorStore';
 
 export const WORKSPACE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
@@ -125,6 +126,17 @@ export function handleFirestoreError(
     path,
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
+  const { rawDetail, stack } = extractErrorRawDetail(error);
+  reportShadowError({
+    source: 'Firestore',
+    title: `Firestore ${operationType} failed (${path ?? 'collection'})`,
+    message: errInfo.error,
+    rawDetail: [rawDetail, JSON.stringify({ operationType, path, authInfo: errInfo.authInfo }, null, 2)]
+      .filter(Boolean)
+      .join('\n\n'),
+    endpoint: path ?? undefined,
+    stack,
+  });
   throw new Error(JSON.stringify(errInfo));
 }
 

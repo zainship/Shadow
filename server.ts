@@ -10,6 +10,7 @@ import { Modality, ThinkingLevel } from '@google/genai';
 import type { LiveServerMessage } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
+  extractRawErrorDetail,
   getGeminiClient,
   getGeminiLiveClient,
   getModelConfig,
@@ -18,7 +19,9 @@ import {
   preferDeepCommandDefault,
   resolveLiveThinkingLevel,
   resolveServerGeminiKey,
+  sanitizeErrorSecrets,
   withGeminiRetry,
+  type DetailedErrorPayload,
 } from './server/gemini.ts';
 import {
   DEFAULT_OPENROUTER_MODEL,
@@ -118,6 +121,64 @@ const PORT = Number(process.env.PORT || 3000) || 3000;
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '12mb' }));
+
+  const buildErrorDetail = (
+    status: number,
+    source: string,
+    errOrMessage: unknown,
+    fallback: string,
+    endpoint?: string
+  ): DetailedErrorPayload => {
+    const extracted = extractRawErrorDetail(errOrMessage);
+    const rawMsg = sanitizeErrorSecrets(extracted.rawMessage || fallback);
+    return {
+      source,
+      status,
+      summary: rawMsg.slice(0, 500) || fallback,
+      rawMessage: rawMsg.slice(0, 2000),
+      code: extracted.code,
+      cause: extracted.cause,
+      stack: extracted.stack,
+      ...(endpoint ? { endpoint: sanitizeErrorSecrets(endpoint) } : {}),
+      timestamp: Date.now(),
+    };
+  };
+
+  const sendError = (
+    res: express.Response,
+    status: number,
+    source: string,
+    errOrMessage: unknown,
+    fallback: string,
+    endpoint?: string,
+    extra?: Record<string, unknown>
+  ) => {
+    const detail = buildErrorDetail(status, source, errOrMessage, fallback, endpoint);
+    return res.status(status).json({
+      ok: false,
+      ...(extra ?? {}),
+      error: detail.summary,
+      errorDetail: detail,
+    });
+  };
+
+  const sendGeminiError = (
+    res: express.Response,
+    err: unknown,
+    fallback: string,
+    source: string,
+    endpoint?: string
+  ) => {
+    const { status, message, detail } = parseGeminiHttpError(err, fallback, source);
+    return res.status(status).json({
+      ok: false,
+      error: message,
+      errorDetail: {
+        ...detail,
+        ...(endpoint ? { endpoint: sanitizeErrorSecrets(endpoint) } : {}),
+      },
+    });
+  };
 
   // Allow packaged Tauri shell, local dev servers, Firebase Hosting PWA domains,
   // and any explicit CORS_ALLOWED_ORIGINS entries to reach this server.
@@ -245,10 +306,14 @@ async function startServer() {
     try {
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
       if (!runtime) {
-        return res.status(400).json({
-          ok: false,
-          error: 'No API key provided. Enter an OpenRouter or Gemini key in Settings/Setup.',
-        });
+        return sendError(
+          res,
+          400,
+          'AI Configuration',
+          'No API key provided. Enter an OpenRouter or Gemini key in Settings/Setup.',
+          'No API key provided',
+          req.originalUrl
+        );
       }
       if (runtime.provider === 'openrouter') {
         const turn = await openRouterGenerate({
@@ -296,13 +361,12 @@ async function startServer() {
         reply: (response.text || 'OK').trim().slice(0, 60),
       });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'API key verification failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'API key verification failed', 'AI Key Verification', req.originalUrl);
     }
   });
 
   // Downloadable / copyable standalone Shadow Laptop Agent & background service installers
-  app.get('/api/desktop/scripts', (_req, res) => {
+  app.get('/api/desktop/scripts', (req, res) => {
     try {
       const scriptsDir = path.resolve(__dirname, 'scripts');
       const agent = fs.readFileSync(path.join(scriptsDir, 'shadow-laptop-agent.mjs'), 'utf8');
@@ -317,10 +381,7 @@ async function startServer() {
         },
       });
     } catch (err) {
-      return res.status(500).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Unable to load agent scripts',
-      });
+      return sendError(res, 500, 'Desktop Scripts', err, 'Unable to load agent scripts', req.originalUrl);
     }
   });
 
@@ -329,7 +390,7 @@ async function startServer() {
     try {
       const q = String(req.query.q || '').trim();
       if (!q) {
-        return res.status(400).json({ error: 'Missing query parameter q' });
+        return sendError(res, 400, 'YouTube Search', 'Missing query parameter q', 'Missing query parameter q', req.originalUrl);
       }
       const ytRuntime = resolveAiRuntime({ headers: req.headers });
       const results = await searchYouTube(
@@ -340,8 +401,7 @@ async function startServer() {
       );
       return res.json({ query: q, results });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'YouTube search failed';
-      return res.status(500).json({ error: msg });
+      return sendGeminiError(res, err, 'YouTube search failed', 'YouTube Search', req.originalUrl);
     }
   });
 
@@ -350,13 +410,12 @@ async function startServer() {
     try {
       const url = String(req.body?.url || '').trim();
       if (!url) {
-        return res.status(400).json({ error: 'Missing url' });
+        return sendError(res, 400, 'Web Inspector', 'Missing url', 'Missing url', req.originalUrl);
       }
       const inspection = await inspectWebPage(url);
       return res.json(inspection);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Page inspection failed';
-      return res.status(500).json({ error: msg });
+      return sendError(res, 500, 'Web Inspector', err, 'Page inspection failed', req.originalUrl);
     }
   });
 
@@ -371,13 +430,18 @@ async function startServer() {
           ? req.body.engine
           : 'auto';
       if (!targetUrl && steps.length === 0) {
-        return res.status(400).json({ ok: false, error: 'Missing targetUrl or steps' });
+        return sendError(res, 400, 'Browser Automation', 'Missing targetUrl or steps', 'Missing targetUrl or steps', req.originalUrl);
       }
       const execution = await executeBrowserPlan({ goal, targetUrl, steps, engine });
+      if (!execution.ok && execution.error) {
+        return res.json({
+          ...execution,
+          errorDetail: buildErrorDetail(400, 'Browser Automation', execution.error, execution.error, req.originalUrl),
+        });
+      }
       return res.json(execution);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Browser automation failed';
-      return res.status(500).json({ ok: false, error: msg });
+      return sendError(res, 500, 'Browser Automation', err, 'Browser automation failed', req.originalUrl);
     }
   });
 
@@ -389,14 +453,19 @@ async function startServer() {
       const maxSteps = Number(req.body?.maxSteps || 4);
       const preferDeep = req.body?.preferDeep === true || req.body?.deepThinking === true;
       if (!goal || !startUrl) {
-        return res.status(400).json({ ok: false, error: 'Missing goal or startUrl' });
+        return sendError(res, 400, 'Autonomous Web Agent', 'Missing goal or startUrl', 'Missing goal or startUrl', req.originalUrl);
       }
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
       const result = await runAutonomousWebAgent({ goal, startUrl, maxSteps, preferDeep, runtime });
+      if (!result.ok && result.error) {
+        return res.json({
+          ...result,
+          errorDetail: buildErrorDetail(400, 'Autonomous Web Agent', result.error, result.error, req.originalUrl),
+        });
+      }
       return res.json(result);
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'Autonomous web agent failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'Autonomous web agent failed', 'Autonomous Web Agent', req.originalUrl);
     }
   });
 
@@ -405,7 +474,7 @@ async function startServer() {
     try {
       const text = String(req.body?.text || '').trim();
       const voiceName = String(req.body?.voiceName || 'Charon');
-      if (!text) return res.status(400).json({ error: 'Missing text' });
+      if (!text) return sendError(res, 400, 'Speech Synthesis', 'Missing text', 'Missing text', req.originalUrl);
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
       const geminiTtsKey = resolveCompanionGeminiKey({ headers: req.headers, body: req.body, runtime });
       if (!geminiTtsKey && !resolveServerGeminiKey()) {
@@ -417,8 +486,7 @@ async function startServer() {
         mimeType: audioBase64 ? 'audio/wav' : null,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'TTS failed';
-      return res.status(500).json({ error: msg });
+      return sendGeminiError(res, err, 'TTS failed', 'Speech Synthesis', req.originalUrl);
     }
   });
 
@@ -434,7 +502,7 @@ async function startServer() {
       const speak = req.body?.speak === true;
 
       if (!query) {
-        return res.status(400).json({ error: 'Missing research query' });
+        return sendError(res, 400, 'Deep Research', 'Missing research query', 'Missing research query', req.originalUrl);
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
@@ -450,8 +518,7 @@ async function startServer() {
       });
     } catch (err) {
       console.error('Research error:', err);
-      const { status, message } = parseGeminiHttpError(err, 'Research failed');
-      return res.status(status).json({ error: message });
+      return sendGeminiError(res, err, 'Research failed', 'Deep Research', req.originalUrl);
     }
   });
 
@@ -465,7 +532,7 @@ async function startServer() {
       const config = saveBriefConfig(req.body ?? {});
       return res.json({ config });
     } catch (err) {
-      return res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid brief config' });
+      return sendError(res, 400, 'Morning Brief', err, 'Invalid brief config', req.originalUrl);
     }
   });
 
@@ -495,8 +562,7 @@ async function startServer() {
       return res.json({ brief });
     } catch (err) {
       console.error('Morning brief error:', err);
-      const { status, message } = parseGeminiHttpError(err, 'Morning Brief failed');
-      return res.status(status).json({ error: message });
+      return sendGeminiError(res, err, 'Morning Brief failed', 'Morning Brief', req.originalUrl);
     }
   });
 
@@ -512,7 +578,7 @@ async function startServer() {
       const speak = req.body?.speak === true;
 
       if (!prompt) {
-        return res.status(400).json({ error: 'Missing visual prompt' });
+        return sendError(res, 400, 'Visual Studio', 'Missing visual prompt', 'Missing visual prompt', req.originalUrl);
       }
 
       const runtime = resolveAiRuntime({ headers: req.headers, body: req.body });
@@ -544,8 +610,7 @@ async function startServer() {
       });
     } catch (err) {
       console.error('Visual generation error:', err);
-      const { status, message } = parseGeminiHttpError(err, 'Visual generation failed');
-      return res.status(status).json({ error: message });
+      return sendGeminiError(res, err, 'Visual generation failed', 'Visual Studio', req.originalUrl);
     }
   });
 
@@ -557,14 +622,11 @@ async function startServer() {
   app.post('/api/plugins/fetch-manifest', async (req, res) => {
     try {
       const url = String(req.body?.url || '').trim();
-      if (!url) return res.status(400).json({ ok: false, error: 'Missing manifest URL' });
+      if (!url) return sendError(res, 400, 'Plugins', 'Missing manifest URL', 'Missing manifest URL', req.originalUrl);
       const plugin = await fetchPluginManifestFromUrl(url);
       return res.json({ ok: true, plugin });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Unable to load plugin manifest',
-      });
+      return sendError(res, 400, 'Plugins', err, 'Unable to load plugin manifest', req.originalUrl);
     }
   });
 
@@ -572,7 +634,7 @@ async function startServer() {
     try {
       const normalized = normalizePluginDescriptors([req.body?.plugin], 1);
       if (normalized.length === 0) {
-        return res.status(400).json({ ok: false, error: 'Invalid plugin configuration.' });
+        return sendError(res, 400, 'Plugins', 'Invalid plugin configuration.', 'Invalid plugin configuration.', req.originalUrl);
       }
       const plugin = normalized[0];
       const args =
@@ -597,10 +659,7 @@ async function startServer() {
       const execution = await executeHttpPlugin(plugin, args);
       return res.json(execution);
     } catch (err) {
-      return res.status(500).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Plugin execution failed',
-      });
+      return sendError(res, 500, 'Plugins', err, 'Plugin execution failed', req.originalUrl);
     }
   });
 
@@ -608,18 +667,19 @@ async function startServer() {
   // Feature 1: Google Workspace Integration (Gmail, Calendar, Drive)
   // Token comes strictly from Authorization: Bearer <token> held in client memory.
   // ---------------------------------------------------------------------------
-  const sendWorkspaceErr = (res: express.Response, err: unknown) => {
+  const sendWorkspaceErr = (res: express.Response, err: unknown, endpoint?: string) => {
     if (err instanceof WorkspaceApiError) {
-      return res.status(err.status).json({
-        ok: false,
-        needsReauth: err.needsReauth,
-        error: err.message,
-      });
+      return sendError(
+        res,
+        err.status,
+        'Google Workspace',
+        err,
+        err.message,
+        endpoint,
+        { needsReauth: err.needsReauth }
+      );
     }
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'Google Workspace error',
-    });
+    return sendError(res, 500, 'Google Workspace', err, 'Google Workspace error', endpoint);
   };
 
   app.get('/api/workspace/gmail/messages', async (req, res) => {
@@ -631,7 +691,7 @@ async function startServer() {
       const messages = await listGmailMessages(token, { query: queryText, unreadOnly, maxResults });
       return res.json({ ok: true, messages });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -641,7 +701,7 @@ async function startServer() {
       const message = await getGmailMessageDetail(token, String(req.params.id || ''));
       return res.json({ ok: true, message });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -656,7 +716,7 @@ async function startServer() {
       });
       return res.json({ ok: true, ...summary });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -671,7 +731,7 @@ async function startServer() {
       });
       return res.json({ ok: true, draft });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -686,7 +746,7 @@ async function startServer() {
       });
       return res.json({ ok: true, sent });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -700,7 +760,7 @@ async function startServer() {
       });
       return res.json({ ok: true, events });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -717,7 +777,7 @@ async function startServer() {
       });
       return res.json({ ok: true, event });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -727,7 +787,7 @@ async function startServer() {
       await deleteCalendarEvent(token, String(req.params.id || ''));
       return res.json({ ok: true, deletedId: String(req.params.id || '') });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -740,7 +800,7 @@ async function startServer() {
       });
       return res.json({ ok: true, files });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -751,7 +811,7 @@ async function startServer() {
       const data = await readDriveFileContent(token, String(req.params.id || ''), runtime);
       return res.json({ ok: true, ...data });
     } catch (err) {
-      return sendWorkspaceErr(res, err);
+      return sendWorkspaceErr(res, err, req.originalUrl);
     }
   });
 
@@ -769,8 +829,7 @@ async function startServer() {
       });
       return res.json({ ok: true, ...result });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'Audio transcription failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'Audio transcription failed', 'Meeting Companion', req.originalUrl);
     }
   });
 
@@ -785,8 +844,7 @@ async function startServer() {
       });
       return res.json({ ok: true, summary: result });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'Meeting summarization failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'Meeting summarization failed', 'Meeting Companion', req.originalUrl);
     }
   });
 
@@ -801,8 +859,7 @@ async function startServer() {
       });
       return res.json({ ok: true, ...result });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'Meeting Q&A failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'Meeting Q&A failed', 'Meeting Companion', req.originalUrl);
     }
   });
 
@@ -830,10 +887,7 @@ async function startServer() {
       });
       return res.json({ ok: true, ...result });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Vault document ingestion failed',
-      });
+      return sendError(res, 400, 'Knowledge Vault', err, 'Vault document ingestion failed', req.originalUrl);
     }
   });
 
@@ -841,7 +895,7 @@ async function startServer() {
     const ownerKey = String(req.query.ownerKey || req.body?.ownerKey || 'local');
     const deleted = deleteVaultDocument(String(req.params.id || ''), ownerKey);
     if (!deleted) {
-      return res.status(404).json({ ok: false, error: 'Document not found' });
+      return sendError(res, 404, 'Knowledge Vault', 'Document not found', 'Document not found', req.originalUrl);
     }
     return res.json({ ok: true, deletedId: String(req.params.id || '') });
   });
@@ -857,10 +911,7 @@ async function startServer() {
       });
       return res.json({ ok: true, hits });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Vault search failed',
-      });
+      return sendError(res, 400, 'Knowledge Vault', err, 'Vault search failed', req.originalUrl);
     }
   });
 
@@ -875,8 +926,7 @@ async function startServer() {
       });
       return res.json({ ok: true, ...result });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'Vault Q&A failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'Vault Q&A failed', 'Knowledge Vault', req.originalUrl);
     }
   });
 
@@ -888,15 +938,12 @@ async function startServer() {
       const repo = String(req.query.repo || '').trim();
       const ghToken = String(req.headers['x-github-token'] || '').trim() || undefined;
       if (!repo) {
-        return res.status(400).json({ ok: false, error: 'Missing repo query parameter (owner/repo).' });
+        return sendError(res, 400, 'GitHub & DevOps', 'Missing repo query parameter (owner/repo).', 'Missing repo query parameter', req.originalUrl);
       }
       const overview = await fetchGithubRepoOverview(repo, ghToken);
       return res.json({ ok: true, overview });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'GitHub lookup failed',
-      });
+      return sendError(res, 400, 'GitHub & DevOps', err, 'GitHub lookup failed', req.originalUrl);
     }
   });
 
@@ -914,8 +961,7 @@ async function startServer() {
       });
       return res.json({ ok: true, overview, analysis });
     } catch (err) {
-      const { status, message } = parseGeminiHttpError(err, 'DevOps analysis failed');
-      return res.status(status).json({ ok: false, error: message });
+      return sendGeminiError(res, err, 'DevOps analysis failed', 'GitHub & DevOps', req.originalUrl);
     }
   });
 
@@ -940,10 +986,7 @@ async function startServer() {
       });
       return res.json({ ok: true, status });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Invalid bridge configuration',
-      });
+      return sendError(res, 400, 'Messaging Bridges', err, 'Invalid bridge configuration', req.originalUrl);
     }
   });
 
@@ -952,7 +995,7 @@ async function startServer() {
       const ch = String(req.body?.channel || 'all') as BridgeChannel | 'all';
       const valid = ch === 'telegram' || ch === 'discord' || ch === 'slack' || ch === 'all';
       if (!valid) {
-        return res.status(400).json({ ok: false, error: 'Channel must be telegram, discord, slack, or all.' });
+        return sendError(res, 400, 'Messaging Bridges', 'Channel must be telegram, discord, slack, or all.', 'Invalid bridge channel', req.originalUrl);
       }
       const outcome = await dispatchBridgeMessage({
         channel: ch,
@@ -961,10 +1004,7 @@ async function startServer() {
       });
       return res.json({ ok: outcome.ok, results: outcome.results, deliveries: getBridgeDeliveryHistory() });
     } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Bridge send failed',
-      });
+      return sendError(res, 400, 'Messaging Bridges', err, 'Bridge send failed', req.originalUrl);
     }
   });
 
@@ -973,7 +1013,7 @@ async function startServer() {
       const expectedSecret = (process.env.WEBHOOK_SIGNING_SECRET || '').trim();
       const gotSecret = String(req.headers['x-telegram-bot-api-secret-token'] || '');
       if (expectedSecret && !timingSafeEqualStr(gotSecret, expectedSecret)) {
-        return res.status(401).json({ ok: false, error: 'Unauthorized Telegram webhook secret.' });
+        return sendError(res, 401, 'Telegram Webhook', 'Unauthorized Telegram webhook secret.', 'Unauthorized Telegram webhook secret.', req.originalUrl);
       }
       const msg = req.body?.message || req.body?.edited_message;
       const chatId = msg?.chat?.id;
@@ -993,7 +1033,7 @@ async function startServer() {
       }
       return res.json({ ok: true });
     } catch (err) {
-      return res.status(500).json({ ok: false, error: err instanceof Error ? err.message : 'Telegram hook failed' });
+      return sendError(res, 500, 'Telegram Webhook', err, 'Telegram hook failed', req.originalUrl);
     }
   });
 
@@ -1013,19 +1053,19 @@ async function startServer() {
       });
       return res.json({ ok: true, job });
     } catch (err) {
-      return res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Invalid job' });
+      return sendError(res, 400, 'Proactive Scheduler', err, 'Invalid job', req.originalUrl);
     }
   });
 
   app.patch('/api/scheduler/jobs/:id', (req, res) => {
     const updated = toggleScheduledJob(String(req.params.id || ''), Boolean(req.body?.enabled));
-    if (!updated) return res.status(404).json({ ok: false, error: 'Job not found' });
+    if (!updated) return sendError(res, 404, 'Proactive Scheduler', 'Job not found', 'Job not found', req.originalUrl);
     return res.json({ ok: true, job: updated });
   });
 
   app.delete('/api/scheduler/jobs/:id', (req, res) => {
     const ok = deleteScheduledJob(String(req.params.id || ''));
-    if (!ok) return res.status(404).json({ ok: false, error: 'Job not found' });
+    if (!ok) return sendError(res, 404, 'Proactive Scheduler', 'Job not found', 'Job not found', req.originalUrl);
     return res.json({ ok: true });
   });
 
@@ -1034,7 +1074,7 @@ async function startServer() {
       const log = await runScheduledJobNow(String(req.params.id || ''));
       return res.json({ ok: true, log });
     } catch (err) {
-      return res.status(404).json({ ok: false, error: err instanceof Error ? err.message : 'Job failed' });
+      return sendError(res, 404, 'Proactive Scheduler', err, 'Job failed', req.originalUrl);
     }
   });
 
@@ -1048,7 +1088,7 @@ async function startServer() {
 
   app.delete('/api/scheduler/webhooks/:id', (req, res) => {
     const ok = deleteInboundWebhook(String(req.params.id || ''));
-    if (!ok) return res.status(404).json({ ok: false, error: 'Webhook not found' });
+    if (!ok) return sendError(res, 404, 'Proactive Scheduler', 'Webhook not found', 'Webhook not found', req.originalUrl);
     return res.json({ ok: true });
   });
 
@@ -1071,7 +1111,7 @@ async function startServer() {
         : msg.toLowerCase().includes('not found')
           ? 404
           : 400;
-      return res.status(status).json({ ok: false, error: msg });
+      return sendError(res, status, 'Inbound Webhook', err, 'Webhook failed', req.originalUrl);
     }
   });
 
@@ -1325,7 +1365,7 @@ async function startServer() {
         ? (req.body.attachments as Array<{ name?: string; mimeType?: string; dataBase64?: string }>)
         : [];
       if (!command && rawAttachments.length === 0) {
-        return res.status(400).json({ error: 'Missing command' });
+        return sendError(res, 400, 'Assistant Command', 'Missing command', 'Missing command', req.originalUrl);
       }
       const effectiveCommand = command || 'Analyze the attached image and summarize what you see.';
 
@@ -1767,9 +1807,29 @@ async function startServer() {
       });
     } catch (err) {
       console.error('Assistant command error:', err);
-      const { status, message } = parseGeminiHttpError(err, 'Assistant command failed');
-      return res.status(status).json({ error: message });
+      return sendGeminiError(res, err, 'Assistant command failed', 'Assistant Command', req.originalUrl);
     }
+  });
+
+  // Unmatched /api/* handler & Express global error middleware returning detailed JSON
+  app.use('/api', (req, res) => {
+    return sendError(
+      res,
+      404,
+      'Server API',
+      `API route not found: ${req.method} ${req.originalUrl}`,
+      'API route not found',
+      req.originalUrl
+    );
+  });
+
+  app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status =
+      typeof err === 'object' && err && 'status' in err && typeof (err as { status?: unknown }).status === 'number'
+        ? (err as { status: number }).status
+        : 500;
+    console.error('Unhandled Express error:', err);
+    return sendError(res, status, 'Server API', err, 'Unhandled server request error', req.originalUrl);
   });
 
   const server = http.createServer(app);
@@ -1916,10 +1976,12 @@ async function startServer() {
         (auth?.geminiKey || '').trim() ||
         ((auth?.provider || '').toLowerCase() !== 'openrouter' ? (auth?.apiKey || '').trim() : '');
       if ((auth?.provider || '').toLowerCase() === 'openrouter' && !liveGeminiKey && !resolveServerGeminiKey()) {
+        const msg =
+          'Live voice audio requires a Gemini API key (OpenRouter powers text commands, research, and visuals). Add a Gemini key in AI Settings to use Live Voice alongside OpenRouter.';
         safeSend({
           type: 'error',
-          message:
-            "Live voice audio requires a Gemini API key (OpenRouter powers text commands, research, and visuals). Add a Gemini key in AI Settings to use Live Voice alongside OpenRouter.",
+          message: msg,
+          detail: buildErrorDetail(400, 'Gemini Live WS', msg, msg, '/ws/live'),
         });
         clientWs.close();
         return;
@@ -2185,9 +2247,11 @@ async function startServer() {
                     }
                   }
                 } catch (toolErr) {
+                  const detail = buildErrorDetail(500, 'Live Tool Execution', toolErr, 'Tool execution failed', `/ws/live:${call.name || 'tool'}`);
                   result = {
                     ok: false,
-                    error: toolErr instanceof Error ? toolErr.message : 'Tool execution failed',
+                    error: detail.summary,
+                    errorDetail: detail,
                   };
                 }
 
@@ -2212,19 +2276,35 @@ async function startServer() {
           onerror: (err: unknown) => {
             console.error('Gemini Live session error:', err);
             reportedLiveError = true;
+            const detail = buildErrorDetail(
+              500,
+              'Gemini Live WS',
+              err,
+              'Gemini Live session error',
+              '/ws/live'
+            );
             safeSend({
               type: 'error',
-              message: err instanceof Error ? err.message : 'Gemini Live session error',
+              message: detail.summary,
+              detail,
             });
           },
           onclose: (ev?: { code?: number; reason?: string }) => {
             if (!isClosed && !reportedLiveError && ev && ((ev.code && ev.code !== 1000 && ev.code !== 1005) || ev.reason)) {
               reportedLiveError = true;
+              const msg = ev.reason
+                ? `Voice session closed (code ${ev.code || 'ws'}): ${ev.reason}`
+                : `Voice session closed unexpectedly (code ${ev.code}).`;
               safeSend({
                 type: 'error',
-                message: ev.reason
-                  ? `Voice session closed (${ev.code || 'ws'}): ${ev.reason}`
-                  : `Voice session closed unexpectedly (code ${ev.code}).`,
+                message: msg,
+                detail: buildErrorDetail(
+                  ev.code || 1006,
+                  'Gemini Live WS',
+                  { code: ev.code, reason: ev.reason, message: msg },
+                  msg,
+                  '/ws/live'
+                ),
               });
             }
             safeSend({ type: 'closed' });
@@ -2234,9 +2314,19 @@ async function startServer() {
     } catch (err) {
       console.error('Failed to open Gemini Live session:', err);
       if (!isClosed) {
+        const { status, message, detail } = parseGeminiHttpError(
+          err,
+          'Could not start Gemini Live voice session.',
+          'Gemini Live WS'
+        );
         safeSend({
           type: 'error',
-          message: err instanceof Error ? err.message : 'Could not start Gemini Live voice session.',
+          message,
+          detail: {
+            ...detail,
+            status,
+            endpoint: '/ws/live',
+          },
         });
       }
       clientWs.close();
@@ -2278,6 +2368,8 @@ async function startServer() {
         }
       } catch (err) {
         console.warn('Invalid WS message from client:', err);
+        const detail = buildErrorDetail(400, 'Gemini Live WS Client', err, 'Invalid WS message from client', '/ws/live');
+        safeSend({ type: 'error', message: detail.summary, detail });
       }
     };
 

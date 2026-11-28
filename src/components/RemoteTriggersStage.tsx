@@ -13,6 +13,7 @@ import {
   Webhook,
 } from 'lucide-react';
 import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
+import { reportExceptionError } from '../lib/errorStore';
 import {
   MAC_GLASS_BTN_PRIMARY,
   MAC_GLASS_BTN_SECONDARY,
@@ -339,8 +340,10 @@ export const RemoteTriggersStage: React.FC = () => {
           playwrightAvailable: data.playwrightRuntime?.available,
         });
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to reach /api/health';
+      setErrorMsg(msg);
+      reportExceptionError('Server Health Check', err, msg, { endpoint: '/api/health' });
     }
   };
 
@@ -376,11 +379,13 @@ export const RemoteTriggersStage: React.FC = () => {
 
       {(errorMsg || statusMsg) && (
         <div
-          className={`px-5 py-2 text-xs border-b border-white/10 flex items-center justify-between gap-2 ${
+          className={`px-5 py-2.5 text-xs border-b border-white/10 flex items-start justify-between gap-3 ${
             errorMsg ? 'bg-rose-500/12 text-rose-200' : 'bg-emerald-500/12 text-emerald-200'
           }`}
         >
-          <span className="truncate">{errorMsg || statusMsg}</span>
+          <span className="whitespace-pre-wrap break-words leading-relaxed min-w-0">
+            {errorMsg || statusMsg}
+          </span>
           <button
             type="button"
             onClick={() => {

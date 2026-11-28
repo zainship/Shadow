@@ -16,6 +16,7 @@ import {
 import type { AiSettings } from '../lib/aiSettings';
 import { aiRequestHeaders } from '../lib/aiSettings';
 import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
+import { reportExceptionError } from '../lib/errorStore';
 import { executeLaptopTool, getSavedAgentToken } from '../lib/tauriBridge';
 import type { VaultDocumentMeta } from '../types/assistant';
 import {
@@ -310,7 +311,9 @@ export const KnowledgeVaultStage: React.FC<KnowledgeVaultStageProps> = ({
       setStatusMsg(`Indexed ${indexed} local files from ${cleanPath}.`);
       void loadVaultDocs();
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Folder ingest requires connected Laptop Agent.');
+      const msg = err instanceof Error ? err.message : 'Folder ingest requires connected Laptop Agent.';
+      setErrorMsg(msg);
+      reportExceptionError('Knowledge Vault Folder', err, msg);
     } finally {
       setVaultBusy(false);
     }
@@ -512,11 +515,13 @@ export const KnowledgeVaultStage: React.FC<KnowledgeVaultStageProps> = ({
 
       {(errorMsg || statusMsg) && (
         <div
-          className={`px-5 py-2 text-xs border-b border-white/10 flex items-center justify-between gap-2 ${
+          className={`px-5 py-2.5 text-xs border-b border-white/10 flex items-start justify-between gap-3 ${
             errorMsg ? 'bg-rose-500/12 text-rose-200' : 'bg-emerald-500/12 text-emerald-200'
           }`}
         >
-          <span className="truncate">{errorMsg || statusMsg}</span>
+          <span className="whitespace-pre-wrap break-words leading-relaxed min-w-0">
+            {errorMsg || statusMsg}
+          </span>
           <button
             type="button"
             onClick={() => {

@@ -2,7 +2,10 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';
 import { DesktopAuthBridge } from './components/DesktopAuthBridge.tsx';
+import { installGlobalErrorListeners } from './lib/errorStore.ts';
 import './index.css';
+
+installGlobalErrorListeners();
 
 const desktopAuthNonce =
   typeof window !== 'undefined'

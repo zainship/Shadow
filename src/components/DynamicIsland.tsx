@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
+  AlertTriangle,
   ArrowRight,
   AudioLines,
   Blocks,
@@ -12,6 +13,7 @@ import {
   ChevronUp,
   Clock,
   Compass,
+  Copy,
   Cpu,
   Eye,
   FileText,
@@ -43,6 +45,7 @@ import {
 import type { ReactorCommandCue, ReactorMode } from './ArcReactorScene';
 import type { DockDrawerTab } from './IosControlDock';
 import type { NetworkTelemetry } from '../hooks/useNetworkTelemetry';
+import type { ShadowErrorEntry } from '../lib/errorStore';
 import type {
   CommandAttachment,
   DialogueEntry,
@@ -101,6 +104,7 @@ interface DynamicIslandProps {
   voices: VoiceName[];
   reactorBrightness: number;
   errorMessage: string | null;
+  errors?: ShadowErrorEntry[];
   inputLevelRef: React.MutableRefObject<number>;
   outputLevelRef: React.MutableRefObject<number>;
   onToggleVoiceSession: () => void;
@@ -118,6 +122,7 @@ interface DynamicIslandProps {
   onRunCommand: (commandText: string, attachment?: CommandAttachment) => void;
   onOpenAiSettings: () => void;
   onOpenSetup: () => void;
+  onOpenErrorInspector?: () => void;
   onLockWithFace?: () => void;
   onDismissError: () => void;
 }
@@ -301,6 +306,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   voices,
   reactorBrightness,
   errorMessage,
+  errors = [],
   inputLevelRef,
   outputLevelRef,
   onToggleVoiceSession,
@@ -318,6 +324,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   onRunCommand,
   onOpenAiSettings,
   onOpenSetup,
+  onOpenErrorInspector,
   onLockWithFace,
   onDismissError,
 }) => {
@@ -327,6 +334,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
   const [clockNow, setClockNow] = useState<Date>(() => new Date());
   const [waveBars, setWaveBars] = useState<number[]>(() => Array(WAVE_COUNT).fill(0.22));
   const [thumbFailed, setThumbFailed] = useState(false);
+  const [copiedError, setCopiedError] = useState(false);
   const [quickCommand, setQuickCommand] = useState('');
   const [isDragHovering, setIsDragHovering] = useState(false);
   const [shelfItems, setShelfItems] = useState<ShelfItem[]>([]);
@@ -748,7 +756,7 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
               : expanded
                 ? 'w-[min(93vw,492px)] rounded-[30px] bg-[#030509]/80 border-white/[0.16] shadow-[0_34px_96px_rgba(0,0,0,0.88),inset_0_1px_0_rgba(255,255,255,0.18),inset_0_-1px_0_rgba(255,255,255,0.05)]'
                 : compactKind === 'error'
-                  ? 'max-w-[min(86vw,370px)] rounded-[22px] bg-[#120409]/82 border-rose-400/40 shadow-[0_18px_46px_rgba(0,0,0,0.82),inset_0_1px_0_rgba(255,255,255,0.15)]'
+                  ? 'max-w-[min(92vw,520px)] rounded-[22px] bg-[#120409]/86 border-rose-400/45 shadow-[0_18px_46px_rgba(0,0,0,0.82),inset_0_1px_0_rgba(255,255,255,0.15)]'
                   : 'max-w-[min(86vw,390px)] rounded-[22px] bg-[#020408]/76 border-white/[0.15] shadow-[0_18px_50px_rgba(0,0,0,0.82),inset_0_1px_0_rgba(255,255,255,0.16),inset_0_-1px_0_rgba(255,255,255,0.04)] hover:bg-[#05080F]/84 hover:border-white/[0.24]'
           }`}
         >
@@ -847,7 +855,13 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                     </span>
                   )}
 
-                  <span className="text-xs font-medium text-slate-100 truncate max-w-[175px] sm:max-w-[230px]">
+                  <span
+                    className={`text-xs font-medium text-slate-100 truncate ${
+                      compactKind === 'error'
+                        ? 'max-w-[200px] sm:max-w-[290px]'
+                        : 'max-w-[175px] sm:max-w-[230px]'
+                    }`}
+                  >
                     {compactKind === 'error'
                       ? errorMessage
                       : compactKind === 'activity'
@@ -908,17 +922,31 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   )}
 
                   {compactKind === 'error' ? (
-                    <button
-                      type="button"
-                      aria-label="Dismiss error"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDismissError();
-                      }}
-                      className="px-2 py-0.5 rounded-full bg-rose-500/22 hover:bg-rose-500/38 text-[11px] font-medium text-rose-200 transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      Clear
-                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        aria-label="View full error details"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (onOpenErrorInspector) onOpenErrorInspector();
+                          else setExpanded(true);
+                        }}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.12] hover:bg-white/[0.2] text-[11px] font-medium text-slate-100 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {errors.length > 1 ? `Details (${errors.length})` : 'Details'}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Dismiss error"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDismissError();
+                        }}
+                        className="px-2 py-0.5 rounded-full bg-rose-500/22 hover:bg-rose-500/38 text-[11px] font-medium text-rose-200 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        Clear
+                      </button>
+                    </div>
                   ) : compactKind === 'voice' || compactKind === 'media' ? (
                     <div className="flex items-center gap-0.5 h-4 px-0.5" aria-hidden="true">
                       {waveBars.slice(0, 5).map((lvl, idx) => (
@@ -1000,7 +1028,11 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                         )}
                       </div>
                       <p className="text-[11px] text-slate-400 truncate">
-                        {errorMessage || commandCue?.label || statusText}
+                        {errorMessage
+                          ? errors[0]?.source
+                            ? `${errors[0].source} error`
+                            : 'Error details below'
+                          : commandCue?.label || statusText}
                       </p>
                     </div>
                   </div>
@@ -1059,6 +1091,86 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                     </button>
                   </div>
                 </div>
+
+                {/* Untruncated Error Diagnostics Panel */}
+                {errorMessage && (
+                  <div className="p-3 rounded-2xl bg-rose-950/45 border border-rose-400/35 space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 space-y-0.5">
+                        {errors[0] && (
+                          <p className="text-[10px] font-mono tabular-nums text-rose-300/90 break-words">
+                            {errors[0].source}
+                            {errors[0].statusCode !== undefined ? ` · HTTP ${errors[0].statusCode}` : ''}
+                            {errors[0].endpoint ? ` · ${errors[0].endpoint}` : ''}
+                          </p>
+                        )}
+                        <p className="text-xs text-rose-100 leading-relaxed whitespace-pre-wrap break-words">
+                          {errorMessage}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={onDismissError}
+                        aria-label="Clear error"
+                        className="p-1 rounded-lg text-rose-300 hover:text-white hover:bg-rose-500/20 shrink-0 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    {(errors[0]?.rawDetail || errors[0]?.stack) && (
+                      <pre className="p-2 rounded-lg bg-black/55 border border-white/10 text-[10px] leading-relaxed font-mono text-slate-200 max-h-28 overflow-auto whitespace-pre-wrap break-words">
+                        {[errors[0].rawDetail, errors[0].stack].filter(Boolean).join('\n\n')}
+                      </pre>
+                    )}
+                    <div className="flex items-center justify-between gap-2 pt-0.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const latest = errors[0];
+                          const text = latest
+                            ? [
+                                `${latest.source}${latest.statusCode ? ` (HTTP ${latest.statusCode})` : ''}`,
+                                latest.endpoint ? `Endpoint: ${latest.endpoint}` : '',
+                                `Message: ${errorMessage}`,
+                                latest.rawDetail ? `Details:\n${latest.rawDetail}` : '',
+                                latest.stack ? `Stack:\n${latest.stack}` : '',
+                              ]
+                                .filter(Boolean)
+                                .join('\n')
+                            : errorMessage;
+                          void navigator.clipboard?.writeText(text).then(() => {
+                            setCopiedError(true);
+                            window.setTimeout(() => setCopiedError(false), 1800);
+                          });
+                        }}
+                        className="px-2 py-1 rounded-lg bg-white/[0.08] hover:bg-white/[0.15] text-[10px] font-medium text-slate-200 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                      >
+                        {copiedError ? (
+                          <Check className="w-3 h-3 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-3 h-3" />
+                        )}
+                        <span>{copiedError ? 'Copied' : 'Copy Details'}</span>
+                      </button>
+
+                      {onOpenErrorInspector && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExpanded(false);
+                            onOpenErrorInspector();
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-rose-500/22 hover:bg-rose-500/35 border border-rose-400/35 text-[10px] font-semibold text-rose-100 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                        >
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>
+                            {errors.length > 0 ? `All Errors (${errors.length})` : 'Open Inspector'}
+                          </span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* Mac Segmented Mode Switcher: Live Hub · Thread · Focus · Shelf */}
                 <div className="grid grid-cols-4 gap-1 p-1 rounded-2xl bg-black/45 border border-white/[0.09] shadow-[inset_0_1px_2px_rgba(0,0,0,0.6)]">
@@ -1865,6 +1977,19 @@ export const DynamicIsland: React.FC<DynamicIslandProps> = ({
                   </div>
 
                   <div className="flex items-center gap-1 shrink-0">
+                    {errors.length > 0 && onOpenErrorInspector && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setExpanded(false);
+                          onOpenErrorInspector();
+                        }}
+                        className="px-2 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 inline-flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <AlertTriangle className="w-3 h-3 text-rose-300" />
+                        <span className="tabular-nums">Errors ({errors.length})</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {

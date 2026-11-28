@@ -99,50 +99,126 @@ export function getGeminiLiveClient(apiKeyOverride?: string): GoogleGenAI {
   return cachedLiveClient;
 }
 
+export function sanitizeErrorSecrets(input: string): string {
+  return String(input || '')
+    .replace(/AIza[0-9A-Za-z_\-]{16,}/g, 'AIza[REDACTED]')
+    .replace(/sk-(?:or-v1-)?[0-9A-Za-z_\-]{12,}/g, 'sk-[REDACTED]')
+    .replace(/ya29\.[0-9A-Za-z_.\-]{16,}/g, 'ya29.[REDACTED]')
+    .replace(/Bearer\s+[0-9A-Za-z_.\-~+/=]{12,}/gi, 'Bearer [REDACTED]')
+    .replace(/xox[baprs]-[0-9A-Za-z\-]{10,}/gi, 'xox-[REDACTED]');
+}
+
+export interface DetailedErrorPayload {
+  source?: string;
+  status: number;
+  summary: string;
+  rawMessage: string;
+  code?: string;
+  cause?: string;
+  stack?: string;
+  endpoint?: string;
+  timestamp: number;
+}
+
+export function extractRawErrorDetail(err: unknown): {
+  rawMessage: string;
+  code?: string;
+  cause?: string;
+  stack?: string;
+} {
+  if (!err) return { rawMessage: 'Unknown error' };
+  if (typeof err === 'string') return { rawMessage: sanitizeErrorSecrets(err) };
+  if (err instanceof Error) {
+    const ext = err as Error & { code?: string | number; status?: number; cause?: unknown };
+    return {
+      rawMessage: sanitizeErrorSecrets(err.message || err.name || 'Error'),
+      code: ext.code !== undefined ? String(ext.code) : ext.status !== undefined ? String(ext.status) : undefined,
+      cause: ext.cause ? sanitizeErrorSecrets(ext.cause instanceof Error ? ext.cause.message : String(ext.cause)) : undefined,
+      stack: err.stack ? sanitizeErrorSecrets(err.stack.split('\n').slice(0, 8).join('\n')) : undefined,
+    };
+  }
+  if (typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+    const nestedErr = obj.error as Record<string, unknown> | string | undefined;
+    const msg =
+      (typeof obj.message === 'string' && obj.message) ||
+      (typeof nestedErr === 'string' && nestedErr) ||
+      (nestedErr && typeof nestedErr === 'object' && typeof nestedErr.message === 'string' && nestedErr.message) ||
+      (() => {
+        try {
+          return JSON.stringify(obj);
+        } catch {
+          return String(err);
+        }
+      })();
+    const code = obj.code ?? obj.status ?? (nestedErr && typeof nestedErr === 'object' ? nestedErr.code ?? nestedErr.status : undefined);
+    return {
+      rawMessage: sanitizeErrorSecrets(String(msg)),
+      code: code !== undefined ? String(code) : undefined,
+    };
+  }
+  return { rawMessage: sanitizeErrorSecrets(String(err)) };
+}
+
 export function isOverloadOrQuotaError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
+  const { rawMessage } = extractRawErrorDetail(err);
   return (
-    msg.includes('503') ||
-    msg.includes('429') ||
-    msg.includes('UNAVAILABLE') ||
-    msg.includes('RESOURCE_EXHAUSTED') ||
-    msg.includes('high demand') ||
-    msg.includes('quota')
+    rawMessage.includes('503') ||
+    rawMessage.includes('429') ||
+    rawMessage.includes('UNAVAILABLE') ||
+    rawMessage.includes('RESOURCE_EXHAUSTED') ||
+    rawMessage.includes('high demand') ||
+    rawMessage.includes('quota')
   );
 }
 
 export function parseGeminiHttpError(
   err: unknown,
-  fallback = 'Gemini request failed'
-): { status: number; message: string } {
-  const raw = err instanceof Error ? err.message : String(err || fallback);
+  fallback = 'Gemini request failed',
+  source = 'Gemini API'
+): { status: number; message: string; detail: DetailedErrorPayload } {
+  const extracted = extractRawErrorDetail(err);
+  const raw = extracted.rawMessage || fallback;
+  const makeDetail = (status: number, summary: string): DetailedErrorPayload => ({
+    source,
+    status,
+    summary,
+    rawMessage: raw.slice(0, 1800),
+    code: extracted.code,
+    cause: extracted.cause,
+    stack: extracted.stack,
+    timestamp: Date.now(),
+  });
+
   // OpenRouter errors are thrown as "OpenRouter <status>: <message>"
-  const openRouterMatch = raw.match(/^OpenRouter\s+(\d{3}):\s*([\s\S]{0,280})/);
+  const openRouterMatch = raw.match(/^OpenRouter\s+(\d{3}):\s*([\s\S]{0,600})/);
   if (openRouterMatch) {
-    return { status: Number(openRouterMatch[1]), message: `OpenRouter: ${openRouterMatch[2]}` };
+    const st = Number(openRouterMatch[1]);
+    const msg = `OpenRouter (${st}): ${openRouterMatch[2]}`;
+    return { status: st, message: msg, detail: { ...makeDetail(st, msg), source: 'OpenRouter API' } };
   }
   if (raw.includes('GEMINI_API_KEY is not configured')) {
-    return { status: 500, message: 'Server Gemini API key is not configured.' };
+    const msg = 'Server Gemini API key is not configured (GEMINI_API_KEY missing).';
+    return { status: 500, message: msg, detail: makeDetail(500, msg) };
   }
   if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED') || raw.includes('quota')) {
-    return {
-      status: 429,
-      message: 'Gemini API quota exceeded for the active key. Please retry shortly or update your plan/key in Settings > Secrets.',
-    };
+    const msg = `Gemini API quota exceeded (429): ${raw.slice(0, 320)}`;
+    return { status: 429, message: msg, detail: makeDetail(429, msg) };
   }
   if (raw.includes('403') || raw.includes('PERMISSION_DENIED')) {
-    return {
-      status: 403,
-      message: 'Gemini API permission denied for the active key. Please check Settings > Secrets.',
-    };
+    const msg = `Gemini API permission denied (403): ${raw.slice(0, 320)}`;
+    return { status: 403, message: msg, detail: makeDetail(403, msg) };
+  }
+  if (raw.includes('404') || raw.includes('NOT_FOUND')) {
+    const msg = `Gemini model/endpoint not found (404): ${raw.slice(0, 320)}`;
+    return { status: 404, message: msg, detail: makeDetail(404, msg) };
   }
   if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
-    return {
-      status: 503,
-      message: 'Gemini model is temporarily busy. Please try again in a moment.',
-    };
+    const msg = `Gemini upstream unavailable (503): ${raw.slice(0, 320)}`;
+    return { status: 503, message: msg, detail: makeDetail(503, msg) };
   }
-  return { status: 500, message: raw.slice(0, 280) || fallback };
+  const msg = raw.slice(0, 500) || fallback;
+  return { status: 500, message: msg, detail: makeDetail(500, msg) };
 }
 
 export async function withGeminiRetry<T>(

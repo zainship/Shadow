@@ -18,6 +18,7 @@ import {
 import type { AiSettings } from '../lib/aiSettings';
 import { aiRequestHeaders } from '../lib/aiSettings';
 import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
+import { reportExceptionError, reportShadowError } from '../lib/errorStore';
 import { getWorkspaceAccessToken } from '../lib/firebase';
 import type { PendingWorkspaceAction, ShadowTask, TaskPriority } from '../types/assistant';
 import {
@@ -172,7 +173,9 @@ export const WorkspaceStage: React.FC<WorkspaceStageProps> = ({
       await onConnectWorkspace();
       setStatusMessage('Google Workspace connected in memory for this session.');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Google Workspace connection failed.');
+      const msg = err instanceof Error ? err.message : 'Google Workspace connection failed.';
+      setErrorMsg(msg);
+      reportExceptionError('Google Workspace OAuth', err, msg);
     } finally {
       setConnecting(false);
     }
@@ -195,7 +198,9 @@ export const WorkspaceStage: React.FC<WorkspaceStageProps> = ({
       setTaskDueAt('');
       setTaskNotes('');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to create task.');
+      const msg = err instanceof Error ? err.message : 'Failed to create task.';
+      setErrorMsg(msg);
+      reportExceptionError('Workspace Tasks', err, msg);
     } finally {
       setTaskBusy(false);
     }
@@ -281,11 +286,13 @@ export const WorkspaceStage: React.FC<WorkspaceStageProps> = ({
         }),
       });
       const data = await parseJsonSafely<{ ok?: boolean; error?: string }>(res);
-      if (!res.ok || !data?.ok) throw new Error(data?.error || 'Could not save Gmail draft.');
+      if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}: Could not save Gmail draft.`);
       setStatusMessage(`Draft saved for ${mailTo.trim()}.`);
       setComposeOpen(false);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Draft failed.');
+      const msg = err instanceof Error ? err.message : 'Draft failed.';
+      setErrorMsg(msg);
+      reportExceptionError('Gmail Draft', err, msg, { endpoint: '/api/workspace/gmail/draft' });
     } finally {
       setGmailLoading(false);
     }
@@ -447,11 +454,13 @@ export const WorkspaceStage: React.FC<WorkspaceStageProps> = ({
 
       {(errorMsg || statusMessage) && (
         <div
-          className={`px-5 py-2 text-xs border-b border-white/10 flex items-center justify-between gap-3 ${
+          className={`px-5 py-2.5 text-xs border-b border-white/10 flex items-start justify-between gap-3 ${
             errorMsg ? 'bg-rose-500/12 text-rose-200' : 'bg-emerald-500/12 text-emerald-200'
           }`}
         >
-          <span className="truncate">{errorMsg || statusMessage}</span>
+          <span className="whitespace-pre-wrap break-words leading-relaxed min-w-0">
+            {errorMsg || statusMessage}
+          </span>
           <button
             type="button"
             onClick={() => {

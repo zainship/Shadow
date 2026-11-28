@@ -11,6 +11,7 @@ import {
 } from 'firebase/auth';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
+  AlertTriangle,
   AudioLines,
   Blocks,
   BookOpen,
@@ -38,6 +39,14 @@ import {
 import { BrowserAutomationStage } from './components/BrowserAutomationStage';
 import { DynamicIsland } from './components/DynamicIsland';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { ErrorInspectorModal } from './components/ErrorInspectorModal';
+import {
+  clearShadowErrors,
+  dismissShadowError,
+  reportExceptionError,
+  reportShadowError,
+  useShadowErrors,
+} from './lib/errorStore';
 import { FaceAuthGateModal } from './components/FaceAuthGateModal';
 import { FirstLaunchSetupModal, type SeedMemoryDraft } from './components/FirstLaunchSetupModal';
 import { IosControlDock } from './components/IosControlDock';
@@ -473,6 +482,8 @@ function JarvisArcWorkspace() {
   const [isResearching, setIsResearching] = useState(false);
   const [isGeneratingVisual, setIsGeneratingVisual] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const shadowErrors = useShadowErrors();
+  const [errorInspectorOpen, setErrorInspectorOpen] = useState(false);
   const [liveCaption, setLiveCaption] = useState<{ speaker: string; text: string } | null>(null);
   const [commandCue, setCommandCue] = useState<ReactorCommandCue | null>(null);
   const [dialogueHistory, setDialogueHistory] = useState<DialogueEntry[]>(() =>
@@ -636,6 +647,11 @@ function JarvisArcWorkspace() {
   useEffect(() => {
     if (vision.visionError) {
       setVoiceError(vision.visionError);
+      reportShadowError({
+        source: 'Live Vision',
+        title: 'Camera / Screen Vision Error',
+        message: vision.visionError,
+      });
     }
   }, [vision.visionError]);
 
@@ -906,7 +922,10 @@ function JarvisArcWorkspace() {
       })
       .catch((err) => {
         const msg = err instanceof Error ? err.message : '';
-        if (msg) setAuthError(msg);
+        if (msg) {
+          setAuthError(msg);
+          reportExceptionError('Authentication', err, msg);
+        }
       });
 
     const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
@@ -1025,7 +1044,9 @@ function JarvisArcWorkspace() {
           unsubMeetings = subscribeMeetings(nextUser.uid, setFirestoreMeetings);
           unsubVaultDocs = subscribeVaultDocs(nextUser.uid, setFirestoreVaultDocs);
         } catch (err) {
-          setAuthError(err instanceof Error ? err.message : 'Failed to load profile');
+          const msg = err instanceof Error ? err.message : 'Failed to load profile';
+          setAuthError(msg);
+          reportExceptionError('User Profile', err, msg);
         }
       } else {
         setWorkflows([]);
@@ -1856,11 +1877,18 @@ function JarvisArcWorkspace() {
           resolvedDuration = data.totalDurationMs;
           if (data.error && !execOk) {
             setVoiceError(data.error);
+            reportShadowError({
+              source: 'Browser Automation',
+              title: `Automation failed (${targetUrl})`,
+              message: data.error,
+              endpoint: '/api/automation/execute',
+            });
           }
         } catch (err) {
           execOk = false;
           const msg = err instanceof Error ? err.message : 'Browser automation failed';
           setVoiceError(msg);
+          reportExceptionError('Browser Automation', err, msg, { endpoint: '/api/automation/execute' });
           resolvedSteps = initialSteps.map((st, idx) =>
             idx === 0 ? { ...st, status: 'failed', detail: msg } : { ...st, status: 'failed' }
           );
@@ -2400,6 +2428,11 @@ function JarvisArcWorkspace() {
         };
         finishCommandCue(cueInfo.kind, `${cueInfo.label} (Denied)`, false);
         setVoiceError(deniedResult.error);
+        reportShadowError({
+          source: 'Laptop Permission',
+          title: `Permission denied for ${toolName}`,
+          message: deniedResult.error,
+        });
         return deniedResult;
       }
       beginCommandCue(cueInfo.kind, cueInfo.label);
@@ -2634,8 +2667,20 @@ function JarvisArcWorkspace() {
 
           recognition.onerror = (ev) => {
             if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-              setVoiceError('Microphone speech recognition permission denied.');
+              const msg = `Microphone speech recognition permission denied (${ev.error}).`;
+              setVoiceError(msg);
+              reportShadowError({
+                source: 'Speech Recognition',
+                title: `SpeechRecognition ${ev.error}`,
+                message: msg,
+              });
               stopVoiceSession();
+            } else if (ev.error && ev.error !== 'no-speech' && ev.error !== 'aborted') {
+              reportShadowError({
+                source: 'Speech Recognition',
+                title: `SpeechRecognition error: ${ev.error}`,
+                message: `Browser speech recognition reported "${ev.error}".`,
+              });
             }
           };
 
@@ -2733,6 +2778,16 @@ function JarvisArcWorkspace() {
             args?: Record<string, unknown>;
             result?: Record<string, unknown>;
             message?: string;
+            detail?: {
+              source?: string;
+              status?: number;
+              summary?: string;
+              rawMessage?: string;
+              code?: string;
+              cause?: string;
+              stack?: string;
+              endpoint?: string;
+            };
           };
 
           if (msg.type === 'audio' && msg.data) {
@@ -2837,14 +2892,49 @@ function JarvisArcWorkspace() {
             const cueInfo = describeToolCue(msg.name, msg.args || {});
             const actionOk = msg.result?.ok !== false;
             finishCommandCue(cueInfo.kind, cueInfo.label, actionOk);
+            if (!actionOk && typeof msg.result?.error === 'string') {
+              const toolDetail = msg.result.errorDetail as
+                | { rawMessage?: string; cause?: string; stack?: string; code?: string }
+                | undefined;
+              reportShadowError({
+                source: `Live Tool · ${msg.name}`,
+                title: `Tool "${msg.name}" failed`,
+                message: msg.result.error,
+                rawDetail: [
+                  toolDetail?.code ? `Code: ${toolDetail.code}` : '',
+                  toolDetail?.rawMessage ? `Upstream: ${toolDetail.rawMessage}` : '',
+                  toolDetail?.cause ? `Cause: ${toolDetail.cause}` : '',
+                  `Args: ${JSON.stringify(msg.args || {}, null, 2)}`,
+                ]
+                  .filter(Boolean)
+                  .join('\n'),
+                stack: toolDetail?.stack,
+              });
+            }
             const recentTranscript = userTranscriptBufRef.current || '';
             await handleToolAction(msg.name, msg.args || {}, msg.result || {}, recentTranscript);
           } else if (msg.type === 'error') {
             setIsResearching(false);
             setIsGeneratingVisual(false);
             setIsAutomating(false);
-            finishCommandCue('command', msg.message || 'Voice stream error', false);
-            setVoiceError(msg.message || 'Voice stream error.');
+            const errMsg = msg.message || 'Voice stream error.';
+            finishCommandCue('command', errMsg, false);
+            setVoiceError(errMsg);
+            const srv = msg.detail;
+            const detailLines = [
+              srv?.code ? `Code: ${srv.code}` : '',
+              srv?.rawMessage ? `Upstream: ${srv.rawMessage}` : '',
+              srv?.cause ? `Cause: ${srv.cause}` : '',
+            ].filter(Boolean);
+            reportShadowError({
+              source: srv?.source || 'Gemini Live WS',
+              title: 'Live Voice Stream Error',
+              message: errMsg,
+              rawDetail: detailLines.length > 0 ? detailLines.join('\n') : undefined,
+              statusCode: srv?.status,
+              endpoint: srv?.endpoint || '/ws/live',
+              stack: srv?.stack,
+            });
           } else if (msg.type === 'closed') {
             setIsResearching(false);
             setIsGeneratingVisual(false);
@@ -2854,19 +2944,42 @@ function JarvisArcWorkspace() {
           }
         };
 
-        ws.onerror = () => {
+        const wsUrl = `${apiWsBase}/ws/live?voice=${voiceName}${ctxQuery}`;
+        let wsErrorReported = false;
+
+        ws.onerror = (ev) => {
           if (wsRef.current !== ws) return;
+          wsErrorReported = true;
           const wsOrigin = getApiWsBase();
-          setVoiceError(
-            getApiOrigin()
-              ? `WebSocket connection failed (${wsOrigin}/ws/live). Ensure your Shadow server is running.`
-              : 'Live voice WebSocket dropped. Click the Core to reconnect.'
-          );
+          const msg = getApiOrigin()
+            ? `WebSocket connection failed (${wsOrigin}/ws/live, readyState=${ws.readyState}). Verify your Shadow server is running and reachable.`
+            : `Live voice WebSocket connection error (${wsUrl.split('?')[0]}, readyState=${ws.readyState}). Verify server /ws/live upgrade and GEMINI_API_KEY.`;
+          setVoiceError(msg);
+          reportShadowError({
+            source: 'Voice WebSocket',
+            title: 'WebSocket connection error',
+            message: msg,
+            rawDetail: `URL: ${wsUrl.split('?')[0]}\nReadyState: ${ws.readyState}\nEvent Type: ${ev.type}\nOnline: ${navigator.onLine}`,
+            endpoint: '/ws/live',
+          });
           stopVoiceSession();
         };
 
-        ws.onclose = () => {
+        ws.onclose = (closeEv) => {
           if (wsRef.current === ws) {
+            if (!wsErrorReported && closeEv.code !== 1000 && closeEv.code !== 1005) {
+              const reasonText = closeEv.reason ? `: ${closeEv.reason}` : '';
+              const closeMsg = `Voice WebSocket closed unexpectedly (code ${closeEv.code}${reasonText}).`;
+              setVoiceError(closeMsg);
+              reportShadowError({
+                source: 'Voice WebSocket',
+                title: `WebSocket closed (${closeEv.code})`,
+                message: closeMsg,
+                rawDetail: `Close Code: ${closeEv.code}\nReason: ${closeEv.reason || 'None provided'}\nClean Close: ${String(closeEv.wasClean)}\nEndpoint: /ws/live`,
+                statusCode: closeEv.code,
+                endpoint: '/ws/live',
+              });
+            }
             stopVoiceSession();
           }
         };
@@ -2905,11 +3018,11 @@ function JarvisArcWorkspace() {
         if (isMicDenied && runtimeInfo.isTauri) {
           void requestNativeOsPermission('microphone');
         }
-        setVoiceError(
-          isMicDenied
-            ? 'Microphone permission denied. Allow Microphone access in your OS Privacy Settings.'
-            : rawMsg
-        );
+        const finalMsg = isMicDenied
+          ? `Microphone permission denied (${err instanceof DOMException ? err.name : 'PermissionDenied'}): Allow Microphone access in your OS/browser Privacy Settings.`
+          : rawMsg;
+        setVoiceError(finalMsg);
+        reportExceptionError('Voice Session', err, finalMsg);
         stopVoiceSession();
       }
     },
@@ -3377,15 +3490,18 @@ function JarvisArcWorkspace() {
             await executeStandaloneFallback();
             return;
           } catch (fallbackErr) {
+            const msg =
+              fallbackErr instanceof Error ? fallbackErr.message : 'Unable to execute command.';
             finishCommandCue('command', 'Command failed', false);
-            setVoiceError(
-              fallbackErr instanceof Error ? fallbackErr.message : 'Unable to execute command.'
-            );
+            setVoiceError(msg);
+            reportExceptionError('Assistant Fallback', fallbackErr, msg);
             return;
           }
         }
+        const msg = err instanceof Error ? err.message : 'Unable to execute command.';
         finishCommandCue('command', 'Command failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'Unable to execute command.');
+        setVoiceError(msg);
+        reportExceptionError('Assistant Command', err, msg, { endpoint: '/api/assistant/command' });
       }
     },
     [
@@ -3408,7 +3524,9 @@ function JarvisArcWorkspace() {
   const handleSearchAndPlayYouTube = useCallback(
     async (query: string, mediaType: 'song' | 'video') => {
       if (!isToolPermitted('play_youtube_media')) {
-        setVoiceError('YouTube Media permission is disabled in Laptop Setup.');
+        const msg = 'YouTube Media permission is disabled in Laptop Setup.';
+        setVoiceError(msg);
+        reportShadowError({ source: 'YouTube Media', message: msg, statusCode: 403 });
         return;
       }
       setActiveDrawer('youtube');
@@ -3420,13 +3538,29 @@ function JarvisArcWorkspace() {
         const data = await parseJsonSafely<{ results?: YouTubeTrack[]; error?: string }>(res);
         if (!data) {
           finishCommandCue('youtube', 'Shadow server required', false);
-          setVoiceError('YouTube search requires a connected Shadow server (set Shadow Server URL in AI Keys).');
+          const msg = 'YouTube search requires a connected Shadow server (set Shadow Server URL in AI Keys).';
+          setVoiceError(msg);
+          reportShadowError({
+            source: 'YouTube Media',
+            message: msg,
+            endpoint: '/api/youtube/search',
+            statusCode: res.status || undefined,
+          });
           return;
+        }
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `YouTube search failed (${res.status})`);
         }
         const first = data.results?.[0];
         if (!first) {
           finishCommandCue('youtube', 'No matching tracks found', false);
-          setVoiceError(`No playable YouTube videos found for "${query}".`);
+          const msg = `No playable YouTube videos found for "${query}".`;
+          setVoiceError(msg);
+          reportShadowError({
+            source: 'YouTube Media',
+            message: msg,
+            endpoint: '/api/youtube/search',
+          });
           return;
         }
         await handleToolAction(
@@ -3438,7 +3572,9 @@ function JarvisArcWorkspace() {
         finishCommandCue('youtube', `Playing: ${first.title.slice(0, 42)}`, true);
       } catch (err) {
         finishCommandCue('youtube', 'YouTube search failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'YouTube search failed');
+        const msg = err instanceof Error ? err.message : 'YouTube search failed';
+        setVoiceError(msg);
+        reportExceptionError('YouTube Media', err, msg, { endpoint: '/api/youtube/search' });
       }
     },
     [handleToolAction, isToolPermitted, beginCommandCue, finishCommandCue]
@@ -3447,7 +3583,9 @@ function JarvisArcWorkspace() {
   const handleInspectUrl = useCallback(
     async (url: string) => {
       if (!isToolPermitted('execute_browser_automation')) {
-        setVoiceError('Browser Automation permission is disabled in Laptop Setup.');
+        const msg = 'Browser Automation permission is disabled in Laptop Setup.';
+        setVoiceError(msg);
+        reportShadowError({ source: 'Browser Automation', message: msg, statusCode: 403 });
         return;
       }
       setActiveDrawer('automation');
@@ -3494,7 +3632,9 @@ function JarvisArcWorkspace() {
         finishCommandCue('automation', `Inspected ${payload.title || url}`, true);
       } catch (err) {
         finishCommandCue('automation', 'Page inspection failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'Inspection failed');
+        const msg = err instanceof Error ? err.message : 'Inspection failed';
+        setVoiceError(msg);
+        reportExceptionError('Page Inspection', err, msg, { endpoint: '/api/automation/inspect' });
       }
     },
     [isToolPermitted, beginCommandCue, finishCommandCue]
@@ -3503,7 +3643,9 @@ function JarvisArcWorkspace() {
   const handleRunAutonomousAgent = useCallback(
     async (goal: string, startUrl: string) => {
       if (!isToolPermitted('run_autonomous_web_agent')) {
-        setVoiceError('Browser Automation permission is disabled in Setup.');
+        const msg = 'Browser Automation permission is disabled in Setup.';
+        setVoiceError(msg);
+        reportShadowError({ source: 'Autonomous Agent', message: msg, statusCode: 403 });
         return;
       }
       const cleanGoal = goal.trim();
@@ -3627,6 +3769,7 @@ function JarvisArcWorkspace() {
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Autonomous web agent failed';
         setVoiceError(msg);
+        reportExceptionError('Autonomous Agent', err, msg, { endpoint: '/api/automation/agent' });
         setAutomationRun((prev) =>
           prev && prev.id === runId
             ? {
@@ -3674,7 +3817,9 @@ function JarvisArcWorkspace() {
       gap: number;
     }) => {
       if (!isToolPermitted('execute_browser_automation')) {
-        setVoiceError('Browser Automation permission is disabled in Laptop Setup.');
+        const msg = 'Browser Automation permission is disabled in Laptop Setup.';
+        setVoiceError(msg);
+        reportShadowError({ source: 'Window Layout', message: msg, statusCode: 403 });
         return;
       }
       const layoutLabel =
@@ -3706,7 +3851,9 @@ function JarvisArcWorkspace() {
         finishCommandCue('automation', `Arranged windows (${layoutLabel})`, true);
       } catch (err) {
         finishCommandCue('automation', 'Window arrangement failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'Unable to arrange windows.');
+        const msg = err instanceof Error ? err.message : 'Unable to arrange windows.';
+        setVoiceError(msg);
+        reportExceptionError('Window Layout', err, msg, { endpoint: '/api/automation/execute' });
       }
     },
     [isToolPermitted, beginCommandCue, finishCommandCue, runAutomationSequence]
@@ -3782,7 +3929,9 @@ function JarvisArcWorkspace() {
       void refreshBriefs();
     } catch (err) {
       finishCommandCue('research', 'Morning brief failed', false);
-      setVoiceError(err instanceof Error ? err.message : 'Morning Brief failed');
+      const msg = err instanceof Error ? err.message : 'Morning Brief failed';
+      setVoiceError(msg);
+      reportExceptionError('Morning Brief', err, msg, { endpoint: '/api/brief/run' });
     } finally {
       setIsBriefRunning(false);
     }
@@ -3807,7 +3956,9 @@ function JarvisArcWorkspace() {
       if (!res.ok || !data?.config) throw new Error(data?.error || 'Could not save brief settings');
       setBriefConfig(data.config);
     } catch (err) {
-      setVoiceError(err instanceof Error ? err.message : 'Could not save brief settings');
+      const msg = err instanceof Error ? err.message : 'Could not save brief settings';
+      setVoiceError(msg);
+      reportExceptionError('Morning Brief', err, msg, { endpoint: '/api/brief/config' });
     }
   }, []);
 
@@ -3816,7 +3967,9 @@ function JarvisArcWorkspace() {
     if (!action || workspaceConfirmBusy) return;
     const token = getWorkspaceAccessToken();
     if (!token) {
-      setVoiceError('Google Workspace session expired. Reconnect inside Workspace.');
+      const msg = 'Google Workspace session expired. Reconnect inside Workspace.';
+      setVoiceError(msg);
+      reportShadowError({ source: 'Google Workspace', message: msg, statusCode: 401 });
       setPendingWorkspaceAction(null);
       setActiveDrawer('workspace');
       return;
@@ -3876,7 +4029,9 @@ function JarvisArcWorkspace() {
       showTransientCaption(assistantNameRef.current, confirmationText, 4500);
       void handleSpeakText(confirmationText);
     } catch (err) {
-      setVoiceError(err instanceof Error ? err.message : 'Workspace action failed.');
+      const msg = err instanceof Error ? err.message : 'Workspace action failed.';
+      setVoiceError(msg);
+      reportExceptionError('Google Workspace', err, msg, { endpoint: '/api/workspace' });
     } finally {
       setWorkspaceConfirmBusy(false);
     }
@@ -3885,7 +4040,9 @@ function JarvisArcWorkspace() {
   const handleRunResearch = useCallback(
     async (query: string, depth: 'quick' | 'deep', urls: string[]) => {
       if (!isToolPermitted('research_topic')) {
-        setVoiceError('Deep Research permission is disabled in Laptop Setup.');
+        const msg = 'Deep Research permission is disabled in Laptop Setup.';
+        setVoiceError(msg);
+        reportShadowError({ source: 'Deep Research', message: msg, statusCode: 403 });
         return;
       }
       const clean = query.trim();
@@ -3932,7 +4089,9 @@ function JarvisArcWorkspace() {
         }
       } catch (err) {
         finishCommandCue('research', 'Research failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'Unable to complete research.');
+        const msg = err instanceof Error ? err.message : 'Unable to complete research.';
+        setVoiceError(msg);
+        reportExceptionError('Deep Research', err, msg, { endpoint: '/api/research/run' });
       } finally {
         setIsResearching(false);
       }
@@ -4007,7 +4166,9 @@ function JarvisArcWorkspace() {
         }
       } catch (err) {
         finishCommandCue('visuals', 'Visual generation failed', false);
-        setVoiceError(err instanceof Error ? err.message : 'Unable to generate visual.');
+        const msg = err instanceof Error ? err.message : 'Unable to generate visual.';
+        setVoiceError(msg);
+        reportExceptionError('Visual Studio', err, msg, { endpoint: '/api/visuals/generate' });
       } finally {
         setIsGeneratingVisual(false);
       }
@@ -4118,16 +4279,22 @@ function JarvisArcWorkspace() {
             await signInWithRedirect(auth, googleProvider);
             return;
           } catch (redirectErr) {
-            setAuthError(
-              redirectErr instanceof Error ? redirectErr.message : 'Google Sign-In failed.'
-            );
+            const msg =
+              redirectErr instanceof Error ? redirectErr.message : 'Google Sign-In failed.';
+            setAuthError(msg);
+            reportExceptionError('Firebase Auth Redirect', redirectErr, msg);
             return;
           }
         }
-        setAuthError('Popup was blocked by your browser. Allow popups for this tab and try Sign In again.');
+        const blockedMsg =
+          'Popup was blocked by your browser (auth/popup-blocked). Allow popups for this tab and try Sign In again.';
+        setAuthError(blockedMsg);
+        reportExceptionError('Firebase Auth Popup', err, blockedMsg);
         return;
       }
-      setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed');
+      const msg = err instanceof Error ? err.message : 'Google Sign-In failed';
+      setAuthError(msg);
+      reportExceptionError('Firebase Auth', err, msg);
     }
   };
 
@@ -4353,6 +4520,21 @@ function JarvisArcWorkspace() {
 
           <PWAInstallButton />
 
+          {shadowErrors.length > 0 && (
+            <motion.button
+              type="button"
+              whileHover={prefersReduced ? undefined : { scale: 1.03 }}
+              whileTap={prefersReduced ? undefined : { scale: 0.96 }}
+              transition={MAC_SPRING_CONTROL}
+              onClick={() => setErrorInspectorOpen(true)}
+              title="Inspect recorded error details"
+              className="px-3 py-1.5 rounded-lg border border-rose-400/45 bg-rose-500/18 backdrop-blur-2xl backdrop-saturate-150 text-xs font-medium text-rose-100 hover:bg-rose-500/28 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-300" />
+              <span className="tabular-nums">Errors ({shadowErrors.length})</span>
+            </motion.button>
+          )}
+
           <motion.button
             type="button"
             whileHover={prefersReduced ? undefined : { scale: 1.03 }}
@@ -4440,6 +4622,7 @@ function JarvisArcWorkspace() {
         voices={VOICES}
         reactorBrightness={reactorBrightness}
         errorMessage={voiceError || authError}
+        errors={shadowErrors}
         inputLevelRef={inputLevelRef}
         outputLevelRef={outputLevelRef}
         onToggleVoiceSession={() => {
@@ -4478,6 +4661,7 @@ function JarvisArcWorkspace() {
         onRunCommand={(cmd, attachment) => void runSpokenAction(cmd, attachment)}
         onOpenAiSettings={() => setAiSettingsOpen(true)}
         onOpenSetup={() => setSetupOpen(true)}
+        onOpenErrorInspector={() => setErrorInspectorOpen(true)}
         onLockWithFace={() => {
           stopVoiceSession();
           setIsFaceUnlocked(false);
@@ -5204,6 +5388,18 @@ function JarvisArcWorkspace() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <ErrorInspectorModal
+        open={errorInspectorOpen}
+        errors={shadowErrors}
+        onClose={() => setErrorInspectorOpen(false)}
+        onDismissError={dismissShadowError}
+        onClearAll={() => {
+          clearShadowErrors();
+          setVoiceError(null);
+          setAuthError(null);
+        }}
+      />
     </div>
   );
 }

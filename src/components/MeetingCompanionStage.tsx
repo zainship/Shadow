@@ -15,6 +15,7 @@ import {
 import type { AiSettings } from '../lib/aiSettings';
 import { aiRequestHeaders } from '../lib/aiSettings';
 import { getApiOrigin, parseJsonSafely } from '../lib/apiBase';
+import { reportExceptionError, reportShadowError } from '../lib/errorStore';
 import type { MeetingActionItem, MeetingNote, TaskPriority } from '../types/assistant';
 import {
   MAC_GLASS_BTN_PRIMARY,
@@ -199,7 +200,9 @@ export const MeetingCompanionStage: React.FC<MeetingCompanionStageProps> = ({
       }
     } catch (err) {
       stopRecording();
-      setErrorMsg(err instanceof Error ? err.message : 'Unable to start audio capture.');
+      const msg = err instanceof Error ? err.message : 'Unable to start audio capture.';
+      setErrorMsg(msg);
+      reportExceptionError('Meeting Audio Capture', err, msg);
     }
   };
 
@@ -409,11 +412,13 @@ export const MeetingCompanionStage: React.FC<MeetingCompanionStageProps> = ({
 
       {(errorMsg || statusMessage) && (
         <div
-          className={`px-5 py-2 text-xs border-b border-white/10 flex items-center justify-between gap-2 ${
+          className={`px-5 py-2.5 text-xs border-b border-white/10 flex items-start justify-between gap-3 ${
             errorMsg ? 'bg-rose-500/12 text-rose-200' : 'bg-emerald-500/12 text-emerald-200'
           }`}
         >
-          <span className="truncate">{errorMsg || statusMessage}</span>
+          <span className="whitespace-pre-wrap break-words leading-relaxed min-w-0">
+            {errorMsg || statusMessage}
+          </span>
           <button
             type="button"
             onClick={() => {
