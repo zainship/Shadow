@@ -29,7 +29,7 @@ export const OPENROUTER_MODEL_SUGGESTIONS = [
   'openai/gpt-4o',
   'anthropic/claude-3.5-haiku',
   'anthropic/claude-3.7-sonnet',
-  'google/gemini-2.0-flash-001',
+  'google/gemini-2.5-flash',
   'meta-llama/llama-3.3-70b-instruct',
   'deepseek/deepseek-chat',
   'qwen/qwen-2.5-72b-instruct',
@@ -116,6 +116,67 @@ export function aiSocketAuthMessage(settings: AiSettings): {
   return geminiKey ? { type: 'ai_auth', geminiKey } : { type: 'ai_auth' };
 }
 
+const DIRECT_GEMINI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+] as const;
+
+/**
+ * Calls Google Gemini generateContent directly from the browser for BYOK standalone mode,
+ * starting with gemini-3.8-flash and falling back cleanly if a model alias is unavailable/overloaded.
+ */
+export async function generateGeminiDirect(
+  apiKey: string,
+  body: Record<string, unknown>
+): Promise<{ text: string; modelUsed: string }> {
+  const cleanKey = apiKey.trim();
+  let lastMessage = 'Gemini request failed.';
+  let lastStatus = 500;
+
+  for (let i = 0; i < DIRECT_GEMINI_MODELS.length; i++) {
+    const model = DIRECT_GEMINI_MODELS[i];
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(cleanKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }
+    );
+    const data = (await res.json().catch(() => null)) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      error?: { message?: string; status?: string };
+    } | null;
+
+    if (res.ok && data?.candidates?.length) {
+      const text =
+        data.candidates[0]?.content?.parts
+          ?.map((p) => p.text || '')
+          .join('')
+          .trim() || '';
+      return { text, modelUsed: model };
+    }
+
+    lastStatus = res.status;
+    lastMessage = data?.error?.message || `Gemini HTTP ${res.status}`;
+    const shouldTryNext =
+      i < DIRECT_GEMINI_MODELS.length - 1 &&
+      (res.status === 404 ||
+        res.status === 400 ||
+        res.status === 429 ||
+        res.status === 503 ||
+        /no longer available|not found|not supported|high demand|UNAVAILABLE|RESOURCE_EXHAUSTED/i.test(
+          lastMessage
+        ));
+    if (!shouldTryNext) {
+      throw new Error(lastMessage);
+    }
+  }
+
+  throw new Error(`${lastMessage} (HTTP ${lastStatus})`);
+}
+
 /**
  * Verifies BYOK API keys directly from the browser (no Shadow backend required).
  * Used automatically in Static PWA / Standalone mode (e.g. Firebase Hosting).
@@ -128,41 +189,25 @@ export async function verifyByokSettingsDirectly(
   const model = settings.openrouterModel.trim() || 'openai/gpt-4o-mini';
 
   const verifyGeminiDirect = async (key: string): Promise<{ ok: boolean; detail: string }> => {
-    const genRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
-          generationConfig: { maxOutputTokens: 12 },
-        }),
+    try {
+      const result = await generateGeminiDirect(key, {
+        contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+        generationConfig: { maxOutputTokens: 12 },
+      });
+      return { ok: true, detail: result.modelUsed };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gemini verification failed';
+      // Fallback to listing models if key only permits metadata check or newer model name shifts
+      if (/404|not found|no longer available/i.test(msg)) {
+        const listRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=${encodeURIComponent(key)}`
+        );
+        if (listRes.ok) {
+          return { ok: true, detail: 'Google AI Studio key verified' };
+        }
       }
-    );
-    const genBody = await genRes.json().catch(() => null) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      error?: { message?: string; status?: string };
-    } | null;
-    if (genRes.ok && genBody?.candidates?.length) {
-      return { ok: true, detail: 'gemini-2.5-flash' };
+      return { ok: false, detail: msg };
     }
-    if (genRes.status === 404) {
-      const listRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=${encodeURIComponent(key)}`
-      );
-      if (listRes.ok) {
-        return { ok: true, detail: 'Google AI Studio key verified' };
-      }
-      const listErr = await listRes.json().catch(() => null) as { error?: { message?: string } } | null;
-      return {
-        ok: false,
-        detail: listErr?.error?.message || `Gemini HTTP ${listRes.status}`,
-      };
-    }
-    return {
-      ok: false,
-      detail: genBody?.error?.message || `Gemini HTTP ${genRes.status}`,
-    };
   };
 
   if (settings.provider === 'openrouter') {

@@ -188,6 +188,7 @@ interface BrowserSpeechRecognition {
 import {
   aiRequestHeaders,
   aiSocketAuthMessage,
+  generateGeminiDirect,
   loadAiSettings,
   saveAiSettings,
   type AiSettings,
@@ -3417,43 +3418,24 @@ function JarvisArcWorkspace() {
 
         // 5) Gemini BYOK direct browser execution (supports CORS directly)
         if (settings.provider === 'gemini' && settings.geminiKey.trim()) {
-          const gemModel = 'gemini-2.5-flash';
-          const gemRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${gemModel}:generateContent?key=${encodeURIComponent(settings.geminiKey.trim())}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                systemInstruction: {
-                  parts: [
-                    {
-                      text: `You are ${assistantNameRef.current}, a concise voice-first AI assistant running in standalone PWA mode. Keep answers sharp and speakable.`,
-                    },
-                  ],
+          const gemResult = await generateGeminiDirect(settings.geminiKey, {
+            systemInstruction: {
+              parts: [
+                {
+                  text: `You are ${assistantNameRef.current}, a concise voice-first AI assistant running in standalone PWA mode. Keep answers sharp and speakable.`,
                 },
-                contents: [
-                  ...priorHistory.map((h) => ({
-                    role: h.speaker === 'user' ? 'user' : 'model',
-                    parts: [{ text: h.text }],
-                  })),
-                  { role: 'user', parts: [{ text: displayPrompt }] },
-                ],
-              }),
-            }
-          );
-          const gemData = await parseJsonSafely<{
-            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-            error?: { message?: string };
-          }>(gemRes);
-          if (!gemRes.ok) {
-            throw new Error(gemData?.error?.message || `Gemini HTTP ${gemRes.status}`);
-          }
-          const reply =
-            gemData?.candidates?.[0]?.content?.parts
-              ?.map((p) => p.text || '')
-              .join('')
-              .trim() || 'Done.';
-          appendDialogueEntry({ speaker: 'shadow', text: reply, modelUsed: gemModel });
+              ],
+            },
+            contents: [
+              ...priorHistory.map((h) => ({
+                role: h.speaker === 'user' ? 'user' : 'model',
+                parts: [{ text: h.text }],
+              })),
+              { role: 'user', parts: [{ text: displayPrompt }] },
+            ],
+          });
+          const reply = gemResult.text || 'Done.';
+          appendDialogueEntry({ speaker: 'shadow', text: reply, modelUsed: gemResult.modelUsed });
           finishCommandCue('command', 'Command completed', true);
           void handleSpeakText(reply);
           return true;
@@ -3467,11 +3449,13 @@ function JarvisArcWorkspace() {
         return true;
       };
 
+      let usingDirectByokEndpoint = false;
       try {
         if (backendReachableRef.current === false) {
           const recovered = await checkShadowBackendHealth(apiOrigin);
           backendReachableRef.current = recovered;
           if (!recovered) {
+            usingDirectByokEndpoint = true;
             await executeStandaloneFallback();
             return;
           }
@@ -3508,6 +3492,7 @@ function JarvisArcWorkspace() {
         }>(res);
 
         if (!data) {
+          usingDirectByokEndpoint = true;
           await executeStandaloneFallback();
           return;
         }
@@ -3541,6 +3526,7 @@ function JarvisArcWorkspace() {
       } catch (err) {
         if (err instanceof TypeError) {
           try {
+            usingDirectByokEndpoint = true;
             await executeStandaloneFallback();
             return;
           } catch (fallbackErr) {
@@ -3548,14 +3534,25 @@ function JarvisArcWorkspace() {
               fallbackErr instanceof Error ? fallbackErr.message : 'Unable to execute command.';
             finishCommandCue('command', 'Command failed', false);
             setVoiceError(msg);
-            reportExceptionError('Assistant Fallback', fallbackErr, msg);
+            reportExceptionError('Assistant Fallback', fallbackErr, msg, {
+              endpoint:
+                aiSettingsRef.current.provider === 'openrouter'
+                  ? 'Direct OpenRouter BYOK'
+                  : 'Direct Gemini BYOK',
+            });
             return;
           }
         }
         const msg = err instanceof Error ? err.message : 'Unable to execute command.';
         finishCommandCue('command', 'Command failed', false);
         setVoiceError(msg);
-        reportExceptionError('Assistant Command', err, msg, { endpoint: '/api/assistant/command' });
+        reportExceptionError('Assistant Command', err, msg, {
+          endpoint: usingDirectByokEndpoint
+            ? aiSettingsRef.current.provider === 'openrouter'
+              ? 'Direct OpenRouter BYOK'
+              : 'Direct Gemini BYOK'
+            : '/api/assistant/command',
+        });
       }
     },
     [
